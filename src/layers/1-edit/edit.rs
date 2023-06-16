@@ -1,6 +1,6 @@
 use core::ops::{Deref, DerefMut};
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// An edit to an object.
 pub trait Edit: Serialize + Deserialize {
@@ -12,11 +12,10 @@ pub trait Edit: Serialize + Deserialize {
 }
 
 /// An editable object.
-pub trait Object: Serialize + Deserialize {
-}
+pub trait Object: Serialize + Deserialize {}
 
 /// A group of edits.
-/// 
+///
 /// A group of edits is also viewed an edit. This could be convenient when
 /// a group of edits should be treated as an atomic edit.
 pub struct EditGroup<E> {
@@ -26,7 +25,7 @@ pub struct EditGroup<E> {
 impl<E: Edit> EditGroup<E> {
     /// Creates a new instance.
     pub fn new() -> Self {
-        Self { edits: Vec::new(), }
+        Self { edits: Vec::new() }
     }
 
     /// Adds an edit to the group.
@@ -48,7 +47,7 @@ impl<E: Edit> EditGroup<E> {
     pub fn as_slice(&self) -> &[E] {
         self.edits.as_slice()
     }
-    
+
     /// Returns a mutable slice of the edits in the group.
     pub fn as_slice_mut(&mut self) -> &mut [E] {
         self.edits.as_slice_mut()

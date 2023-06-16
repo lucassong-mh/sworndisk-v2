@@ -1,17 +1,10 @@
+#![feature(new_uninit)]
+
+mod bio;
 mod layers;
-mod bio; 
+mod prelude;
 
-pub fn add(left: usize, right: usize) -> usize {
-    left + right
-}
+pub type BlockId = u64;
+pub type Result<T> = std::result::Result<T, std::io::Error>;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub const BLOCK_SIZE: usize = 0x1000;

@@ -1,19 +1,19 @@
-use core::mem;
 use core::marker::PhantomData;
-use postcard::{from_bytes};
+use core::mem;
+use postcard::from_bytes;
 
-use crate::bio::{BlockLog, BlockSet};
-use crate::layers::crypto::{CryptoChain, CryptoBlob};
 use super::Edit;
+use crate::bio::{BlockLog, BlockSet};
+use crate::layers::crypto::{CryptoBlob, CryptoChain};
 
 /// The journal of a series of edits to an object.
-/// 
+///
 /// By tracking all the edits made to an object, `EditJournal` maintains
 /// the latest state of an object that may be updated with incremental changes
-/// and in high frequency. Behind the scene, `EditJournal` leverages 
+/// and in high frequency. Behind the scene, `EditJournal` leverages
 /// a `CryptoChain` to store the edit sequence securely.
-/// 
-/// As the total number of edits amounts over time, so does the total size of 
+///
+/// As the total number of edits amounts over time, so does the total size of
 /// the storage space consumed by the edit journal. To keep the storage
 /// consumption at bay, object edits are merged into one object snapshot periodically.
 /// This process is called compaction.
@@ -29,7 +29,7 @@ pub struct EditJournal<E: Edit, L, S, P> {
     write_buf: WriteBuf,
 }
 
-impl<E, L, S, P> EditJournal<E, L, S, P> 
+impl<E, L, S, P> EditJournal<E, L, S, P>
 where
     E: Edit,
     L: BlockLog,
@@ -37,27 +37,27 @@ where
     P: CompactPolicy<E>,
 {
     /// Format the given `block_log` and `block_sets` as the storage for a
-    /// new `EditJournal`, returning the crypo-protected versions of the 
+    /// new `EditJournal`, returning the crypo-protected versions of the
     /// storage.
-    /// 
-    /// After formatting, the crypto-protected versions of storage will be 
+    ///
+    /// After formatting, the crypto-protected versions of storage will be
     /// returned. Later, they can be feed to the `recover` method
     /// to open the `EditJournal`. The initial state of the object represented
     /// by the journal is as specified by `init_object`.
     pub fn format(
         init_object: E::Object,
         block_log: L,
-        block_sets: [S; 2]
+        block_sets: [S; 2],
     ) -> Result<(CryptoChain<L>, CryptoBlob<S>)> {
         todo!()
     }
 
     /// Recover the state of an `EditJournal` given its crypo-protected storage
     /// regions.
-    /// 
+    ///
     /// # Panics
-    /// 
-    /// The user must make sure that the given storage indeed stores an 
+    ///
+    /// The user must make sure that the given storage indeed stores an
     /// `EditJournal` for edit type `E`. Otherwise, attempts to deserilize edits
     /// will fail, causing panics.
     pub fn recover(
@@ -129,10 +129,10 @@ enum Record<E> {
 }
 
 /// A buffer for writing records into an edit journal.
-/// 
-/// The capacity of `WriteBuf` is equal to the (available) block size of 
+///
+/// The capacity of `WriteBuf` is equal to the (available) block size of
 /// `CryptoChain`. Records that are written to an edit journal will first
-/// be inserted into the `WriteBuf`. When the `WriteBuf` is (near) full, 
+/// be inserted into the `WriteBuf`. When the `WriteBuf` is (near) full,
 /// the buffer as a whole will be written to the underlying `CryptoChain`.
 struct WriteBuf<E> {
     buf: Box<[u8]>,
@@ -156,8 +156,8 @@ impl<E: Edit> WriteBuf<E> {
                 if e != SerializeBufferFull {
                     panic!("Errors (except SerializeBufferFull) are not expected");
                 }
-                return None
-            },
+                return None;
+            }
         };
         self.avail_begin += serial_record_len;
 
@@ -169,7 +169,7 @@ impl<E: Edit> WriteBuf<E> {
         self.avail_end -= U16_LEN;
 
         debug_assert!(self.avail_begin <= self.avail_end);
-        
+
         Some(())
     }
 
@@ -202,8 +202,8 @@ impl<E: Edit> WriteBuf<E> {
     }
 }
 
-/// A byte slice containing serialized edit records. 
-/// 
+/// A byte slice containing serialized edit records.
+///
 /// The slice allows deserializing and iterates the contained edit records.
 struct RecordSlice<'a, E> {
     buf: &'a [u8],
@@ -228,7 +228,7 @@ impl<'a, E> RecordSlice<'a, E> {
 }
 
 impl<'a, E: Edit> Iterator for RecordSlice<'a, E> {
-    type Item = Record; 
+    type Item = Record;
 
     fn next(&mut self) -> Option<Record<E>> {
         let record_len = {
@@ -269,7 +269,7 @@ const U16_LEN: usize = mem::size_of::<u16>();
 /// the edits in an edit journal.
 pub trait CompactPolicy<E: Edit> {
     /// Accmulate one more edit.
-    /// 
+    ///
     /// As more edits are accmulated, the compact policy is more likely to
     /// decide that it is now a good time to compact.
     fn accumulate(&mut self, edit: &E);
