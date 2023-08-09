@@ -40,3 +40,11 @@ impl BoxedBlockBuf<Box<[u8]>> {
         Self(boxed_slice)
     }
 }
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn ci_test() {
+        assert!(0 == 0);
+    }
+}
