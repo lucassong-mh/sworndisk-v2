@@ -75,6 +75,7 @@ pub struct RootMhtMeta {
     pub iv: Iv,
 }
 
+
 struct MhtNode {
     // The height of the MHT tree whose root is this node
     height: u8,
