@@ -99,6 +99,9 @@ struct MhtStorage<L> {
     crypt_buf: CryptBuf,
 }
 
+type Lbid = BlockId; // Logical block position, in terms of user
+type Pbid = BlockId; // Physical block position, in terms of underlying log
+
 /// The metadata of the root MHT node of a `CryptoLog`.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct RootMhtMeta {
