@@ -1,0 +1,1131 @@
+warning: unused import: `TxStatus`
+  --> src/layers/4-lsm/tx_lsm_tree.rs:13:21
+   |
+13 | use crate::tx::{Tx, TxStatus};
+   |                     ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `openssl::pkey::Id`
+  --> src/layers/4-lsm/tx_lsm_tree.rs:19:5
+   |
+19 | use openssl::pkey::Id;
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `debug`, `error`, `info`, `trace`, `warn`
+  --> src/prelude.rs:12:22
+   |
+12 | pub(crate) use log::{debug, error, info, trace, warn};
+   |                      ^^^^^  ^^^^^  ^^^^  ^^^^^  ^^^^
+
+warning: unused import: `any::Any`
+  --> src/tx/mod.rs:14:14
+   |
+14 | use anymap::{any::Any, AnyMap};
+   |              ^^^^^^^^
+
+warning: unreachable statement
+   --> src/layers/3-log/tx_log.rs:890:17
+    |
+889 |                 panic!("TxLogEdit::Append is added at very late stage, after which logs won't get deleted"); // WAL
+    |                 ------------------------------------------------------------------------------------------- any code following this expression is unreachable
+890 |                 self.edit_table.insert(log_id, TxLogEdit::Delete);
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+    |
+    = note: `#[warn(unreachable_code)]` on by default
+
+warning: unused import: `Rng`
+ --> src/prelude.rs:4:50
+  |
+4 |     align_down, align_up, Aead as _, RandomInit, Rng as _, Skcipher as _,
+  |                                                  ^^^
+
+warning: unused import: `Skcipher`
+ --> src/prelude.rs:4:60
+  |
+4 |     align_down, align_up, Aead as _, RandomInit, Rng as _, Skcipher as _,
+  |                                                            ^^^^^^^^
+
+warning: unused variable: `store`
+   --> src/layers/5-disk/mod.rs:425:16
+    |
+425 |     fn recover(store: Arc<TxLogStore<D>>) -> Result<Self> {
+    |                ^^^^^ help: if this is intentional, prefix it with an underscore: `_store`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: unused variable: `is_removed`
+   --> src/layers/3-log/raw_log.rs:749:13
+    |
+749 |         let is_removed = self.write_set.remove(&log_id);
+    |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_is_removed`
+
+warning: unused variable: `key`
+   --> src/layers/3-log/tx_log.rs:549:40
+    |
+549 |     pub fn open<D: BlockSet>(disk: &D, key: &Key) -> Result<Self> {
+    |                                        ^^^ help: if this is intentional, prefix it with an underscore: `_key`
+
+warning: unused variable: `key`
+   --> src/layers/3-log/tx_log.rs:556:46
+    |
+556 |     fn persist<D: BlockSet>(&self, disk: &D, key: &Key) -> Result<()> {
+    |                                              ^^^ help: if this is intentional, prefix it with an underscore: `_key`
+
+warning: unused variable: `ucv`
+  --> src/layers/4-lsm/mem_table.rs:44:50
+   |
+44 |             ValueEx::CommittedAndUncommitted(cv, ucv) => {
+   |                                                  ^^^ help: if this is intentional, prefix it with an underscore: `_ucv`
+
+warning: unused variable: `v`
+  --> src/layers/4-lsm/mem_table.rs:55:32
+   |
+55 |             ValueEx::Committed(v) => (None, None),
+   |                                ^ help: if this is intentional, prefix it with an underscore: `_v`
+
+warning: unused variable: `range`
+   --> src/layers/4-lsm/tx_lsm_tree.rs:237:29
+    |
+237 |     pub fn get_range(&self, range: &Range<K>) -> Vec<V> {
+    |                             ^^^^^ help: if this is intentional, prefix it with an underscore: `_range`
+
+warning: unused variable: `to_be_replaced`
+   --> src/layers/4-lsm/tx_lsm_tree.rs:247:13
+    |
+247 |         let to_be_replaced = self.active_mem_table().write().put(key, value);
+    |             ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_to_be_replaced`
+
+warning: unreachable pattern
+   --> src/layers/4-lsm/tx_lsm_tree.rs:319:13
+    |
+319 |             _ => unreachable!(),
+    |             ^
+    |
+    = note: `#[warn(unreachable_patterns)]` on by default
+
+warning: unused variable: `max_sync_id`
+   --> src/layers/4-lsm/tx_lsm_tree.rs:889:21
+    |
+889 |         if let Some(max_sync_id) = max_sync_id {
+    |                     ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_max_sync_id`
+
+warning: unused variable: `tx_type`
+   --> src/layers/4-lsm/tx_lsm_tree.rs:968:38
+    |
+968 |         fn new_event_listener(&self, tx_type: TxType) -> Arc<dyn TxEventListener<K, V>> {
+    |                                      ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_tx_type`
+
+warning: unused variable: `record`
+   --> src/layers/4-lsm/tx_lsm_tree.rs:973:33
+    |
+973 |         fn on_add_record(&self, record: &dyn AsKv<K, V>) -> Result<()> {
+    |                                 ^^^^^^ help: if this is intentional, prefix it with an underscore: `_record`
+
+warning: unused variable: `record`
+   --> src/layers/4-lsm/tx_lsm_tree.rs:976:34
+    |
+976 |         fn on_drop_record(&self, record: &dyn AsKv<K, V>) -> Result<()> {
+    |                                  ^^^^^^ help: if this is intentional, prefix it with an underscore: `_record`
+
+warning: unused variable: `tx`
+   --> src/layers/4-lsm/tx_lsm_tree.rs:979:31
+    |
+979 |         fn on_tx_begin(&self, tx: &mut Tx) -> Result<()> {
+    |                               ^^ help: if this is intentional, prefix it with an underscore: `_tx`
+
+warning: unused variable: `tx`
+   --> src/layers/4-lsm/tx_lsm_tree.rs:982:35
+    |
+982 |         fn on_tx_precommit(&self, tx: &mut Tx) -> Result<()> {
+    |                                   ^^ help: if this is intentional, prefix it with an underscore: `_tx`
+
+warning: variable does not need to be mutable
+   --> src/tx/mod.rs:361:21
+    |
+361 |                 let mut current_tx = self.tx_provider.current();
+    |                     ----^^^^^^^^^^
+    |                     |
+    |                     help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` on by default
+
+warning: variable does not need to be mutable
+   --> src/tx/mod.rs:399:17
+    |
+399 |             let mut current_tx = self.tx_provider.current();
+    |                 ----^^^^^^^^^^
+    |                 |
+    |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/tx/mod.rs:412:17
+    |
+412 |             let mut current_tx = self.tx_provider.current();
+    |                 ----^^^^^^^^^^
+    |                 |
+    |                 help: remove this `mut`
+
+warning: variant `IoError` is never constructed
+  --> src/error.rs:10:5
+   |
+3  | pub enum Errno {
+   |          ----- variant in this enum
+...
+10 |     IoError,
+   |     ^^^^^^^
+   |
+   = note: `Errno` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` on by default
+
+warning: field `msg` is never read
+  --> src/error.rs:27:5
+   |
+25 | pub struct Error {
+   |            ----- field in this struct
+26 |     errno: Errno,
+27 |     msg: Option<&'static str>,
+   |     ^^^
+   |
+   = note: `Error` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: constant `BID_SIZE` is never used
+  --> src/layers/0-bio/mod.rs:15:11
+   |
+15 | pub const BID_SIZE: usize = core::mem::size_of::<BlockId>();
+   |           ^^^^^^^^
+
+warning: method `iter` is never used
+   --> src/layers/0-bio/block_buf.rs:119:12
+    |
+102 | impl<'a> BufMut<'a> {
+    | ------------------- method in this implementation
+...
+119 |     pub fn iter(&self) -> BufIter<'_> {
+    |            ^^^^
+
+warning: methods `num_blocks` and `block_range` are never used
+   --> src/layers/1-crypto/crypto_chain.rs:251:12
+    |
+234 | impl<L: BlockLog> Recovery<L> {
+    | ----------------------------- methods in this implementation
+...
+251 |     pub fn num_blocks(&self) -> usize {
+    |            ^^^^^^^^^^
+...
+258 |     pub fn block_range(&self) -> &Range<BlockId> {
+    |            ^^^^^^^^^^^
+
+warning: method `key` is never used
+   --> src/layers/1-crypto/crypto_log.rs:231:12
+    |
+164 | impl<L: BlockLog> CryptoLog<L> {
+    | ------------------------------ method in this implementation
+...
+231 |     pub fn key(&self) -> &Key {
+    |            ^^^
+
+warning: field `root_key` is never read
+  --> src/layers/5-disk/mod.rs:32:5
+   |
+28 | pub struct SwornDisk<D: BlockSet> {
+   |            --------- field in this struct
+...
+32 |     root_key: Key,
+   |     ^^^^^^^^
+
+warning: associated items `total_blocks`, `open`, and `recover_bitmap` are never used
+   --> src/layers/5-disk/mod.rs:82:12
+    |
+35  | impl<D: BlockSet + 'static> SwornDisk<D> {
+    | ---------------------------------------- associated items in this implementation
+...
+82  |     pub fn total_blocks(&self) -> usize {
+    |            ^^^^^^^^^^^^
+...
+118 |     pub fn open(disk: D, root_key: Key) -> Result<Self> {
+    |            ^^^^
+...
+149 |     fn recover_bitmap(store: &Arc<TxLogStore<D>>, bitmap: &Arc<AllocBitmap>) -> Result<()> {
+    |        ^^^^^^^^^^^^^^
+
+warning: constant `BUCKET_BLOCK_VALIDITY_TABLE` is never used
+   --> src/layers/5-disk/mod.rs:294:7
+    |
+294 | const BUCKET_BLOCK_VALIDITY_TABLE: &str = "BVT";
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `recover` and `do_compaction` are never used
+   --> src/layers/5-disk/mod.rs:425:8
+    |
+334 | impl<D: BlockSet + 'static> BlockAlloc<D> {
+    | ----------------------------------------- associated items in this implementation
+...
+425 |     fn recover(store: Arc<TxLogStore<D>>) -> Result<Self> {
+    |        ^^^^^^^
+...
+430 |     fn do_compaction(&self) {
+    |        ^^^^^^^^^^^^^
+
+warning: methods `iter` and `clear` are never used
+  --> src/layers/2-edit/edit.rs:81:12
+   |
+66 | impl<E: Edit<S>, S> EditGroup<E, S> {
+   | ----------------------------------- methods in this implementation
+...
+81 |     pub fn iter(&self) -> impl Iterator<Item = &E> {
+   |            ^^^^
+...
+86 |     pub fn clear(&mut self) {
+   |            ^^^^^
+
+warning: method `abort` is never used
+   --> src/layers/2-edit/journal.rs:363:12
+    |
+95  | impl<E, S, D, P> EditJournal<E, S, D, P>
+    | ---------------------------------------- method in this implementation
+...
+363 |     pub fn abort(&mut self) {
+    |            ^^^^^
+
+warning: method `avail_len` is never used
+   --> src/layers/2-edit/journal.rs:564:8
+    |
+525 | impl<E: Edit<S>, S: Sized> WriteBuf<E, S> {
+    | ----------------------------------------- method in this implementation
+...
+564 |     fn avail_len(&self) -> usize {
+    |        ^^^^^^^^^
+
+warning: method `any_error` is never used
+   --> src/layers/2-edit/journal.rs:593:12
+    |
+582 | impl<'a, E: Edit<S>, S> RecordSlice<'a, E, S> {
+    | --------------------------------------------- method in this implementation
+...
+593 |     pub fn any_error(&self) -> bool {
+    |            ^^^^^^^^^
+
+warning: field `lazy_delete` is never read
+   --> src/layers/3-log/raw_log.rs:326:5
+    |
+321 | pub struct RawLog<D> {
+    |            ------ field in this struct
+...
+326 |     lazy_delete: Option<Arc<LazyDelete<RawLogEntry>>>,
+    |     ^^^^^^^^^^^
+
+warning: constant `JOURNAL_AREA_PROPORTION` is never used
+  --> src/layers/3-log/tx_log.rs:53:7
+   |
+53 | const JOURNAL_AREA_PROPORTION: f32 = 1.0 - LOG_STORE_AREA_PROPORTION;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `tx_id` and `lazy_delete` are never read
+   --> src/layers/3-log/tx_log.rs:573:5
+    |
+571 | struct TxLogInner<D> {
+    |        ---------- fields in this struct
+572 |     log_id: TxLogId,
+573 |     tx_id: TxId,
+    |     ^^^^^
+...
+576 |     lazy_delete: Option<Arc<LazyDelete<TxLogId>>>,
+    |     ^^^^^^^^^^^
+
+warning: method `tx_id` is never used
+   --> src/layers/3-log/tx_log.rs:594:12
+    |
+580 | impl<D: BlockSet> TxLog<D> {
+    | -------------------------- method in this implementation
+...
+594 |     pub fn tx_id(&self) -> TxId {
+    |            ^^^^^
+
+warning: method `size` is never used
+   --> src/layers/4-lsm/mem_table.rs:117:12
+    |
+64  | impl<K: Copy + Ord + Debug, V: Copy> MemTable<K, V> {
+    | --------------------------------------------------- method in this implementation
+...
+117 |     pub fn size(&self) -> usize {
+    |            ^^^^
+
+warning: associated items `INDEX_ENTRY_SIZE` and `from_log` are never used
+   --> src/layers/4-lsm/sstable.rs:75:11
+    |
+70  | impl<K: Ord + Pod + Debug, V: Pod> SSTable<K, V> {
+    | ------------------------------------------------ associated items in this implementation
+...
+75  |     const INDEX_ENTRY_SIZE: usize = Self::BID_SIZE + Self::K_SIZE;
+    |           ^^^^^^^^^^^^^^^^
+...
+253 |     pub fn from_log<D: BlockSet>(tx_log: &Arc<TxLog<D>>) -> Result<Self> {
+    |            ^^^^^^^^
+
+warning: constant `LEVELI_RATIO` is never used
+  --> src/layers/4-lsm/tx_lsm_tree.rs:28:7
+   |
+28 | const LEVELI_RATIO: u16 = 10;
+   |       ^^^^^^^^^^^^
+
+warning: variant `Migration` is never constructed
+  --> src/layers/4-lsm/tx_lsm_tree.rs:88:5
+   |
+77 | pub enum TxType {
+   |          ------ variant in this enum
+...
+88 |     Migration,
+   |     ^^^^^^^^^
+   |
+   = note: `TxType` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: associated items `recover`, `get_range`, `do_append_tx`, and `do_migration_tx` are never used
+   --> src/layers/4-lsm/tx_lsm_tree.rs:143:12
+    |
+108 | impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V, D> {
+    | ------------------------------------------------------------------------------------ associated items in this implementation
+...
+143 |     pub fn recover(
+    |            ^^^^^^^
+...
+237 |     pub fn get_range(&self, range: &Range<K>) -> Vec<V> {
+    |            ^^^^^^^^^
+...
+310 |     fn do_append_tx(&self, record: &dyn AsKv<K, V>) -> Result<()> {
+    |        ^^^^^^^^^^^^
+...
+594 |     fn do_migration_tx(&self) -> Result<()> {
+    |        ^^^^^^^^^^^^^^^
+
+warning: associated function `collect_committed_records` is never used
+   --> src/layers/4-lsm/tx_lsm_tree.rs:850:12
+    |
+741 | impl<D: BlockSet + 'static> WalAppendTx<D> {
+    | ------------------------------------------ associated function in this implementation
+...
+850 |     pub fn collect_committed_records<K: Pod, V: Pod>(wal: &TxLog<D>) -> Result<Vec<(K, V)>> {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `provider` is never read
+  --> src/tx/current.rs:10:5
+   |
+9  | pub struct CurrentTx<'a> {
+   |            --------- field in this struct
+10 |     provider: &'a TxProvider,
+   |     ^^^^^^^^
+   |
+   = note: `CurrentTx` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: methods `contains` and `len` are never used
+   --> src/tx/mod.rs:359:16
+    |
+320 |     impl<T> Db<T>
+    |     ------------- methods in this implementation
+...
+359 |         pub fn contains(&self, item: &T) -> bool {
+    |                ^^^^^^^^
+...
+410 |         pub fn len(&self) -> usize {
+    |                ^^^
+
+warning: unused return value of `std::option::Option::<T>::insert` that must be used
+   --> src/layers/5-disk/mod.rs:375:9
+    |
+375 |         self.diff_log.lock().insert(diff_log.clone());
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if you intended to set a value, consider assignment instead
+    = note: `#[warn(unused_must_use)]` on by default
+help: use `let _ = ...` to ignore the resulting value
+    |
+375 |         let _ = self.diff_log.lock().insert(diff_log.clone());
+    |         +++++++
+
+warning: unused `std::result::Result` that must be used
+   --> src/layers/4-lsm/tx_lsm_tree.rs:621:29
+    |
+621 | ...                   listener.on_drop_record(&(k, v));
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+    |
+621 |                             let _ = listener.on_drop_record(&(k, v));
+    |                             +++++++
+
+warning: unused `std::result::Result` that must be used
+   --> src/layers/4-lsm/tx_lsm_tree.rs:625:29
+    |
+625 | ...                   listener.on_drop_record(&(k, ucv));
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+    |
+625 |                             let _ = listener.on_drop_record(&(k, ucv));
+    |                             +++++++
+
+warning: unused return value of `std::option::Option::<T>::insert` that must be used
+   --> src/layers/4-lsm/tx_lsm_tree.rs:716:13
+    |
+716 |             self.log_id.insert(wal_log.id());
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if you intended to set a value, consider assignment instead
+help: use `let _ = ...` to ignore the resulting value
+    |
+716 |             let _ = self.log_id.insert(wal_log.id());
+    |             +++++++
+
+warning: unused return value of `std::option::Option::<T>::insert` that must be used
+   --> src/layers/4-lsm/tx_lsm_tree.rs:883:21
+    |
+883 |                     max_sync_id.insert(sync_id);
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: if you intended to set a value, consider assignment instead
+help: use `let _ = ...` to ignore the resulting value
+    |
+883 |                     let _ = max_sync_id.insert(sync_id);
+    |                     +++++++
+
+warning: calls to `std::mem::drop` with a reference instead of an owned value does nothing
+  --> src/tx/current.rs:79:9
+   |
+79 |         drop(tx);
+   |         ^^^^^--^
+   |              |
+   |              argument has type `&mut tx::Tx`
+   |
+   = note: use `let _ = ...` to ignore the expression or result
+   = note: `#[warn(dropping_references)]` on by default
+
+warning: calls to `std::mem::drop` with a reference instead of an owned value does nothing
+   --> src/tx/current.rs:126:9
+    |
+126 |         drop(current_mut);
+    |         ^^^^^-----------^
+    |              |
+    |              argument has type `&mut tx::Tx`
+    |
+    = note: use `let _ = ...` to ignore the expression or result
+
+warning: `sworndisk-v2` (lib test) generated 58 warnings (run `cargo fix --lib -p sworndisk-v2 --tests` to apply 21 suggestions)
+    Finished test [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/sworndisk_v2-ae51ec6a0d8d018e)
+
+running 1 test
+create_log "WAL"
+0
+here
+record buf len: 50176
+flush buf
+1
+here: []
+here 2
+do_minor_compaction before SstManager { levels: [{}, {}] }
+RawLogStoreState {
+    log_table: {
+        0: RawLogEntry {
+            head: RawLogHead {
+                chunks: [
+                    0,
+                ],
+                num_blocks: 14,
+            },
+        },
+    },
+    next_free_log_id: 1,
+}
+TxLogStoreState {
+    log_table: {
+        0: TxLogEntry {
+            bucket: "WAL",
+            key: AeadKey(
+                [
+                    20,
+                    248,
+                    27,
+                    45,
+                    46,
+                    195,
+                    46,
+                    50,
+                    217,
+                    12,
+                    90,
+                    54,
+                    194,
+                    38,
+                    133,
+                    135,
+                ],
+            ),
+            root_mht: RootMhtMeta {
+                pos: 13,
+            },
+        },
+    },
+    bucket_table: {
+        "WAL": Bucket {
+            log_ids: {
+                0,
+            },
+        },
+    },
+}
+create_log "L0"
+1
+1
+here: []
+RawLogStoreState {
+    log_table: {
+        0: RawLogEntry {
+            head: RawLogHead {
+                chunks: [
+                    0,
+                ],
+                num_blocks: 14,
+            },
+        },
+        1: RawLogEntry {
+            head: RawLogHead {
+                chunks: [
+                    1,
+                ],
+                num_blocks: 16,
+            },
+        },
+    },
+    next_free_log_id: 2,
+}
+TxLogStoreState {
+    log_table: {
+        0: TxLogEntry {
+            bucket: "WAL",
+            key: AeadKey(
+                [
+                    20,
+                    248,
+                    27,
+                    45,
+                    46,
+                    195,
+                    46,
+                    50,
+                    217,
+                    12,
+                    90,
+                    54,
+                    194,
+                    38,
+                    133,
+                    135,
+                ],
+            ),
+            root_mht: RootMhtMeta {
+                pos: 13,
+            },
+        },
+        1: TxLogEntry {
+            bucket: "L0",
+            key: AeadKey(
+                [
+                    20,
+                    248,
+                    27,
+                    45,
+                    46,
+                    195,
+                    46,
+                    50,
+                    217,
+                    12,
+                    90,
+                    54,
+                    194,
+                    38,
+                    133,
+                    135,
+                ],
+            ),
+            root_mht: RootMhtMeta {
+                pos: 15,
+            },
+        },
+    },
+    bucket_table: {
+        "L0": Bucket {
+            log_ids: {
+                1,
+            },
+        },
+        "WAL": Bucket {
+            log_ids: {
+                0,
+            },
+        },
+    },
+}
+TxLogStoreEdit delete_log: 0
+1
+1
+here: [0]
+deleted_log_id: 0
+delete_raw_log
+do_minor_compaction after SstManager { levels: [{1: SSTable { footer: FooterMeta { index_nblocks: 2, num_index: 13, total_records: 1024, sync_id: 0 }, range: 0..=1023 }}, {}] }
+apppppend pos: 16
+append_pos: 15
+0
+here: []
+synccccccc
+create_log "WAL"
+2
+flush buf
+1
+here: []
+here?
+apppppend pos: 16
+append_pos: 15
+0
+here: []
+open log
+apppppend pos: 2
+append_pos: 1
+here
+record buf len: 50176
+flush buf
+1
+here: []
+here 2
+do_major_compaction before SstManager { levels: [{1: SSTable { footer: FooterMeta { index_nblocks: 2, num_index: 13, total_records: 1024, sync_id: 0 }, range: 0..=1023 }}, {}] }
+RawLogStoreState {
+    log_table: {
+        1: RawLogEntry {
+            head: RawLogHead {
+                chunks: [
+                    1,
+                ],
+                num_blocks: 16,
+            },
+        },
+        2: RawLogEntry {
+            head: RawLogHead {
+                chunks: [
+                    0,
+                ],
+                num_blocks: 16,
+            },
+        },
+    },
+    next_free_log_id: 3,
+}
+TxLogStoreState {
+    log_table: {
+        1: TxLogEntry {
+            bucket: "L0",
+            key: AeadKey(
+                [
+                    20,
+                    248,
+                    27,
+                    45,
+                    46,
+                    195,
+                    46,
+                    50,
+                    217,
+                    12,
+                    90,
+                    54,
+                    194,
+                    38,
+                    133,
+                    135,
+                ],
+            ),
+            root_mht: RootMhtMeta {
+                pos: 15,
+            },
+        },
+        2: TxLogEntry {
+            bucket: "WAL",
+            key: AeadKey(
+                [
+                    20,
+                    248,
+                    27,
+                    45,
+                    46,
+                    195,
+                    46,
+                    50,
+                    217,
+                    12,
+                    90,
+                    54,
+                    194,
+                    38,
+                    133,
+                    135,
+                ],
+            ),
+            root_mht: RootMhtMeta {
+                pos: 15,
+            },
+        },
+    },
+    bucket_table: {
+        "L0": Bucket {
+            log_ids: {
+                1,
+            },
+        },
+        "WAL": Bucket {
+            log_ids: {
+                2,
+            },
+        },
+    },
+}
+apppppend pos: 16
+append_pos: 15
+create_log "L1"
+3
+delete log: [(1, L0)]
+TxLogStoreEdit delete_log: 1
+2
+2
+here: [1]
+deleted_log_id: 1
+delete_raw_log
+do_major_compaction after SstManager { levels: [{}, {3: SSTable { footer: FooterMeta { index_nblocks: 2, num_index: 13, total_records: 1024, sync_id: 1 }, range: 0..=1023 }}] }
+RawLogStoreState {
+    log_table: {
+        2: RawLogEntry {
+            head: RawLogHead {
+                chunks: [
+                    0,
+                ],
+                num_blocks: 16,
+            },
+        },
+        3: RawLogEntry {
+            head: RawLogHead {
+                chunks: [
+                    2,
+                ],
+                num_blocks: 16,
+            },
+        },
+    },
+    next_free_log_id: 4,
+}
+TxLogStoreState {
+    log_table: {
+        2: TxLogEntry {
+            bucket: "WAL",
+            key: AeadKey(
+                [
+                    20,
+                    248,
+                    27,
+                    45,
+                    46,
+                    195,
+                    46,
+                    50,
+                    217,
+                    12,
+                    90,
+                    54,
+                    194,
+                    38,
+                    133,
+                    135,
+                ],
+            ),
+            root_mht: RootMhtMeta {
+                pos: 15,
+            },
+        },
+        3: TxLogEntry {
+            bucket: "L1",
+            key: AeadKey(
+                [
+                    20,
+                    248,
+                    27,
+                    45,
+                    46,
+                    195,
+                    46,
+                    50,
+                    217,
+                    12,
+                    90,
+                    54,
+                    194,
+                    38,
+                    133,
+                    135,
+                ],
+            ),
+            root_mht: RootMhtMeta {
+                pos: 15,
+            },
+        },
+    },
+    bucket_table: {
+        "L0": Bucket {
+            log_ids: {},
+        },
+        "L1": Bucket {
+            log_ids: {
+                3,
+            },
+        },
+        "WAL": Bucket {
+            log_ids: {
+                2,
+            },
+        },
+    },
+}
+do_minor_compaction before SstManager { levels: [{}, {3: SSTable { footer: FooterMeta { index_nblocks: 2, num_index: 13, total_records: 1024, sync_id: 1 }, range: 0..=1023 }}] }
+RawLogStoreState {
+    log_table: {
+        2: RawLogEntry {
+            head: RawLogHead {
+                chunks: [
+                    0,
+                ],
+                num_blocks: 16,
+            },
+        },
+        3: RawLogEntry {
+            head: RawLogHead {
+                chunks: [
+                    2,
+                ],
+                num_blocks: 16,
+            },
+        },
+    },
+    next_free_log_id: 4,
+}
+TxLogStoreState {
+    log_table: {
+        2: TxLogEntry {
+            bucket: "WAL",
+            key: AeadKey(
+                [
+                    20,
+                    248,
+                    27,
+                    45,
+                    46,
+                    195,
+                    46,
+                    50,
+                    217,
+                    12,
+                    90,
+                    54,
+                    194,
+                    38,
+                    133,
+                    135,
+                ],
+            ),
+            root_mht: RootMhtMeta {
+                pos: 15,
+            },
+        },
+        3: TxLogEntry {
+            bucket: "L1",
+            key: AeadKey(
+                [
+                    20,
+                    248,
+                    27,
+                    45,
+                    46,
+                    195,
+                    46,
+                    50,
+                    217,
+                    12,
+                    90,
+                    54,
+                    194,
+                    38,
+                    133,
+                    135,
+                ],
+            ),
+            root_mht: RootMhtMeta {
+                pos: 15,
+            },
+        },
+    },
+    bucket_table: {
+        "L0": Bucket {
+            log_ids: {},
+        },
+        "L1": Bucket {
+            log_ids: {
+                3,
+            },
+        },
+        "WAL": Bucket {
+            log_ids: {
+                2,
+            },
+        },
+    },
+}
+create_log "L0"
+4
+1
+here: []
+RawLogStoreState {
+    log_table: {
+        2: RawLogEntry {
+            head: RawLogHead {
+                chunks: [
+                    0,
+                ],
+                num_blocks: 16,
+            },
+        },
+        3: RawLogEntry {
+            head: RawLogHead {
+                chunks: [
+                    2,
+                ],
+                num_blocks: 16,
+            },
+        },
+        4: RawLogEntry {
+            head: RawLogHead {
+                chunks: [
+                    1,
+                ],
+                num_blocks: 16,
+            },
+        },
+    },
+    next_free_log_id: 5,
+}
+TxLogStoreState {
+    log_table: {
+        2: TxLogEntry {
+            bucket: "WAL",
+            key: AeadKey(
+                [
+                    20,
+                    248,
+                    27,
+                    45,
+                    46,
+                    195,
+                    46,
+                    50,
+                    217,
+                    12,
+                    90,
+                    54,
+                    194,
+                    38,
+                    133,
+                    135,
+                ],
+            ),
+            root_mht: RootMhtMeta {
+                pos: 15,
+            },
+        },
+        3: TxLogEntry {
+            bucket: "L1",
+            key: AeadKey(
+                [
+                    20,
+                    248,
+                    27,
+                    45,
+                    46,
+                    195,
+                    46,
+                    50,
+                    217,
+                    12,
+                    90,
+                    54,
+                    194,
+                    38,
+                    133,
+                    135,
+                ],
+            ),
+            root_mht: RootMhtMeta {
+                pos: 15,
+            },
+        },
+        4: TxLogEntry {
+            bucket: "L0",
+            key: AeadKey(
+                [
+                    20,
+                    248,
+                    27,
+                    45,
+                    46,
+                    195,
+                    46,
+                    50,
+                    217,
+                    12,
+                    90,
+                    54,
+                    194,
+                    38,
+                    133,
+                    135,
+                ],
+            ),
+            root_mht: RootMhtMeta {
+                pos: 15,
+            },
+        },
+    },
+    bucket_table: {
+        "L0": Bucket {
+            log_ids: {
+                4,
+            },
+        },
+        "L1": Bucket {
+            log_ids: {
+                3,
+            },
+        },
+        "WAL": Bucket {
+            log_ids: {
+                2,
+            },
+        },
+    },
+}
+TxLogStoreEdit delete_log: 2
+1
+1
+here: [2]
+deleted_log_id: 2
+delete_raw_log
+do_minor_compaction after SstManager { levels: [{4: SSTable { footer: FooterMeta { index_nblocks: 2, num_index: 13, total_records: 1024, sync_id: 1 }, range: 725..=1748 }}, {3: SSTable { footer: FooterMeta { index_nblocks: 2, num_index: 13, total_records: 1024, sync_id: 1 }, range: 0..=1023 }}] }
+test layers::lsm::tx_lsm_tree::tests::tx_lsm_tree_fns ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.01s
+
