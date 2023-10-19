@@ -53,16 +53,16 @@ impl<D: BlockSet> SwornDisk<D> {
     }
 
     /// Sync all cached data in the device to the storage medium for durability.
-    pub fn flush(&self) -> Result<()> {
+    pub fn sync(&self) -> Result<()> {
         self.tx_lsm_tree.commit()?;
         self.user_data.flush()
     }
 
-    /// Flush specified cached blocks to the underlying device.
-    pub fn flush_blocks(&self, blocks: &[Lba]) -> Result<usize> {
-        // TODO: Optimize flush_blocks
-        self.flush().map(|| blocks.len())
-    }
+    /// Flush specified cached blocks to the underlying device. // deprecated
+    // pub fn flush_blocks(&self, blocks: &[Lba]) -> Result<usize> {
+    //     // TODO: Optimize flush_blocks
+    //     self.flush().map(|| blocks.len())
+    // }
 
     /// Discard(trim) a specified number of blocks.
     pub fn discard(&self, blocks: &[Lba]) -> Result<usize> {
@@ -205,7 +205,7 @@ impl<K, V> TxEventListener for TxLsmTreeListener<K, V> {
         }
     }
 
-    fn on_tx_at_beginning(&self, tx: &Tx) -> Result<()> {
+    fn on_tx_begin(&self, tx: &Tx) -> Result<()> {
         match self.tx_type {
             TxType::Compaction | TxType::Migration => {
                 tx.context(|| self.block_alloc.open_diff_log())
@@ -213,7 +213,7 @@ impl<K, V> TxEventListener for TxLsmTreeListener<K, V> {
         }
     }
 
-    fn on_tx_near_end(&self, tx: &Tx) -> Result<()> {
+    fn on_tx_precommit(&self, tx: &Tx) -> Result<()> {
         match self.tx_type {
             TxType::Compaction | TxType::Migration => {
                 let diff_log = self.block_alloc.diff_log.lock().unwrap();
