@@ -58,10 +58,10 @@ pub trait TxEventListener<K, V> {
     fn on_drop_record(&self, record: &dyn AsKv<K, V>) -> Result<()>;
 
     /// Notify the listener after a tx just begined.
-    fn on_tx_begin(&self, tx: &Tx) -> Result<()>;
+    fn on_tx_begin(&self, tx: &mut Tx) -> Result<()>;
 
     /// Notify the listener before a tx ended.
-    fn on_tx_precommit(&self, tx: &Tx) -> Result<()>;
+    fn on_tx_precommit(&self, tx: &mut Tx) -> Result<()>;
 
     /// Notify the listener after a tx committed.
     fn on_tx_commit(&self);
@@ -84,7 +84,7 @@ pub enum TxType {
 }
 
 /// Levels in Lsm-tree.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum LsmLevel {
     L0 = 0,
     L1,
@@ -235,6 +235,7 @@ impl<K: Ord + Pod, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
         self.do_compaction_tx(LsmLevel::L0)
     }
 
+    // FIXME: Should we need this API?
     //     pub fn put_range(&self, range: &Range<K>) -> Result<()> {
     //         todo!()
     //     }
@@ -244,9 +245,9 @@ impl<K: Ord + Pod, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
         self.wal_append_tx.commit()
     }
 
-    /// Txs in TxLsmTree
+    /// TXs in TxLsmTree
 
-    /// Read Tx
+    /// Read TX
     fn do_read_tx(&self, key: &K) -> Result<V> {
         let mut tx = self.tx_log_store.new_tx();
 
@@ -274,12 +275,12 @@ impl<K: Ord + Pod, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
         read_res
     }
 
-    /// Append Tx
+    /// Append TX
     fn do_append_tx(&self, record: &dyn AsKv<K, V>) -> Result<()> {
         self.wal_append_tx.append(record)
     }
 
-    /// Compaction Tx
+    /// Compaction TX
     fn do_compaction_tx(&self, to_level: LsmLevel) -> Result<()> {
         match to_level {
             LsmLevel::L0 => self.do_minor_compaction(),
@@ -288,14 +289,14 @@ impl<K: Ord + Pod, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
         }
     }
 
-    /// Compaction Tx { to_level: LsmLevel::L0 }
+    /// Compaction TX { to_level: LsmLevel::L0 }
     fn do_minor_compaction(&self) -> Result<()> {
         let mut tx = self.tx_log_store.new_tx();
         let tx_type = TxType::Compaction {
             to_level: LsmLevel::L0,
         };
         let event_listener = self.listener_factory.new_event_listener(tx_type);
-        let res = event_listener.on_tx_begin(&tx);
+        let res = event_listener.on_tx_begin(&mut tx);
         if res.is_err() {
             tx.abort();
             return_errno!(TxAborted);
@@ -330,7 +331,7 @@ impl<K: Ord + Pod, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
             return_errno!(TxAborted);
         }
 
-        let res = event_listener.on_tx_precommit(&tx);
+        let res = event_listener.on_tx_precommit(&mut tx);
         if res.is_err() {
             tx.abort();
             return_errno!(TxAborted);
@@ -348,7 +349,7 @@ impl<K: Ord + Pod, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
         Ok(())
     }
 
-    //     /// Compaction Tx { to_level: LsmLevel::L1 }
+    //     /// Compaction TX { to_level: LsmLevel::L1 }
     //     fn do_major_compaction(&self, to_level: LsmLevel) -> Result<()> {
     //         let tx_log_store = self.tx_log_store;
     //         let tx = tx_log_store.new_tx();
@@ -430,7 +431,7 @@ impl<K: Ord + Pod, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
     //         }
     //     }
 
-    //     /// Migration Tx
+    //     /// Migration TX
     //     fn do_migration_tx(&self) -> Result<()> {
     //         // Discard all uncommitted records in SSTs
     //         let tx_log_store = self.tx_log_store;
@@ -1121,10 +1122,10 @@ mod tests {
         fn on_drop_record(&self, record: &dyn AsKv<K, V>) -> Result<()> {
             Ok(())
         }
-        fn on_tx_begin(&self, tx: &Tx) -> Result<()> {
+        fn on_tx_begin(&self, tx: &mut Tx) -> Result<()> {
             Ok(())
         }
-        fn on_tx_precommit(&self, tx: &Tx) -> Result<()> {
+        fn on_tx_precommit(&self, tx: &mut Tx) -> Result<()> {
             Ok(())
         }
         fn on_tx_commit(&self) {}
