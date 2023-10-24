@@ -83,30 +83,6 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         self.user_data_disk.nblocks()
     }
 
-    // /// Open the device on a disk, given the root cryption key.
-    // pub fn open(disk: D, root_key: Key) -> Result<Self> {
-    //     let data_disk = Self::subdisk_for_data(&disk)?;
-    //     let index_disk = Self::subdisk_for_tx_lsm_tree(&disk)?;
-
-    //     let tx_log_store = Arc::new(TxLogStore::recover(index_disk, root_key)?);
-    //     let block_validity_bitmap = Arc::new(Mutex::new(BitMap::repeat(true, data_disk.nblocks())));
-    //     let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
-    //         tx_log_store.clone(),
-    //         block_validity_bitmap.clone(),
-    //     ));
-    //     let on_drop_record_in_memtable =
-    //         |record: &Record| self.dealloc_block(record.value.hba);
-    //     let tx_lsm_tree =
-    //         TxLsmTree::recover(tx_log_store, listener_factory, Some(Arc::new(on_drop_record_in_memtable)))?;
-
-    //     Ok(Self {
-    //         tx_lsm_tree,
-    //         user_data_disk: data_disk,
-    //         root_key,
-    //         block_validity_bitmap,
-    //     })
-    // }
-
     /// Create the device on a disk, given the root cryption key.
     pub fn create(disk: D, root_key: Key) -> Result<Self> {
         let data_disk = Self::subdisk_for_data(&disk)?;
@@ -138,11 +114,74 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         })
     }
 
-    fn alloc_block(&self) -> Option<BlockId> {
-        let bitmap = self.block_validity_bitmap.lock();
-        for (nth, is_valid) in bitmap.iter().enumerate() {
+    /// Open the device on a disk, given the root cryption key.
+    pub fn open(disk: D, root_key: Key) -> Result<Self> {
+        let data_disk = Self::subdisk_for_data(&disk)?;
+        let index_disk = Self::subdisk_for_tx_lsm_tree(&disk)?;
+
+        let tx_log_store = Arc::new(TxLogStore::recover(index_disk, root_key)?);
+        let block_validity_bitmap = Arc::new(Mutex::new(BitMap::repeat(true, data_disk.nblocks())));
+        let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
+            tx_log_store.clone(),
+            block_validity_bitmap.clone(),
+        ));
+        Self::recover_bitmap(&tx_log_store, &block_validity_bitmap)?;
+
+        let bitmap = block_validity_bitmap.clone();
+        let on_drop_record_in_memtable = move |record: &dyn AsKv<RecordKey, RecordValue>| {
+            // Dealloc block
+            bitmap.lock().set(record.value().hba, true);
+        };
+        let tx_lsm_tree = TxLsmTree::recover(
+            tx_log_store,
+            listener_factory,
+            Some(Arc::new(on_drop_record_in_memtable)),
+        )?;
+
+        Ok(Self {
+            tx_lsm_tree,
+            user_data_disk: data_disk,
+            root_key,
+            block_validity_bitmap,
+        })
+    }
+
+    fn recover_bitmap(store: &Arc<TxLogStore<D>>, bitmap: &Arc<AllocBitmap>) -> Result<()> {
+        let mut tx = store.new_tx();
+        let res: Result<_> = tx.context(|| {
+            let diff_log = store.open_log_in(BUCKET_BLOCK_ALLOC_LOG)?;
+            let mut buf = Buf::alloc(diff_log.nblocks())?;
+            diff_log.read(0, buf.as_mut())?;
+            let buf_slice = buf.as_slice();
+            let mut offset = 0;
+            while offset <= buf.nblocks() * BLOCK_SIZE {
+                let diff = AllocDiff::try_from(buf_slice[offset]);
+                offset += 1;
+                if diff.is_err() {
+                    continue;
+                }
+                let bid = BlockId::from_bytes(&buf_slice[offset..offset + 8]);
+                offset += 8;
+                match diff? {
+                    AllocDiff::Alloc => bitmap.lock().set(bid, false),
+                    AllocDiff::Dealloc => bitmap.lock().set(bid, true),
+                }
+            }
+            Ok(())
+        });
+        if res.is_err() {
+            tx.abort();
+            return_errno!(TxAborted);
+        }
+        tx.commit()
+    }
+
+    fn alloc_block(&self) -> Option<Hba> {
+        let mut bitmap = self.block_validity_bitmap.lock();
+        for (nth, mut is_valid) in bitmap.iter_mut().enumerate() {
             if *is_valid {
-                return Some(nth as BlockId);
+                *is_valid = false;
+                return Some(nth as Hba);
             }
         }
         None
@@ -267,17 +306,28 @@ struct BlockAlloc<D> {
 /// Block validity bitmap.
 type AllocBitmap = Mutex<BitMap>;
 /// Incremental changes of block validity bitmap.
-type AllocDiffTable = Mutex<BTreeMap<BlockId, AllocDiff>>;
+type AllocDiffTable = Mutex<BTreeMap<Hba, AllocDiff>>;
 
-#[derive(PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum AllocDiff {
     Alloc = 3,
     Dealloc = 7,
 }
 
+impl TryFrom<u8> for AllocDiff {
+    type Error = Error;
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            3 => Ok(AllocDiff::Alloc),
+            7 => Ok(AllocDiff::Dealloc),
+            _ => Err(Error::new(InvalidArgs)),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 enum AllocDiffRecord {
-    Diff(BlockId, AllocDiff),
+    Diff(Hba, AllocDiff),
     Checkpoint,
 }
 
@@ -292,7 +342,7 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
     }
 
     /// Allocate a specifiied block, means update in-memory metadata.
-    fn alloc_block(&self, block_id: BlockId) -> Result<()> {
+    fn alloc_block(&self, block_id: Hba) -> Result<()> {
         let mut diff_table = self.diff_table.lock();
         let replaced = diff_table.insert(block_id, AllocDiff::Alloc);
         if replaced == Some(AllocDiff::Alloc) {
@@ -302,7 +352,7 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
     }
 
     /// Deallocate a specifiied block, means update in-memory metadata.
-    fn dealloc_block(&self, block_id: BlockId) -> Result<()> {
+    fn dealloc_block(&self, block_id: Hba) -> Result<()> {
         let mut diff_table = self.diff_table.lock();
         let replaced = diff_table.insert(block_id, AllocDiff::Dealloc);
         if replaced == Some(AllocDiff::Dealloc) {
@@ -317,7 +367,11 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
     fn prepare_diff_log(&self) -> Result<()> {
-        let diff_log = self.store.open_log_in(BUCKET_BLOCK_ALLOC_LOG)?;
+        let mut diff_log = self.store.open_log_in(BUCKET_BLOCK_ALLOC_LOG);
+        if let Err(e) = &diff_log && e.errno() == NotFound {
+            diff_log = self.store.create_log(BUCKET_BLOCK_ALLOC_LOG);
+        }
+        let diff_log = diff_log?;
         self.diff_log.lock().insert(diff_log.clone());
         Ok(())
     }
@@ -328,12 +382,18 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
     fn update_diff_log(&self) -> Result<()> {
-        let mut diff_table = self.diff_table.lock();
-        let diff_log = self.diff_log.lock().as_ref().unwrap();
+        let diff_table = self.diff_table.lock();
+        let mut diff_buf = Vec::new();
         for (block_id, block_diff) in diff_table.iter() {
-            // diff_log.append(AllocDiffRecord::Diff(block_id, block_diff))?;
+            diff_buf.push(*block_diff as u8);
+            diff_buf.extend_from_slice(block_id.as_bytes());
         }
-        Ok(())
+        let mut buf = Buf::alloc(align_up(diff_buf.len(), BLOCK_SIZE) / BLOCK_SIZE)?;
+        buf.as_mut_slice()[..diff_buf.len()].copy_from_slice(&diff_buf);
+
+        let diff_log = self.diff_log.lock();
+        let diff_log = diff_log.as_ref().unwrap();
+        diff_log.append(buf.as_ref())
     }
 
     fn update_bitmap(&self) {
