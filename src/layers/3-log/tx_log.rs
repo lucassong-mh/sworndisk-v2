@@ -47,6 +47,11 @@ pub struct Superblock {
 }
 
 impl<D: BlockSet + 'static> TxLogStore<D> {
+    pub fn debug_state(&self) {
+        self.raw_log_store.debug_state();
+        println!("{:#?}", self.state.lock().persistent);
+    }
+
     /// Formats the disk to create a new instance of `TxLogStore`.
     ///
     /// Each instance will be assigned a unique, automatically-generated root

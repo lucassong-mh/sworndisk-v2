@@ -107,6 +107,10 @@ pub struct RawLogStore<D> {
 }
 
 impl<D: BlockSet> RawLogStore<D> {
+    pub fn debug_state(&self) {
+        println!("{:#?}", self.state.lock().persistent);
+    }
+
     /// Creates a new store of raw logs given a chunk allocator and an untrusted disk.
     pub fn new(disk: D, tx_provider: Arc<TxProvider>, chunk_alloc: ChunkAlloc) -> Arc<Self> {
         Self::from_parts(RawLogStoreState::new(), disk, chunk_alloc, tx_provider)
@@ -170,6 +174,24 @@ impl<D: BlockSet> RawLogStore<D> {
                         );
                     }
                 });
+
+                // Add lazy delete for newly created logs
+                let mut state = state.lock();
+                for log_id in created_logs {
+                    let log_entry = state.persistent.find_log(log_id);
+                    if log_entry.is_none() || state.lazy_deletes.contains_key(&log_id) {
+                        continue;
+                    }
+
+                    let log_entry = log_entry.unwrap().clone();
+                    let chunk_alloc = chunk_alloc.clone();
+                    state.lazy_deletes.insert(
+                        log_id,
+                        Arc::new(LazyDelete::new(log_entry, move |entry| {
+                            chunk_alloc.dealloc_batch(entry.head.chunks.iter().map(|id| *id))
+                        })),
+                    );
+                }
             }
         });
 

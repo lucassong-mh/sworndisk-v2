@@ -201,16 +201,6 @@ struct CryptBuf {
 }
 
 impl<L: BlockLog> CryptoLog<L> {
-    // Buffer capacity for appended data nodes.
-    const APPEND_BUF_CAPACITY: usize = MHT_NBRANCHES;
-
-/// Prepares buffer for node cryption.
-struct CryptBuf {
-    pub plain: RefCell<Buf>,
-    pub cipher: RefCell<Buf>,
-}
-
-impl<L: BlockLog> CryptoLog<L> {
     /// Creates a new `CryptoLog`.
     ///
     /// A newly-created instance won't occupy any space on the `block_log`
