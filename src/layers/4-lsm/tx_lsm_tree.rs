@@ -5,6 +5,8 @@
 //! Responsible for managing two `MemTable`s, a `TxLogStore` to
 //! manage tx logs (WAL and SSTs). Operations are executed based
 //! on internal transactions.
+use super::mem_table::{MemTable, ValueEx};
+use super::sstable::SSTable;
 use crate::layers::bio::{BlockId, BlockSet, Buf};
 use crate::layers::log::{TxLog, TxLogId, TxLogStore};
 use crate::prelude::*;
@@ -12,9 +14,8 @@ use crate::tx::{Tx, TxStatus};
 
 use alloc::collections::BTreeMap;
 use core::fmt::Debug;
-use core::marker::PhantomData;
 use core::mem::size_of;
-use core::ops::{Range, RangeInclusive};
+use core::ops::Range;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use pod::Pod;
 use spin::{Mutex, RwLock};
@@ -29,7 +30,10 @@ const LEVELI_RATIO: u16 = 10;
 static MASTER_SYNC_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A LSM-tree built upon `TxLogStore`.
-pub struct TxLsmTree<K, V, D> {
+pub struct TxLsmTree<K, V, D>
+where
+    D: BlockSet,
+{
     mem_tables: [Arc<RwLock<MemTable<K, V>>>; 2],
     immut_idx: AtomicU8,
     tx_log_store: Arc<TxLogStore<D>>,
@@ -92,7 +96,16 @@ pub enum LsmLevel {
     // TODO: Support variable levels
 }
 
-impl<K: Ord + Pod + Debug, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
+impl LsmLevel {
+    pub fn upper_level(&self) -> Option<LsmLevel> {
+        match self {
+            LsmLevel::L0 => None,
+            LsmLevel::L1 => Some(LsmLevel::L0),
+        }
+    }
+}
+
+impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V, D> {
     const MEMTABLE_CAPACITY: usize = 1024;
 
     /// Format a `TxLsmTree` from a given `TxLogStore`.
@@ -102,12 +115,15 @@ impl<K: Ord + Pod + Debug, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
     ) -> Result<Self> {
         let mem_tables = {
+            let sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
             let mem_table = Arc::new(RwLock::new(MemTable::new(
                 Self::MEMTABLE_CAPACITY,
+                sync_id,
                 on_drop_record_in_memtable.clone(),
             )));
             let immut_mem_table = Arc::new(RwLock::new(MemTable::new(
                 Self::MEMTABLE_CAPACITY,
+                sync_id,
                 on_drop_record_in_memtable,
             )));
             [mem_table, immut_mem_table]
@@ -146,14 +162,19 @@ impl<K: Ord + Pod + Debug, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
             res.unwrap()
         };
         let mem_tables = {
-            let mut mem_table =
-                MemTable::new(Self::MEMTABLE_CAPACITY, on_drop_record_in_memtable.clone());
+            let sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
+            let mut mem_table = MemTable::new(
+                Self::MEMTABLE_CAPACITY,
+                sync_id,
+                on_drop_record_in_memtable.clone(),
+            );
             for (k, v) in committed_records {
                 mem_table.put(k, v);
             }
 
             let immut_mem_table = Arc::new(RwLock::new(MemTable::new(
                 Self::MEMTABLE_CAPACITY,
+                sync_id,
                 on_drop_record_in_memtable,
             )));
             [Arc::new(RwLock::new(mem_table)), immut_mem_table]
@@ -228,6 +249,10 @@ impl<K: Ord + Pod + Debug, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
             return Ok(());
         }
 
+        println!("here");
+        self.wal_append_tx.commit()?;
+        println!("here 2");
+
         // 3. Trigger compaction if needed
         self.immut_idx.fetch_xor(1, Ordering::Release);
         // Do major compaction first if needed
@@ -245,7 +270,10 @@ impl<K: Ord + Pod + Debug, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
 
     /// User-called flush
     pub fn sync(&self) -> Result<()> {
-        self.wal_append_tx.commit()
+        // TODO: Store master sync id to trusted storage
+        let master_sync_id = MASTER_SYNC_ID.fetch_add(1, Ordering::Release) + 1;
+        self.wal_append_tx.sync(master_sync_id)?;
+        self.active_mem_table().write().commit(master_sync_id)
     }
 
     /// TXs in TxLsmTree
@@ -294,6 +322,9 @@ impl<K: Ord + Pod + Debug, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
 
     /// Compaction TX { to_level: LsmLevel::L0 }
     fn do_minor_compaction(&self) -> Result<()> {
+        println!("do_minor_compaction before {:?}", self.sst_manager.read());
+        self.tx_log_store.debug_state();
+
         let mut tx = self.tx_log_store.new_tx();
         let tx_type = TxType::Compaction {
             to_level: LsmLevel::L0,
@@ -302,7 +333,10 @@ impl<K: Ord + Pod + Debug, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
         let res = event_listener.on_tx_begin(&mut tx);
         if res.is_err() {
             tx.abort();
-            return_errno!(TxAborted);
+            return_errno_with_msg!(
+                TxAborted,
+                "minor compaction TX callback 'on_tx_begin' failed"
+            );
         }
 
         let res: Result<_> = tx.context(|| {
@@ -331,135 +365,153 @@ impl<K: Ord + Pod + Debug, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
         });
         if res.is_err() {
             tx.abort();
-            return_errno!(TxAborted);
+            return_errno_with_msg!(TxAborted, "minor compaction TX failed");
         }
 
         let res = event_listener.on_tx_precommit(&mut tx);
         if res.is_err() {
             tx.abort();
-            return_errno!(TxAborted);
+            return_errno_with_msg!(
+                TxAborted,
+                "minor compaction TX callback 'on_tx_precommit' failed"
+            );
         }
 
-        if res.is_ok() {
-            tx.commit()?;
-            event_listener.on_tx_commit();
-            self.immut_mem_table().write().clear();
-            // Discard current WAL
-            self.wal_append_tx.discard()?;
-        } else {
-            tx.abort();
-        }
+        tx.commit()?;
+        event_listener.on_tx_commit();
+        self.immut_mem_table().write().clear();
+
+        self.tx_log_store.debug_state();
+
+        // Discard current WAL
+        self.wal_append_tx.discard()?;
+
+        println!("do_minor_compaction after {:?}", self.sst_manager.read());
         Ok(())
     }
 
     /// Compaction TX { to_level: LsmLevel::L1 }
     fn do_major_compaction(&self, to_level: LsmLevel) -> Result<()> {
+        println!("do_major_compaction before {:?}", self.sst_manager.read());
+        self.tx_log_store.debug_state();
+
+        let from_level = to_level.upper_level().unwrap();
         let mut tx = self.tx_log_store.new_tx();
         let tx_type = TxType::Compaction { to_level };
         let event_listener = self.listener_factory.new_event_listener(tx_type);
         let res = event_listener.on_tx_begin(&mut tx);
         if res.is_err() {
             tx.abort();
-            return_errno!(TxAborted);
+            return_errno_with_msg!(
+                TxAborted,
+                "major compaction TX callback 'on_tx_begin' failed"
+            );
         }
 
         let tx_log_store = self.tx_log_store.clone();
         let mut compacted_sst_ids = Vec::new();
         let mut compacted_ssts = Vec::new();
+        let mut compacted_records = Vec::new();
         let master_sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
         let listener = event_listener.clone();
         let res: Result<_> = tx.context(move || {
             // Collect overlapped SSTs
             let sst_manager = self.sst_manager.read();
-            let upper_sst = sst_manager.list_level(LsmLevel::L0).last().unwrap();
-            let upper_range = upper_sst.1.range();
-            let lower_ssts = sst_manager.list_level(LsmLevel::L1);
-            let overlapped_lower_ssts = lower_ssts.filter(|sst| sst.1.overlap_with(&upper_range));
-            compacted_sst_ids.push(*upper_sst.0);
-            let sync_id = upper_sst.1.sync_id();
-            let mut records = upper_sst
-                .1
-                .collect_all_records(&tx_log_store.open_log(*upper_sst.0, false)?)?;
-            if sync_id < master_sync_id {
-                for r in records.iter_mut() {
-                    match r.1 {
-                        ValueEx::Uncommitted(v) => r.1 = ValueEx::Committed(v),
-                        ValueEx::CommittedAndUncommitted(cv, ucv) => {
-                            r.1 = ValueEx::Committed(ucv);
-                            listener.on_drop_record(&(r.0, cv))?;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            compacted_ssts.push(records);
-            for (&id, sst) in overlapped_lower_ssts {
-                compacted_sst_ids.push(id);
+            // TODO: Make number of upper level SSTs for compaction configurable
+
+            let upper_range = {
+                let (id, sst) = sst_manager.list_level(from_level).last().unwrap();
+                compacted_sst_ids.push((*id, from_level));
+                compacted_ssts.push(sst.clone());
+                sst.range()
+            };
+            let lower_ssts = sst_manager.list_level(to_level);
+
+            let _: Vec<()> = lower_ssts
+                .filter(|(_, sst)| sst.overlap_with(&upper_range))
+                .map(|(id, sst)| {
+                    compacted_sst_ids.push((*id, to_level));
+                    compacted_ssts.push(sst.clone());
+                })
+                .collect();
+            drop(sst_manager);
+
+            for sst in compacted_ssts {
                 let sync_id = sst.sync_id();
                 let mut records =
-                    sst.collect_all_records(&tx_log_store.open_log(*upper_sst.0, false)?)?;
+                    sst.collect_all_records(&tx_log_store.open_log(sst.id(), false)?)?;
+                debug_assert!(sync_id <= master_sync_id);
                 if sync_id < master_sync_id {
-                    for r in records.iter_mut() {
-                        match r.1 {
-                            ValueEx::Uncommitted(v) => r.1 = ValueEx::Committed(v),
+                    for (k, v_ex) in records.iter_mut() {
+                        match v_ex {
+                            ValueEx::Uncommitted(v) => *v_ex = ValueEx::Committed(*v),
                             ValueEx::CommittedAndUncommitted(cv, ucv) => {
-                                r.1 = ValueEx::Committed(ucv);
-                                listener.on_drop_record(&(r.0, cv))?;
+                                listener.on_drop_record(&(*k, *cv))?;
+                                *v_ex = ValueEx::Committed(*ucv);
                             }
                             _ => {}
                         }
                     }
                 }
-                compacted_ssts.push(records);
+                compacted_records.push(records);
             }
-            drop(sst_manager);
 
             // Collect records during compaction
-            let compacted_records = Self::merge_sort(compacted_ssts, &listener)?;
+            let sorted_records = Self::merge_sort(compacted_records, &listener)?;
+            // println!(
+            //     "sorted records: {:?}, {:?}, {:?}",
+            //     &sorted_records[0],
+            //     &sorted_records[1],
+            //     &sorted_records.last().unwrap()
+            // );
 
             let (mut created_ssts, mut deleted_ssts) = (vec![], vec![]);
             // Create new SSTs
-            for records in compacted_records.chunks(Self::MEMTABLE_CAPACITY) {
+            for records in sorted_records.chunks(Self::MEMTABLE_CAPACITY) {
                 let new_log = tx_log_store.create_log(BUCKET_L1)?;
                 let new_sst = SSTable::build(records, master_sync_id, &new_log)?;
-                created_ssts.push((new_sst, LsmLevel::L1));
+                created_ssts.push((new_sst, to_level));
             }
 
             // Delete old SSTs
-            for id in compacted_sst_ids {
+            println!("delete log: {:?}", compacted_sst_ids);
+            for (id, level) in compacted_sst_ids {
                 tx_log_store.delete_log(id)?;
-                deleted_ssts.push((id, LsmLevel::L1));
+                deleted_ssts.push((id, level));
             }
             Ok((created_ssts, deleted_ssts))
         });
         if res.is_err() {
             tx.abort();
-            return_errno!(TxAborted);
+            return_errno_with_msg!(TxAborted, "major compaction TX failed");
         }
         let (created_ssts, deleted_ssts) = res.unwrap();
 
         let res = event_listener.on_tx_precommit(&mut tx);
         if res.is_err() {
             tx.abort();
-            return_errno!(TxAborted);
+            return_errno_with_msg!(
+                TxAborted,
+                "major compaction TX callback 'on_tx_precommit' failed"
+            );
         }
 
-        if res.is_ok() {
-            tx.commit()?;
-            event_listener.on_tx_commit();
-            // Update SST cache
-            let mut sst_manager = self.sst_manager.write();
-            created_ssts
-                .into_iter()
-                .for_each(|(sst, level)| sst_manager.insert(sst, level));
-            deleted_ssts
-                .into_iter()
-                .for_each(|(id, level)| sst_manager.remove(id, level));
-            Ok(())
-        } else {
-            tx.abort();
-            Err(Error::new(TxAborted))
-        }
+        tx.commit()?;
+        event_listener.on_tx_commit();
+        // Update SST cache
+        let mut sst_manager = self.sst_manager.write();
+        created_ssts
+            .into_iter()
+            .for_each(|(sst, level)| sst_manager.insert(sst, level));
+        deleted_ssts
+            .into_iter()
+            .for_each(|(id, level)| sst_manager.remove(id, level));
+        drop(sst_manager);
+
+        println!("do_major_compaction after {:?}", self.sst_manager.read());
+        self.tx_log_store.debug_state();
+
+        Ok(())
     }
 
     fn merge_sort(
@@ -547,7 +599,7 @@ impl<K: Ord + Pod + Debug, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
         let res = event_listener.on_tx_begin(&mut tx);
         if res.is_err() {
             tx.abort();
-            return_errno!(TxAborted);
+            return_errno_with_msg!(TxAborted, "migration TX callback 'on_tx_begin' failed");
         }
 
         let master_sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
@@ -575,6 +627,9 @@ impl<K: Ord + Pod + Debug, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
                         }
                     })
                     .collect();
+                if records.is_empty() {
+                    continue;
+                }
                 // Create new migrated SST
                 let new_log = tx_log_store.create_log(BUCKET_L0)?;
                 let new_sst = SSTable::build(&records, master_sync_id, &new_log)?;
@@ -590,32 +645,28 @@ impl<K: Ord + Pod + Debug, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
         });
         if res.is_err() {
             tx.abort();
-            return_errno!(TxAborted);
+            res.unwrap();
+            return_errno_with_msg!(TxAborted, "migration TX failed");
         }
         let (created_ssts, deleted_ssts) = res.unwrap();
 
         let res = event_listener.on_tx_precommit(&mut tx);
         if res.is_err() {
             tx.abort();
-            return_errno!(TxAborted);
+            return_errno_with_msg!(TxAborted, "migration TX callback 'on_tx_precommit' failed");
         }
 
-        if res.is_ok() {
-            tx.commit()?;
-            event_listener.on_tx_commit();
-            // Update SST cache
-            let mut sst_manager = self.sst_manager.write();
-            created_ssts
-                .into_iter()
-                .for_each(|(sst, level)| sst_manager.insert(sst, level));
-            deleted_ssts
-                .into_iter()
-                .for_each(|(id, level)| sst_manager.remove(id, level));
-            Ok(())
-        } else {
-            tx.abort();
-            Err(Error::new(TxAborted))
-        }
+        tx.commit()?;
+        event_listener.on_tx_commit();
+        // Update SST cache
+        let mut sst_manager = self.sst_manager.write();
+        created_ssts
+            .into_iter()
+            .for_each(|(sst, level)| sst_manager.insert(sst, level));
+        deleted_ssts
+            .into_iter()
+            .for_each(|(id, level)| sst_manager.remove(id, level));
+        Ok(())
     }
 
     fn active_mem_table(&self) -> &Arc<RwLock<MemTable<K, V>>> {
@@ -628,7 +679,10 @@ impl<K: Ord + Pod + Debug, V: Pod, D: BlockSet + 'static> TxLsmTree<K, V, D> {
 }
 
 /// An append tx in `TxLsmTree`.
-struct WalAppendTx<D> {
+struct WalAppendTx<D>
+where
+    D: BlockSet,
+{
     inner: Mutex<WalAppendTxInner<D>>,
 }
 
@@ -649,6 +703,7 @@ impl<D: BlockSet + 'static> WalAppendTxInner<D> {
             let log_id_opt = self.log_id.clone();
             let res = wal_tx.context(|| {
                 if log_id_opt.is_some() {
+                    println!("open log");
                     store.open_log(log_id_opt.unwrap(), true)
                 } else {
                     store.create_log(BUCKET_WAL)
@@ -663,15 +718,6 @@ impl<D: BlockSet + 'static> WalAppendTxInner<D> {
         };
         let _ = self.wal_tx_and_log.insert(wal_tx_and_log);
         Ok(())
-    }
-
-    fn reset(&mut self, discard: bool) {
-        self.wal_tx_and_log
-            .take()
-            .map(|(wal_tx, _)| debug_assert!(wal_tx.status() == TxStatus::Committed));
-        if discard {
-            self.log_id.take();
-        }
     }
 }
 
@@ -721,62 +767,84 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
         if record_buf.len() < Self::BUF_CAP {
             return Ok(());
         }
-        let mut buf = Buf::alloc(align_up(Self::BUF_CAP, BLOCK_SIZE) / BLOCK_SIZE)?;
-        buf.as_mut_slice()[..record_buf.len()].copy_from_slice(&record_buf);
+
+        let buf = record_buf.clone();
+        record_buf.clear();
 
         let (wal_tx, wal_log) = inner.wal_tx_and_log.as_mut().unwrap();
-
-        let res = wal_tx.context(|| wal_log.append(buf.as_ref()));
-        if res.is_err() {
-            wal_tx.abort();
-        }
-        res
+        self.flush_buf(buf, wal_tx, wal_log)?;
+        Ok(())
     }
 
     /// Commit phase for Append Tx, mainly to commit(or abort) the tx.
     pub fn commit(&self) -> Result<()> {
         let mut inner = self.inner.lock();
         if inner.wal_tx_and_log.is_none() {
+            return Ok(());
+        }
+
+        let record_buf = &mut inner.record_buf;
+        println!("record buf len: {}", record_buf.len());
+        let buf = record_buf.clone();
+        record_buf.clear();
+        let (mut wal_tx, wal_log) = inner.wal_tx_and_log.take().unwrap();
+        // Append cached records
+        // Append master sync id
+        self.flush_buf(buf, &mut wal_tx, &wal_log)?;
+
+        drop(wal_log);
+        wal_tx.commit()
+    }
+
+    pub fn sync(&self, sync_id: u64) -> Result<()> {
+        println!("synccccccc");
+        let mut inner = self.inner.lock();
+        if inner.wal_tx_and_log.is_none() {
             inner.perpare()?;
         }
         let record_buf = &mut inner.record_buf;
         record_buf.push(WalAppendFlag::Sync as u8);
+        record_buf.extend_from_slice(&sync_id.to_le_bytes());
+        let buf = record_buf.clone();
+        record_buf.clear();
 
-        // TODO: Store master sync id to trusted storage
-        let pre_master_sync_id = MASTER_SYNC_ID.fetch_add(1, Ordering::Release);
+        let (mut wal_tx, wal_log) = inner.wal_tx_and_log.take().unwrap();
+        // Append cached records
+        // Append master sync id
+        self.flush_buf(buf, &mut wal_tx, &wal_log)?;
 
-        record_buf.extend_from_slice(&(pre_master_sync_id + 1).to_le_bytes());
+        drop(wal_log);
+        wal_tx.commit()
+    }
+
+    fn flush_buf(&self, record_buf: Vec<u8>, tx: &mut Tx, log: &Arc<TxLog<D>>) -> Result<()> {
+        println!("flush buf");
         let mut buf = Buf::alloc(align_up(record_buf.len(), BLOCK_SIZE) / BLOCK_SIZE)?;
         buf.as_mut_slice()[..record_buf.len()].copy_from_slice(&record_buf);
-
-        let (wal_tx, wal_log) = inner.wal_tx_and_log.as_mut().unwrap();
-        let res = wal_tx.context(|| {
+        let res = tx.context(|| {
             // Append cached records
             // Append master sync id
-            wal_log.append(buf.as_ref())
+            log.append(buf.as_ref())
         });
         if res.is_err() {
-            wal_tx.abort();
-            return res;
+            tx.abort();
         }
-        wal_tx.commit()?;
-
-        inner.reset(false);
-        Ok(())
+        res
     }
 
     pub fn discard(&self) -> Result<()> {
         let mut inner = self.inner.lock();
+        debug_assert!(inner.record_buf.is_empty());
         let store = inner.tx_log_store.clone();
-        let (wal_tx, wal_log) = inner.wal_tx_and_log.as_mut().unwrap();
-        let res = wal_tx.context(|| store.delete_log(wal_log.id()));
+        let _ = inner.wal_tx_and_log.take();
+        let log_id = inner.log_id.take().unwrap();
+        let mut wal_tx = store.new_tx();
+        let res = wal_tx.context(move || store.delete_log(log_id));
         if res.is_err() {
             wal_tx.abort();
             return res;
         }
-        wal_tx.commit()?;
-        inner.reset(true);
-        Ok(())
+        wal_tx.commit()
     }
 
     pub fn collect_committed_records<K: Pod, V: Pod>(wal: &TxLog<D>) -> Result<Vec<(K, V)>> {
@@ -828,132 +896,17 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
     }
 }
 
+impl<D: BlockSet> Drop for WalAppendTx<D> {
+    fn drop(&mut self) {
+        // self.commit().unwrap()
+    }
+}
+
 /// Represent any type that includes a key and a value.
 pub trait AsKv<K, V> {
     fn key(&self) -> &K;
 
     fn value(&self) -> &V;
-}
-
-/// MemTable for LSM-tree.
-pub(super) struct MemTable<K, V> {
-    // Use `ValueEx<V>` instead `V` to maintain multiple
-    // values tagged with commit id for each key
-    table: BTreeMap<K, ValueEx<V>>,
-    size: usize,
-    cap: usize,
-    sync_id: u64,
-    on_drop_record: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
-}
-
-// Value which is commit-aware
-// At most one uncommitted&one committed records can coexist at the same time
-#[derive(Clone)]
-pub(super) enum ValueEx<V> {
-    Committed(V),
-    Uncommitted(V),
-    CommittedAndUncommitted(V, V),
-}
-
-impl<V: Copy> ValueEx<V> {
-    fn new(value: V) -> Self {
-        Self::Uncommitted(value)
-    }
-
-    fn get(&self) -> &V {
-        match self {
-            ValueEx::Committed(v) => v,
-            ValueEx::Uncommitted(v) => v,
-            ValueEx::CommittedAndUncommitted(_, v) => v,
-        }
-    }
-
-    fn put(&mut self, value: V) -> Option<V> {
-        // TODO: Optimize this by using `mem::take`
-        let (updated, replaced) = match self {
-            ValueEx::Committed(v) => (Self::CommittedAndUncommitted(*v, value), None),
-            ValueEx::Uncommitted(v) => (Self::Uncommitted(value), Some(*v)),
-            ValueEx::CommittedAndUncommitted(cv, ucv) => {
-                (Self::CommittedAndUncommitted(*cv, value), Some(*cv))
-            }
-        };
-        *self = updated;
-        replaced
-    }
-
-    fn commit(&mut self) -> Option<V> {
-        // TODO: Optimize this by using `mem::take`
-        let (updated, replaced) = match self {
-            ValueEx::Committed(v) => (None, None),
-            ValueEx::Uncommitted(v) => (Some(Self::Committed(*v)), None),
-            ValueEx::CommittedAndUncommitted(cv, ucv) => (Some(Self::Committed(*cv)), Some(*ucv)),
-        };
-        updated.map(|updated| *self = updated);
-        replaced
-    }
-}
-
-impl<K: Copy + Ord + Debug, V: Copy> MemTable<K, V> {
-    pub fn new(cap: usize, on_drop_record: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>) -> Self {
-        Self {
-            table: BTreeMap::new(),
-            size: 0,
-            cap,
-            sync_id: MASTER_SYNC_ID.load(Ordering::Relaxed),
-            on_drop_record,
-        }
-    }
-
-    pub fn get(&self, key: &K) -> Option<&V> {
-        let value_ex = self.table.get(key)?;
-        // Return value which tagged most latest commit id
-        Some(value_ex.get())
-    }
-
-    pub fn put(&mut self, key: K, value: V) -> Option<V> {
-        if let Some(value_ex) = self.table.get_mut(&key) {
-            if let Some(replaced) = value_ex.put(value) {
-                self.on_drop_record
-                    .as_ref()
-                    .map(|on_drop_record| on_drop_record(&(key, replaced)));
-                return Some(replaced);
-            }
-        }
-        self.table.insert(key, ValueEx::new(value));
-        self.size += 1;
-        None
-    }
-
-    pub fn commit(&mut self) -> Result<()> {
-        for (k, v_ex) in &mut self.table {
-            if let Some(replaced) = v_ex.commit() {
-                self.on_drop_record
-                    .as_ref()
-                    .map(|on_drop_record| on_drop_record(&(*k, replaced)));
-                self.size -= 1;
-            }
-        }
-        self.sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
-        Ok(())
-    }
-
-    // Records should be tagged with commit id
-    pub fn keys_values(&self) -> impl Iterator<Item = (&K, &ValueEx<V>)> {
-        self.table.iter()
-    }
-
-    pub fn size(&self) -> usize {
-        self.size
-    }
-
-    pub fn at_capacity(&self) -> bool {
-        self.size == self.cap
-    }
-
-    pub fn clear(&mut self) {
-        self.table.clear();
-        self.size = 0;
-    }
 }
 
 impl<K, V> AsKv<K, V> for (K, V) {
@@ -966,12 +919,11 @@ impl<K, V> AsKv<K, V> for (K, V) {
     }
 }
 
-static SST_VERSION: AtomicU64 = AtomicU64::new(0);
-
 /// SST manager of the `TxLsmTree`,
 /// cache SST's index blocks of every level in memory.
 // TODO: Support variable levels
 // Issue: Should changes support abort?
+#[derive(Debug)]
 struct SstManager<K, V> {
     levels: Vec<BTreeMap<TxLogId, Arc<SSTable<K, V>>>>,
 }
@@ -1001,336 +953,6 @@ impl<K: Ord + Pod + Debug, V: Pod> SstManager<K, V> {
         let level_ssts = &mut self.levels[level as usize];
         let removed = level_ssts.remove(&id);
         debug_assert!(removed.is_some());
-    }
-}
-
-/// Sorted String Table (SST) for LSM-tree
-///
-/// format:
-/// ```text
-/// |   [record]    |   [record]    |...|         Footer           |
-/// |K|flag|V(V)|...|   [record]    |...| [IndexEntry] | FooterMeta|
-/// |  BLOCK_SIZE   |  BLOCK_SIZE   |...|                          |
-/// ```
-///
-// TODO: Add bloom filter and second-level index
-// TODO: Constrain encoded KV's length
-struct SSTable<K, V> {
-    // Cache txlog id, and footer block
-    id: TxLogId,
-    footer: Footer<K>,
-    phantom: PhantomData<(K, V)>,
-}
-
-struct Footer<K> {
-    meta: FooterMeta,
-    index: Vec<IndexEntry<K>>,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod)]
-struct FooterMeta {
-    index_nblocks: u16,
-    num_index: u16,
-    total_records: u32,
-    sync_id: u64,
-}
-const FOOTER_META_SIZE: usize = size_of::<FooterMeta>();
-
-struct IndexEntry<K> {
-    pos: BlockId,
-    first: K,
-    last: K,
-}
-
-#[derive(PartialEq, Eq, Debug)]
-enum RecordFlag {
-    Invalid = 0,
-    Committed = 7,
-    Uncommitted = 11,
-    CommittedAndUncommitted = 19,
-}
-
-impl From<u8> for RecordFlag {
-    fn from(value: u8) -> Self {
-        match value {
-            7 => RecordFlag::Committed,
-            11 => RecordFlag::Uncommitted,
-            19 => RecordFlag::CommittedAndUncommitted,
-            _ => RecordFlag::Invalid,
-        }
-    }
-}
-
-impl<K: Ord + Pod + Debug, V: Pod> SSTable<K, V> {
-    const BID_SIZE: usize = size_of::<BlockId>();
-    const K_SIZE: usize = size_of::<K>();
-    const V_SIZE: usize = size_of::<V>();
-    const MAX_RECORD_SIZE: usize = Self::BID_SIZE + 1 + 2 * Self::V_SIZE;
-    const INDEX_ENTRY_SIZE: usize = Self::BID_SIZE + Self::K_SIZE;
-
-    fn id(&self) -> TxLogId {
-        self.id
-    }
-
-    fn footer(&self) -> &Footer<K> {
-        &self.footer
-    }
-
-    fn sync_id(&self) -> u64 {
-        self.footer.meta.sync_id
-    }
-
-    fn range(&self) -> RangeInclusive<K> {
-        RangeInclusive::new(
-            self.footer.index[0].first,
-            self.footer.index[self.footer.meta.num_index as usize - 1].last,
-        )
-    }
-
-    fn overlap_with(&self, rhs_range: &RangeInclusive<K>) -> bool {
-        let lhs_range = self.range();
-        !(lhs_range.end() < rhs_range.start() || lhs_range.start() > rhs_range.end())
-    }
-
-    fn search<D: BlockSet>(&self, key: &K, tx_log: &Arc<TxLog<D>>) -> Option<V> {
-        let target_block_pos = self.search_in_cache(key)?;
-        self.search_in_log(key, target_block_pos, tx_log).ok()
-    }
-
-    /// Search a target records block position in the SST (from cache).
-    fn search_in_cache(&self, key: &K) -> Option<BlockId> {
-        // TODO: Use iter::find
-        for (i, entry) in self.footer.index.iter().enumerate() {
-            if (entry.first..=entry.last).contains(key) {
-                return Some(self.footer.index[i].pos);
-            }
-        }
-        None
-    }
-
-    /// Search a target record in the SST (from log).
-    ///
-    /// # Panics
-    ///
-    /// This method must be called within a TX. Otherwise, this method panics.
-    fn search_in_log<D: BlockSet>(
-        &self,
-        key: &K,
-        target_pos: BlockId,
-        tx_log: &Arc<TxLog<D>>,
-    ) -> Result<V> {
-        debug_assert!(tx_log.id() == self.id());
-        let mut rbuf = Buf::alloc(1)?;
-        tx_log.read(target_pos, rbuf.as_mut())?;
-        // Search in the records block
-        let rbuf_slice = rbuf.as_slice();
-        let mut offset = 0;
-        loop {
-            if offset + Self::MAX_RECORD_SIZE > BLOCK_SIZE {
-                break;
-            }
-            let k = K::from_bytes(&rbuf_slice[offset..offset + Self::K_SIZE]);
-            offset += Self::K_SIZE;
-            let flag = RecordFlag::from(rbuf_slice[offset]);
-            offset += 1;
-            if flag == RecordFlag::Invalid {
-                break;
-            }
-            let target_value = match flag {
-                RecordFlag::Committed | RecordFlag::Uncommitted => {
-                    let v = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
-                    offset += Self::V_SIZE;
-                    v
-                }
-                RecordFlag::CommittedAndUncommitted => {
-                    let v = V::from_bytes(
-                        &rbuf_slice[offset + Self::V_SIZE..offset + 2 * Self::V_SIZE],
-                    );
-                    offset += 2 * Self::V_SIZE;
-                    v
-                }
-                _ => unreachable!(),
-            };
-            if k != *key {
-                continue;
-            }
-            return Ok(target_value);
-        }
-
-        return_errno_with_msg!(NotFound, "record not existed in the tx log");
-    }
-
-    /// Build a SST given a bunch of records, after build, the SST sealed.
-    ///
-    /// # Panics
-    ///
-    /// This method must be called within a TX. Otherwise, this method panics.
-    fn build<D: BlockSet>(
-        records: &[(K, ValueEx<V>)],
-        sync_id: u64,
-        tx_log: &TxLog<D>,
-    ) -> Result<Self> {
-        let total_records = records.len();
-        let mut index = Vec::new();
-        let mut buf = Vec::with_capacity(BLOCK_SIZE);
-        let mut append_buf = Buf::alloc(1)?;
-        let mut pos = 0 as BlockId;
-        let mut first_k = None;
-        for (i, record) in records.iter().enumerate() {
-            if buf.is_empty() {
-                let _ = first_k.insert(record.0);
-            }
-            buf.extend_from_slice(record.0.as_bytes());
-            match record.1 {
-                ValueEx::Committed(v) => {
-                    buf.push(RecordFlag::Committed as u8);
-                    buf.extend_from_slice(v.as_bytes());
-                }
-                ValueEx::Uncommitted(v) => {
-                    buf.push(RecordFlag::Uncommitted as u8);
-                    buf.extend_from_slice(v.as_bytes());
-                }
-                ValueEx::CommittedAndUncommitted(cv, ucv) => {
-                    buf.push(RecordFlag::CommittedAndUncommitted as u8);
-                    buf.extend_from_slice(cv.as_bytes());
-                    buf.extend_from_slice(ucv.as_bytes());
-                }
-            }
-            if BLOCK_SIZE - buf.len() < Self::MAX_RECORD_SIZE || i == total_records - 1 {
-                append_buf.as_mut_slice()[..buf.len()].copy_from_slice(&buf);
-                tx_log.append(append_buf.as_ref())?;
-                index.push(IndexEntry {
-                    pos,
-                    first: first_k.unwrap(),
-                    last: record.0,
-                });
-                pos += 1;
-                buf.clear();
-                append_buf.as_mut_slice().fill(0);
-            }
-        }
-
-        debug_assert!(buf.is_empty());
-        for entry in &index {
-            buf.extend_from_slice(&entry.pos.to_le_bytes());
-            buf.extend_from_slice(entry.first.as_bytes());
-        }
-        let index_nblocks = {
-            let nblocks = align_up(buf.len(), BLOCK_SIZE) / BLOCK_SIZE;
-            if nblocks * BLOCK_SIZE - buf.len() <= FOOTER_META_SIZE {
-                nblocks
-            } else {
-                nblocks + 1
-            }
-        };
-        let meta = FooterMeta {
-            index_nblocks: index_nblocks as _,
-            num_index: index.len() as _,
-            total_records: total_records as _,
-            sync_id,
-        };
-        let mut append_buf = Buf::alloc(index_nblocks)?;
-        append_buf.as_mut_slice()[..buf.len()].copy_from_slice(&buf);
-        append_buf.as_mut_slice()[index_nblocks * BLOCK_SIZE - FOOTER_META_SIZE..]
-            .copy_from_slice(meta.as_bytes());
-        tx_log.append(append_buf.as_ref())?;
-
-        Ok(Self {
-            id: tx_log.id(),
-            footer: Footer { meta, index },
-            phantom: PhantomData,
-        })
-    }
-
-    /// Build a SST from a tx log, load index block to cache.
-    ///
-    /// # Panics
-    ///
-    /// This method must be called within a TX. Otherwise, this method panics.
-    fn from_log<D: BlockSet>(tx_log: &Arc<TxLog<D>>) -> Result<Self> {
-        let nblocks = tx_log.nblocks();
-        let mut rbuf = Buf::alloc(1)?;
-        // Load footer block (last block)
-        tx_log.read(nblocks - 1, rbuf.as_mut())?;
-
-        let meta = FooterMeta::from_bytes(&rbuf.as_slice()[BLOCK_SIZE - FOOTER_META_SIZE..]);
-        let mut rbuf = Buf::alloc(meta.index_nblocks as _)?;
-        tx_log.read(nblocks - meta.index_nblocks as usize, rbuf.as_mut())?;
-        let mut index = Vec::with_capacity(meta.num_index as _);
-        for i in 0..meta.num_index as _ {
-            let buf =
-                &rbuf.as_slice()[i * Self::INDEX_ENTRY_SIZE..(i + 1) * Self::INDEX_ENTRY_SIZE];
-            let pos = BlockId::from_le_bytes(buf[..Self::BID_SIZE].try_into().unwrap());
-            let first = K::from_bytes(&buf[Self::BID_SIZE..Self::BID_SIZE + Self::K_SIZE]);
-            let last =
-                K::from_bytes(&buf[Self::INDEX_ENTRY_SIZE - Self::K_SIZE..Self::INDEX_ENTRY_SIZE]);
-            index.push(IndexEntry { pos, first, last })
-        }
-
-        let footer = Footer { meta, index };
-        Ok(Self {
-            id: tx_log.id(),
-            footer,
-            phantom: PhantomData,
-        })
-    }
-
-    /// Collect all records from a SST.
-    ///
-    /// # Panics
-    ///
-    /// This method must be called within a TX. Otherwise, this method panics.
-    fn collect_all_records<D: BlockSet>(
-        &self,
-        tx_log: &Arc<TxLog<D>>,
-    ) -> Result<Vec<(K, ValueEx<V>)>> {
-        let mut records = Vec::with_capacity(self.footer.meta.total_records as _);
-        let mut rbuf = Buf::alloc(1)?;
-        for entry in self.footer.index.iter() {
-            tx_log.read(entry.pos, rbuf.as_mut())?;
-            let rbuf_slice = rbuf.as_slice();
-
-            let mut offset = 0;
-            loop {
-                if offset + Self::MAX_RECORD_SIZE > BLOCK_SIZE {
-                    break;
-                }
-
-                let k = K::from_bytes(&rbuf_slice[offset..offset + Self::K_SIZE]);
-                offset += Self::K_SIZE;
-                let v_ex = {
-                    let flag = RecordFlag::from(rbuf_slice[offset]);
-                    offset += 1;
-                    if flag == RecordFlag::Invalid {
-                        break;
-                    }
-                    match flag {
-                        RecordFlag::Committed => {
-                            let v = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
-                            offset += Self::V_SIZE;
-                            ValueEx::Committed(v)
-                        }
-                        RecordFlag::Uncommitted => {
-                            let v = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
-                            offset += Self::V_SIZE;
-                            ValueEx::Uncommitted(v)
-                        }
-                        RecordFlag::CommittedAndUncommitted => {
-                            let cv = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
-                            offset += Self::V_SIZE;
-                            let ucv = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
-                            offset += Self::V_SIZE;
-                            ValueEx::CommittedAndUncommitted(cv, ucv)
-                        }
-                        _ => unreachable!(),
-                    }
-                };
-                records.push((k, v_ex));
-            }
-        }
-
-        Ok(records)
     }
 }
 
@@ -1364,7 +986,7 @@ mod tests {
     }
 
     #[repr(C)]
-    #[derive(Clone, Copy, Pod)]
+    #[derive(Clone, Copy, Pod, Debug)]
     struct RecordValue {
         pub hba: BlockId,
         pub key: Key,
@@ -1373,14 +995,15 @@ mod tests {
 
     #[test]
     fn tx_lsm_tree_fns() -> Result<()> {
-        let nblocks = 4096;
+        let nblocks = 16 * 1024;
         let mem_disk = MemDisk::create(nblocks)?;
         let tx_log_store = Arc::new(TxLogStore::format(mem_disk)?);
         let tx_lsm_tree: TxLsmTree<BlockId, RecordValue, MemDisk> =
             TxLsmTree::format(tx_log_store.clone(), Arc::new(Factory), None)?;
 
-        let put_cnt = 1024;
-        for i in 0..put_cnt {
+        let cap = 1024;
+        let start = 0;
+        for i in start..start + cap {
             let (k, v) = (
                 i as BlockId,
                 RecordValue {
@@ -1391,16 +1014,95 @@ mod tests {
             );
             tx_lsm_tree.put(k, v)?;
         }
-        tx_lsm_tree.sync()?;
-
         let target_value = tx_lsm_tree.get(&5).unwrap();
         assert_eq!(target_value.hba, 5);
 
-        drop(tx_lsm_tree);
-        let tx_lsm_tree: TxLsmTree<BlockId, RecordValue, MemDisk> =
-            TxLsmTree::recover(tx_log_store, Arc::new(Factory), None)?;
-        let target_value = tx_lsm_tree.get(&25).unwrap();
-        assert_eq!(target_value.hba, 25);
+        tx_lsm_tree.sync()?;
+        println!("here?");
+
+        let target_value = tx_lsm_tree.get(&1023).unwrap();
+        assert_eq!(target_value.hba, 1023);
+
+        let start = 725;
+        for i in start..start + cap {
+            let (k, v) = (
+                i as BlockId,
+                RecordValue {
+                    hba: (i * 2) as BlockId,
+                    key: Key::random(),
+                    mac: Mac::random(),
+                },
+            );
+            tx_lsm_tree.put(k, v)?;
+        }
+
+        // let target_value = tx_lsm_tree.get(&725).unwrap();
+        // assert_eq!(target_value.hba, 1450);
+
+        // let start = 512;
+        // for i in start..start + cap {
+        //     let (k, v) = (
+        //         i as BlockId,
+        //         RecordValue {
+        //             hba: (i * 2) as BlockId,
+        //             key: Key::random(),
+        //             mac: Mac::random(),
+        //         },
+        //     );
+        //     tx_lsm_tree.put(k, v)?;
+        // }
+
+        // let target_value = tx_lsm_tree.get(&1023).unwrap();
+        // assert_eq!(target_value.hba, 2046);
+        // let target_value = tx_lsm_tree.get(&5).unwrap();
+        // assert_eq!(target_value.hba, 5);
+
+        //
+
+        // let c1 = 225577;
+        // let (k, v) = (
+        //     c1 as BlockId,
+        //     RecordValue {
+        //         hba: c1 as BlockId,
+        //         key: Key::random(),
+        //         mac: Mac::random(),
+        //     },
+        // );
+        // tx_lsm_tree.put(k, v)?;
+
+        // drop(tx_lsm_tree);
+        // let tx_lsm_tree: TxLsmTree<BlockId, RecordValue, MemDisk> =
+        //     TxLsmTree::recover(tx_log_store.clone(), Arc::new(Factory), None)?;
+
+        // let target_value = tx_lsm_tree.get(&1748).unwrap();
+        // assert_eq!(target_value.hba, 1748);
+
+        // let target_value = tx_lsm_tree.get(&c1);
+        // assert!(target_value.is_none());
+
+        // tx_lsm_tree.put(k, v)?;
+
+        // tx_lsm_tree.sync()?;
+
+        // let c2 = 775522;
+        // let (k, v) = (
+        //     c2 as BlockId,
+        //     RecordValue {
+        //         hba: c2 as BlockId,
+        //         key: Key::random(),
+        //         mac: Mac::random(),
+        //     },
+        // );
+        // tx_lsm_tree.put(k, v)?;
+
+        // drop(tx_lsm_tree);
+        // let tx_lsm_tree: TxLsmTree<BlockId, RecordValue, MemDisk> =
+        //     TxLsmTree::recover(tx_log_store, Arc::new(Factory), None)?;
+
+        // let target_value = tx_lsm_tree.get(&c1).unwrap();
+        // assert_eq!(target_value.hba, c1);
+        // let target_value = tx_lsm_tree.get(&c2);
+        // assert!(target_value.is_none());
 
         Ok(())
     }
