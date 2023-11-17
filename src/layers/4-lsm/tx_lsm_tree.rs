@@ -21,8 +21,6 @@ use pod::Pod;
 use spin::{Mutex, RwLock};
 
 const BUCKET_WAL: &str = "WAL";
-const BUCKET_L0: &str = "L0";
-const BUCKET_L1: &str = "L1";
 
 const LEVEL0_RATIO: u16 = 1;
 const LEVELI_RATIO: u16 = 10;
@@ -49,11 +47,11 @@ pub trait TxEventListenerFactory<K, V> {
 }
 
 /// An event listener that get informed when
-/// 1. A new record is added,
-/// 2. An existing record is dropped,
-/// 3. After a tx begined,
-/// 4. Before a tx ended,
-/// 5. After a tx committed.
+/// 1) A new record is added,
+/// 2) An existing record is dropped,
+/// 3) After a tx begined,
+/// 4) Before a tx ended,
+/// 5) After a tx committed.
 /// `tx_type` indicates an internal transaction of `TxLsmTree`.
 pub trait TxEventListener<K, V> {
     /// Notify the listener that a new record is added to a LSM-tree.
@@ -97,10 +95,26 @@ pub enum LsmLevel {
 }
 
 impl LsmLevel {
+    const LEVEL_BUCKETS: [(LsmLevel, &str); 2] = [
+        (LsmLevel::L0, LsmLevel::L0.bucket()),
+        (LsmLevel::L1, LsmLevel::L1.bucket()),
+    ];
+
+    pub fn iter() -> impl Iterator<Item = (LsmLevel, &'static str)> {
+        Self::LEVEL_BUCKETS.iter().cloned()
+    }
+
     pub fn upper_level(&self) -> Option<LsmLevel> {
         match self {
             LsmLevel::L0 => None,
             LsmLevel::L1 => Some(LsmLevel::L0),
+        }
+    }
+
+    const fn bucket(&self) -> &str {
+        match self {
+            LsmLevel::L0 => "L0",
+            LsmLevel::L1 => "L1",
         }
     }
 }
@@ -154,7 +168,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
             });
             if res.is_ok() {
                 tx.commit()?;
-                // TODO: Update master commit id if mismatch
+                // TODO: Update master sync id if mismatch
             } else {
                 tx.abort();
                 return_errno_with_msg!(TxAborted, "recover from WAL failed");
@@ -185,8 +199,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
             let mut manager = SstManager::new(2);
             let mut tx = tx_log_store.new_tx();
             let res: Result<_> = tx.context(|| {
-                let buckets = [(BUCKET_L0, LsmLevel::L0), (BUCKET_L1, LsmLevel::L1)];
-                for (bucket, level) in buckets {
+                for (level, bucket) in LsmLevel::iter() {
                     let log_ids = tx_log_store.list_logs(bucket);
                     if let Err(e) = &log_ids && e.errno() == NotFound {
                         continue;
@@ -222,7 +235,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
     }
 
     pub fn get(&self, key: &K) -> Option<V> {
-        // 1. Get from MemTables
+        // 1. Search from MemTables
         if let Some(value) = self.active_mem_table().read().get(key) {
             return Some(value.clone());
         }
@@ -230,7 +243,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
             return Some(value.clone());
         }
 
-        // 2. Get from SSTs (do Read Tx)
+        // 2. Search from SSTs (do Read Tx)
         self.do_read_tx(key).ok()
     }
 
@@ -244,36 +257,32 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
         self.wal_append_tx.append(&record)?;
 
         // 2. Put into MemTable
-        let to_be_replaced = self.active_mem_table().write().put(key, value);
+        let _ = self.active_mem_table().write().put(key, value);
         if !self.active_mem_table().read().at_capacity() {
             return Ok(());
         }
 
-        println!("here");
         self.wal_append_tx.commit()?;
-        println!("here 2");
 
         // 3. Trigger compaction if needed
         self.immut_idx.fetch_xor(1, Ordering::Release);
         // Do major compaction first if needed
-        if self.sst_manager.read().list_level(LsmLevel::L0).count() == LEVEL0_RATIO as _ {
+        if self.sst_manager.read().need_minor_compaction() {
             self.do_compaction_tx(LsmLevel::L1)?;
         }
         // Do minor compaction
         self.do_compaction_tx(LsmLevel::L0)
     }
 
-    // FIXME: Should we need this API?
-    //     pub fn put_range(&self, range: &Range<K>) -> Result<()> {
-    //         todo!()
-    //     }
+    // FIXME: Do we really need this API?
+    // pub fn put_range(&self, range: &Range<K>) -> Result<()> {}
 
-    /// User-called flush
+    /// Persista all in-memory data of `TxLsmTree`.
     pub fn sync(&self) -> Result<()> {
         // TODO: Store master sync id to trusted storage
         let master_sync_id = MASTER_SYNC_ID.fetch_add(1, Ordering::Release) + 1;
         self.wal_append_tx.sync(master_sync_id)?;
-        self.active_mem_table().write().commit(master_sync_id)
+        self.active_mem_table().write().sync(master_sync_id)
     }
 
     /// TXs in TxLsmTree
@@ -284,9 +293,8 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
 
         let read_res: Result<_> = tx.context(|| {
             // Search each level from top to bottom (newer to older)
-            let buckets = [(BUCKET_L0, LsmLevel::L0), (BUCKET_L1, LsmLevel::L1)];
             let sst_manager = self.sst_manager.read();
-            for (bucket, level) in buckets {
+            for (level, bucket) in LsmLevel::iter() {
                 for (id, sst) in sst_manager.list_level(level) {
                     let tx_log = self.tx_log_store.open_log(*id, false)?;
                     debug_assert!(tx_log.bucket() == bucket);
@@ -295,7 +303,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
                     }
                 }
             }
-            return_errno!(NotFound);
+            return_errno_with_msg!(NotFound, "target sst not found");
         });
         if read_res.as_ref().is_err_and(|e| e.errno() != NotFound) {
             tx.abort();
@@ -340,7 +348,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
         }
 
         let res: Result<_> = tx.context(|| {
-            let tx_log = self.tx_log_store.create_log(BUCKET_L0)?;
+            let tx_log = self.tx_log_store.create_log(LsmLevel::L0.bucket())?;
 
             let immut_mem_table = self.immut_mem_table().read();
             let records: Vec<_> = immut_mem_table
@@ -468,13 +476,12 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
             let (mut created_ssts, mut deleted_ssts) = (vec![], vec![]);
             // Create new SSTs
             for records in sorted_records.chunks(Self::MEMTABLE_CAPACITY) {
-                let new_log = tx_log_store.create_log(BUCKET_L1)?;
+                let new_log = tx_log_store.create_log(LsmLevel::L1.bucket())?;
                 let new_sst = SSTable::build(records, master_sync_id, &new_log)?;
                 created_ssts.push((new_sst, to_level));
             }
 
             // Delete old SSTs
-            println!("delete log: {:?}", compacted_sst_ids);
             for (id, level) in compacted_sst_ids {
                 tx_log_store.delete_log(id)?;
                 deleted_ssts.push((id, level));
@@ -631,7 +638,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
                     continue;
                 }
                 // Create new migrated SST
-                let new_log = tx_log_store.create_log(BUCKET_L0)?;
+                let new_log = tx_log_store.create_log(LsmLevel::L0.bucket())?;
                 let new_sst = SSTable::build(&records, master_sync_id, &new_log)?;
                 created_ssts.push((new_sst, LsmLevel::L0));
                 deleted_ssts.push((id, LsmLevel::L0));
@@ -687,14 +694,14 @@ where
 }
 
 struct WalAppendTxInner<D> {
-    wal_tx_and_log: Option<(Tx, Arc<TxLog<D>>)>, // Cache append tx and wal log
+    wal_tx_and_log: Option<(Tx, Arc<TxLog<D>>)>, // Cache append tx and WAL log
     log_id: Option<TxLogId>,
-    record_buf: Vec<u8>, // Cache appended wal record
+    record_buf: Vec<u8>, // Cache appended WAL record
     tx_log_store: Arc<TxLogStore<D>>,
 }
 
 impl<D: BlockSet + 'static> WalAppendTxInner<D> {
-    /// Prepare phase for Append Tx, mainly to create new tx and wal log.
+    /// Prepare phase for Append Tx, mainly to create new tx and WAL log.
     fn perpare(&mut self) -> Result<()> {
         debug_assert!(self.wal_tx_and_log.is_none());
         let wal_tx_and_log = {
@@ -703,7 +710,6 @@ impl<D: BlockSet + 'static> WalAppendTxInner<D> {
             let log_id_opt = self.log_id.clone();
             let res = wal_tx.context(|| {
                 if log_id_opt.is_some() {
-                    println!("open log");
                     store.open_log(log_id_opt.unwrap(), true)
                 } else {
                     store.create_log(BUCKET_WAL)
@@ -713,7 +719,7 @@ impl<D: BlockSet + 'static> WalAppendTxInner<D> {
                 wal_tx.abort();
             }
             let wal_log = res?;
-            self.log_id.insert(wal_log.id());
+            let _ = self.log_id.insert(wal_log.id());
             (wal_tx, wal_log)
         };
         let _ = self.wal_tx_and_log.insert(wal_tx_and_log);
@@ -752,27 +758,29 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
         }
     }
 
-    /// Append phase for Append Tx, mainly to append newly records to wal log.
+    /// Append phase for Append Tx, mainly to append newly records to WAL log.
     pub fn append<K: Pod, V: Pod>(&self, record: &dyn AsKv<K, V>) -> Result<()> {
         let mut inner = self.inner.lock();
         if inner.wal_tx_and_log.is_none() {
             inner.perpare()?;
         }
 
-        let record_buf = &mut inner.record_buf;
-        record_buf.push(WalAppendFlag::Record as u8);
-        record_buf.extend_from_slice(record.key().as_bytes());
-        record_buf.extend_from_slice(record.value().as_bytes());
+        {
+            let record_buf = &mut inner.record_buf;
+            record_buf.push(WalAppendFlag::Record as u8);
+            record_buf.extend_from_slice(record.key().as_bytes());
+            record_buf.extend_from_slice(record.value().as_bytes());
+        }
 
-        if record_buf.len() < Self::BUF_CAP {
+        if inner.record_buf.len() < Self::BUF_CAP {
             return Ok(());
         }
 
-        let buf = record_buf.clone();
-        record_buf.clear();
-
+        let record_buf = inner.record_buf.clone();
         let (wal_tx, wal_log) = inner.wal_tx_and_log.as_mut().unwrap();
-        self.flush_buf(buf, wal_tx, wal_log)?;
+        self.flush_buf(&record_buf, wal_tx, wal_log)?;
+        inner.record_buf.clear();
+
         Ok(())
     }
 
@@ -783,42 +791,35 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
             return Ok(());
         }
 
-        let record_buf = &mut inner.record_buf;
-        println!("record buf len: {}", record_buf.len());
-        let buf = record_buf.clone();
-        record_buf.clear();
         let (mut wal_tx, wal_log) = inner.wal_tx_and_log.take().unwrap();
         // Append cached records
         // Append master sync id
-        self.flush_buf(buf, &mut wal_tx, &wal_log)?;
+        self.flush_buf(&inner.record_buf, &mut wal_tx, &wal_log)?;
+        inner.record_buf.clear();
 
         drop(wal_log);
         wal_tx.commit()
     }
 
     pub fn sync(&self, sync_id: u64) -> Result<()> {
-        println!("synccccccc");
         let mut inner = self.inner.lock();
         if inner.wal_tx_and_log.is_none() {
             inner.perpare()?;
         }
-        let record_buf = &mut inner.record_buf;
-        record_buf.push(WalAppendFlag::Sync as u8);
-        record_buf.extend_from_slice(&sync_id.to_le_bytes());
-        let buf = record_buf.clone();
-        record_buf.clear();
+        inner.record_buf.push(WalAppendFlag::Sync as u8);
+        inner.record_buf.extend_from_slice(&sync_id.to_le_bytes());
 
         let (mut wal_tx, wal_log) = inner.wal_tx_and_log.take().unwrap();
         // Append cached records
         // Append master sync id
-        self.flush_buf(buf, &mut wal_tx, &wal_log)?;
+        self.flush_buf(&inner.record_buf, &mut wal_tx, &wal_log)?;
+        inner.record_buf.clear();
 
         drop(wal_log);
         wal_tx.commit()
     }
 
-    fn flush_buf(&self, record_buf: Vec<u8>, tx: &mut Tx, log: &Arc<TxLog<D>>) -> Result<()> {
-        println!("flush buf");
+    fn flush_buf(&self, record_buf: &[u8], tx: &mut Tx, log: &Arc<TxLog<D>>) -> Result<()> {
         let mut buf = Buf::alloc(align_up(record_buf.len(), BLOCK_SIZE) / BLOCK_SIZE)?;
         buf.as_mut_slice()[..record_buf.len()].copy_from_slice(&record_buf);
         let res = tx.context(|| {
@@ -925,34 +926,41 @@ impl<K, V> AsKv<K, V> for (K, V) {
 // Issue: Should changes support abort?
 #[derive(Debug)]
 struct SstManager<K, V> {
-    levels: Vec<BTreeMap<TxLogId, Arc<SSTable<K, V>>>>,
+    level_ssts: Vec<BTreeMap<TxLogId, Arc<SSTable<K, V>>>>,
 }
 
 impl<K: Ord + Pod + Debug, V: Pod> SstManager<K, V> {
-    fn new(num_levels: usize) -> Self {
-        let mut levels = Vec::with_capacity(num_levels);
+    pub fn new(num_levels: usize) -> Self {
+        let mut level_ssts = Vec::with_capacity(num_levels);
         for _ in 0..num_levels {
-            levels.push(BTreeMap::new());
+            level_ssts.push(BTreeMap::new());
         }
-        Self { levels }
+        Self { level_ssts }
     }
 
-    fn list_level(&self, level: LsmLevel) -> impl Iterator<Item = (&TxLogId, &Arc<SSTable<K, V>>)> {
-        self.levels[level as usize].iter().rev()
+    pub fn list_level(
+        &self,
+        level: LsmLevel,
+    ) -> impl Iterator<Item = (&TxLogId, &Arc<SSTable<K, V>>)> {
+        self.level_ssts[level as usize].iter().rev()
     }
 
-    fn insert(&mut self, sst: SSTable<K, V>, level: LsmLevel) {
+    pub fn insert(&mut self, sst: SSTable<K, V>, level: LsmLevel) {
         let nth_level = level as usize;
-        debug_assert!(nth_level < self.levels.len());
-        let level_ssts = &mut self.levels[nth_level];
+        debug_assert!(nth_level < self.level_ssts.len());
+        let level_ssts = &mut self.level_ssts[nth_level];
         let replaced = level_ssts.insert(sst.id(), Arc::new(sst));
         debug_assert!(replaced.is_none());
     }
 
-    fn remove(&mut self, id: TxLogId, level: LsmLevel) {
-        let level_ssts = &mut self.levels[level as usize];
+    pub fn remove(&mut self, id: TxLogId, level: LsmLevel) {
+        let level_ssts = &mut self.level_ssts[level as usize];
         let removed = level_ssts.remove(&id);
         debug_assert!(removed.is_some());
+    }
+
+    pub fn need_minor_compaction(&self) -> bool {
+        self.list_level(LsmLevel::L0).count() == LEVEL0_RATIO as _
     }
 }
 
@@ -965,21 +973,21 @@ mod tests {
     struct Listener;
 
     impl<K, V> TxEventListenerFactory<K, V> for Factory {
-        fn new_event_listener(&self, tx_type: TxType) -> Arc<dyn TxEventListener<K, V>> {
+        fn new_event_listener(&self, _tx_type: TxType) -> Arc<dyn TxEventListener<K, V>> {
             Arc::new(Listener)
         }
     }
     impl<K, V> TxEventListener<K, V> for Listener {
-        fn on_add_record(&self, record: &dyn AsKv<K, V>) -> Result<()> {
+        fn on_add_record(&self, _record: &dyn AsKv<K, V>) -> Result<()> {
             Ok(())
         }
-        fn on_drop_record(&self, record: &dyn AsKv<K, V>) -> Result<()> {
+        fn on_drop_record(&self, _record: &dyn AsKv<K, V>) -> Result<()> {
             Ok(())
         }
-        fn on_tx_begin(&self, tx: &mut Tx) -> Result<()> {
+        fn on_tx_begin(&self, _tx: &mut Tx) -> Result<()> {
             Ok(())
         }
-        fn on_tx_precommit(&self, tx: &mut Tx) -> Result<()> {
+        fn on_tx_precommit(&self, _tx: &mut Tx) -> Result<()> {
             Ok(())
         }
         fn on_tx_commit(&self) {}
@@ -1018,7 +1026,6 @@ mod tests {
         assert_eq!(target_value.hba, 5);
 
         tx_lsm_tree.sync()?;
-        println!("here?");
 
         let target_value = tx_lsm_tree.get(&1023).unwrap();
         assert_eq!(target_value.hba, 1023);
@@ -1036,8 +1043,8 @@ mod tests {
             tx_lsm_tree.put(k, v)?;
         }
 
-        // let target_value = tx_lsm_tree.get(&725).unwrap();
-        // assert_eq!(target_value.hba, 1450);
+        let target_value = tx_lsm_tree.get(&725).unwrap();
+        assert_eq!(target_value.hba, 1450);
 
         // let start = 512;
         // for i in start..start + cap {

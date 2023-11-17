@@ -97,7 +97,7 @@ impl<K: Copy + Ord + Debug, V: Copy> MemTable<K, V> {
         None
     }
 
-    pub fn commit(&mut self, sync_id: u64) -> Result<()> {
+    pub fn sync(&mut self, sync_id: u64) -> Result<()> {
         for (k, v_ex) in &mut self.table {
             if let Some(replaced) = v_ex.commit() {
                 self.on_drop_record
