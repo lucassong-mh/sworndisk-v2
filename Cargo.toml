@@ -33,3 +33,7 @@ jinux = []
 linux = []
 occlum = []
 std = []
+
+[[bench]]
+name = "bench"
+harness = false
