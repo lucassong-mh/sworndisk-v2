@@ -1,13 +1,14 @@
+//! MemTable.
 use super::AsKv;
 use crate::prelude::*;
 
 use alloc::collections::BTreeMap;
 use core::fmt::Debug;
 
-/// MemTable for LSM-tree.
+/// MemTable for LSM-Tree.
 pub(super) struct MemTable<K, V> {
     // Use `ValueEx<V>` instead `V` to maintain multiple
-    // values tagged with commit id for each key
+    // values tagged with sync id for each key
     table: BTreeMap<K, ValueEx<V>>,
     size: usize,
     cap: usize,
@@ -15,47 +16,47 @@ pub(super) struct MemTable<K, V> {
     on_drop_record: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
 }
 
-// Value which is commit-aware
-// At most one uncommitted&one committed records can coexist at the same time
+// Value which is sync-aware
+// At most one unsynced&one synced records can coexist at the same time
 #[derive(Clone, Debug)]
 pub(super) enum ValueEx<V> {
-    Committed(V),
-    Uncommitted(V),
-    CommittedAndUncommitted(V, V),
+    Synced(V),
+    Unsynced(V),
+    SyncedAndUnsynced(V, V),
 }
 
 impl<V: Copy> ValueEx<V> {
     fn new(value: V) -> Self {
-        Self::Uncommitted(value)
+        Self::Unsynced(value)
     }
 
     fn get(&self) -> &V {
         match self {
-            ValueEx::Committed(v) => v,
-            ValueEx::Uncommitted(v) => v,
-            ValueEx::CommittedAndUncommitted(_, v) => v,
+            ValueEx::Synced(v) => v,
+            ValueEx::Unsynced(v) => v,
+            ValueEx::SyncedAndUnsynced(_, v) => v,
         }
     }
 
     fn put(&mut self, value: V) -> Option<V> {
         // TODO: Optimize this by using `mem::take`
         let (updated, replaced) = match self {
-            ValueEx::Committed(v) => (Self::CommittedAndUncommitted(*v, value), None),
-            ValueEx::Uncommitted(v) => (Self::Uncommitted(value), Some(*v)),
-            ValueEx::CommittedAndUncommitted(cv, ucv) => {
-                (Self::CommittedAndUncommitted(*cv, value), Some(*cv))
+            ValueEx::Synced(v) => (Self::SyncedAndUnsynced(*v, value), None),
+            ValueEx::Unsynced(v) => (Self::Unsynced(value), Some(*v)),
+            ValueEx::SyncedAndUnsynced(cv, _ucv) => {
+                (Self::SyncedAndUnsynced(*cv, value), Some(*cv))
             }
         };
         *self = updated;
         replaced
     }
 
-    fn commit(&mut self) -> Option<V> {
+    fn sync(&mut self) -> Option<V> {
         // TODO: Optimize this by using `mem::take`
         let (updated, replaced) = match self {
-            ValueEx::Committed(v) => (None, None),
-            ValueEx::Uncommitted(v) => (Some(Self::Committed(*v)), None),
-            ValueEx::CommittedAndUncommitted(cv, ucv) => (Some(Self::Committed(*cv)), Some(*ucv)),
+            ValueEx::Synced(_v) => (None, None),
+            ValueEx::Unsynced(v) => (Some(Self::Synced(*v)), None),
+            ValueEx::SyncedAndUnsynced(cv, ucv) => (Some(Self::Synced(*cv)), Some(*ucv)),
         };
         updated.map(|updated| *self = updated);
         replaced
@@ -79,7 +80,7 @@ impl<K: Copy + Ord + Debug, V: Copy> MemTable<K, V> {
 
     pub fn get(&self, key: &K) -> Option<&V> {
         let value_ex = self.table.get(key)?;
-        // Return value which tagged most latest commit id
+        // Return value which tagged most latest sync id
         Some(value_ex.get())
     }
 
@@ -99,7 +100,7 @@ impl<K: Copy + Ord + Debug, V: Copy> MemTable<K, V> {
 
     pub fn sync(&mut self, sync_id: u64) -> Result<()> {
         for (k, v_ex) in &mut self.table {
-            if let Some(replaced) = v_ex.commit() {
+            if let Some(replaced) = v_ex.sync() {
                 self.on_drop_record
                     .as_ref()
                     .map(|on_drop_record| on_drop_record(&(*k, replaced)));
@@ -110,7 +111,7 @@ impl<K: Copy + Ord + Debug, V: Copy> MemTable<K, V> {
         Ok(())
     }
 
-    // Records should be tagged with commit id
+    // Records should be tagged with sync id
     pub fn keys_values(&self) -> impl Iterator<Item = (&K, &ValueEx<V>)> {
         self.table.iter()
     }

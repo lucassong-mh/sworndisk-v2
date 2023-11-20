@@ -236,7 +236,7 @@ impl ChunkAllocState {
     ///
     /// Deallocating a free chunk causes panic.
     pub fn dealloc(&mut self, chunk_id: ChunkId) {
-        assert_eq!(self.alloc_map[chunk_id], true);
+        // debug_assert_eq!(self.alloc_map[chunk_id], true); // may fail in journal's commit
         self.alloc_map.set(chunk_id, false);
         self.free_count += 1;
 

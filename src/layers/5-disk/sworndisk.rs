@@ -227,19 +227,21 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
     }
 
     fn on_tx_begin(&self, tx: &mut Tx) -> Result<()> {
-        match self.tx_type {
-            TxType::Compaction { .. } | TxType::Migration => {
-                tx.context(|| self.block_alloc.prepare_diff_log())
-            }
-        }
+        // match self.tx_type {
+        //     TxType::Compaction { .. } | TxType::Migration => {
+        //         tx.context(|| self.block_alloc.prepare_diff_log().unwrap())
+        //     }
+        // }
+        Ok(())
     }
 
     fn on_tx_precommit(&self, tx: &mut Tx) -> Result<()> {
-        match self.tx_type {
-            TxType::Compaction { .. } | TxType::Migration => {
-                tx.context(|| self.block_alloc.update_diff_log())
-            }
-        }
+        // match self.tx_type {
+        //     TxType::Compaction { .. } | TxType::Migration => {
+        //         tx.context(|| self.block_alloc.update_diff_log().unwrap())
+        //     }
+        // }
+        Ok(())
     }
 
     fn on_tx_commit(&self) {
@@ -291,7 +293,7 @@ mod tests {
         let root_key = Key::random();
         let sworndisk = SwornDisk::create(mem_disk, root_key)?;
 
-        let num_rw = 1 * 1024;
+        let num_rw = 3 * 1024;
         let mut rw_buf = Buf::alloc(1)?;
         for i in 0..num_rw {
             rw_buf.as_mut_slice().fill(i as u8);

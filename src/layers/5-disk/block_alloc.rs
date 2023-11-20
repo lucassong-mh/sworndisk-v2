@@ -43,7 +43,7 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
         let mut diff_table = self.diff_table.lock();
         let replaced = diff_table.insert(block_id, AllocDiff::Alloc);
         if replaced == Some(AllocDiff::Alloc) {
-            panic!("cannot allocate a block twice");
+            panic!("can't allocate a block twice");
         }
         Ok(())
     }
@@ -53,7 +53,7 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
         let mut diff_table = self.diff_table.lock();
         let replaced = diff_table.insert(block_id, AllocDiff::Dealloc);
         if replaced == Some(AllocDiff::Dealloc) {
-            panic!("cannot deallocate a block twice");
+            panic!("can't deallocate a block twice");
         }
         Ok(())
     }
@@ -64,6 +64,7 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
     pub fn prepare_diff_log(&self) -> Result<()> {
+        // FIXME: not in append mode
         let mut diff_log = self.store.open_log_in(BUCKET_BLOCK_ALLOC_LOG);
         if let Err(e) = &diff_log && e.errno() == NotFound {
             diff_log = self.store.create_log(BUCKET_BLOCK_ALLOC_LOG);
@@ -80,6 +81,9 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
     /// This method must be called within a TX. Otherwise, this method panics.
     pub fn update_diff_log(&self) -> Result<()> {
         let diff_table = self.diff_table.lock();
+        if diff_table.is_empty() {
+            return Ok(());
+        }
         let mut diff_buf = Vec::new();
         for (block_id, block_diff) in diff_table.iter() {
             diff_buf.push(*block_diff as u8);

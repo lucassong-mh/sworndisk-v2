@@ -1,5 +1,6 @@
+//! Sorted String Table.
 use super::mem_table::ValueEx;
-use crate::layers::bio::{BlockSet, Buf};
+use crate::layers::bio::{BlockSet, Buf, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogId};
 use crate::prelude::*;
 
@@ -9,17 +10,16 @@ use core::mem::size_of;
 use core::ops::RangeInclusive;
 use pod::Pod;
 
-/// Sorted String Table (SST) for LSM-tree
+/// Sorted String Table (SST) for LSM-Tree
 ///
 /// format:
 /// ```text
-/// |   [record]    |   [record]    |...|         Footer           |
-/// |K|flag|V(V)|...|   [record]    |...| [IndexEntry] | FooterMeta|
-/// |  BLOCK_SIZE   |  BLOCK_SIZE   |...|                          |
+/// |   [record]    |   [record]    |...|         Footer            |
+/// |K|flag|V(V)|...|   [record]    |...| [IndexEntry] | FooterMeta |
+/// |  BLOCK_SIZE   |  BLOCK_SIZE   |...|                           |
 /// ```
 ///
 // TODO: Add bloom filter and second-level index
-// TODO: Constrain encoded KV's length
 pub(super) struct SSTable<K, V> {
     // Cache txlog id, and footer block
     id: TxLogId,
@@ -27,11 +27,13 @@ pub(super) struct SSTable<K, V> {
     phantom: PhantomData<(K, V)>,
 }
 
+/// Footer of SSTable, contains metadata and index entry arrays of SSTable.
 struct Footer<K> {
     meta: FooterMeta,
     index: Vec<IndexEntry<K>>,
 }
 
+/// Footer metadata to describe a SSTable.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Debug)]
 struct FooterMeta {
@@ -42,37 +44,28 @@ struct FooterMeta {
 }
 const FOOTER_META_SIZE: usize = size_of::<FooterMeta>();
 
+/// Index entry of SSTable.
 struct IndexEntry<K> {
     pos: BlockId,
     first: K,
     last: K,
 }
 
+/// Flag bit for record in SSTable.
 #[derive(PartialEq, Eq, Debug)]
 enum RecordFlag {
     Invalid = 0,
-    Committed = 7,
-    Uncommitted = 11,
-    CommittedAndUncommitted = 19,
-}
-
-impl From<u8> for RecordFlag {
-    fn from(value: u8) -> Self {
-        match value {
-            7 => RecordFlag::Committed,
-            11 => RecordFlag::Uncommitted,
-            19 => RecordFlag::CommittedAndUncommitted,
-            _ => RecordFlag::Invalid,
-        }
-    }
+    Synced = 7,
+    Unsynced = 11,
+    SyncedAndUnsynced = 19,
 }
 
 impl<K: Ord + Pod + Debug, V: Pod> SSTable<K, V> {
-    const BID_SIZE: usize = size_of::<BlockId>();
     const K_SIZE: usize = size_of::<K>();
     const V_SIZE: usize = size_of::<V>();
-    const MAX_RECORD_SIZE: usize = Self::BID_SIZE + 1 + 2 * Self::V_SIZE;
-    const INDEX_ENTRY_SIZE: usize = Self::BID_SIZE + Self::K_SIZE;
+    const MAX_RECORD_SIZE: usize = BID_SIZE + 1 + 2 * Self::V_SIZE;
+    const INDEX_ENTRY_SIZE: usize = BID_SIZE + Self::K_SIZE;
+    // TODO: Optimize search&build
 
     pub fn id(&self) -> TxLogId {
         self.id
@@ -139,12 +132,12 @@ impl<K: Ord + Pod + Debug, V: Pod> SSTable<K, V> {
                 break;
             }
             let target_value = match flag {
-                RecordFlag::Committed | RecordFlag::Uncommitted => {
+                RecordFlag::Synced | RecordFlag::Unsynced => {
                     let v = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
                     offset += Self::V_SIZE;
                     v
                 }
-                RecordFlag::CommittedAndUncommitted => {
+                RecordFlag::SyncedAndUnsynced => {
                     let v = V::from_bytes(
                         &rbuf_slice[offset + Self::V_SIZE..offset + 2 * Self::V_SIZE],
                     );
@@ -185,16 +178,16 @@ impl<K: Ord + Pod + Debug, V: Pod> SSTable<K, V> {
             }
             buf.extend_from_slice(record.0.as_bytes());
             match record.1 {
-                ValueEx::Committed(v) => {
-                    buf.push(RecordFlag::Committed as u8);
+                ValueEx::Synced(v) => {
+                    buf.push(RecordFlag::Synced as u8);
                     buf.extend_from_slice(v.as_bytes());
                 }
-                ValueEx::Uncommitted(v) => {
-                    buf.push(RecordFlag::Uncommitted as u8);
+                ValueEx::Unsynced(v) => {
+                    buf.push(RecordFlag::Unsynced as u8);
                     buf.extend_from_slice(v.as_bytes());
                 }
-                ValueEx::CommittedAndUncommitted(cv, ucv) => {
-                    buf.push(RecordFlag::CommittedAndUncommitted as u8);
+                ValueEx::SyncedAndUnsynced(cv, ucv) => {
+                    buf.push(RecordFlag::SyncedAndUnsynced as u8);
                     buf.extend_from_slice(cv.as_bytes());
                     buf.extend_from_slice(ucv.as_bytes());
                 }
@@ -263,8 +256,8 @@ impl<K: Ord + Pod + Debug, V: Pod> SSTable<K, V> {
         for i in 0..meta.num_index as _ {
             let buf =
                 &rbuf.as_slice()[i * Self::INDEX_ENTRY_SIZE..(i + 1) * Self::INDEX_ENTRY_SIZE];
-            let pos = BlockId::from_le_bytes(buf[..Self::BID_SIZE].try_into().unwrap());
-            let first = K::from_bytes(&buf[Self::BID_SIZE..Self::BID_SIZE + Self::K_SIZE]);
+            let pos = BlockId::from_le_bytes(buf[..BID_SIZE].try_into().unwrap());
+            let first = K::from_bytes(&buf[BID_SIZE..BID_SIZE + Self::K_SIZE]);
             let last =
                 K::from_bytes(&buf[Self::INDEX_ENTRY_SIZE - Self::K_SIZE..Self::INDEX_ENTRY_SIZE]);
             index.push(IndexEntry { pos, first, last })
@@ -308,22 +301,22 @@ impl<K: Ord + Pod + Debug, V: Pod> SSTable<K, V> {
                         break;
                     }
                     match flag {
-                        RecordFlag::Committed => {
+                        RecordFlag::Synced => {
                             let v = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
                             offset += Self::V_SIZE;
-                            ValueEx::Committed(v)
+                            ValueEx::Synced(v)
                         }
-                        RecordFlag::Uncommitted => {
+                        RecordFlag::Unsynced => {
                             let v = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
                             offset += Self::V_SIZE;
-                            ValueEx::Uncommitted(v)
+                            ValueEx::Unsynced(v)
                         }
-                        RecordFlag::CommittedAndUncommitted => {
+                        RecordFlag::SyncedAndUnsynced => {
                             let cv = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
                             offset += Self::V_SIZE;
                             let ucv = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
                             offset += Self::V_SIZE;
-                            ValueEx::CommittedAndUncommitted(cv, ucv)
+                            ValueEx::SyncedAndUnsynced(cv, ucv)
                         }
                         _ => unreachable!(),
                     }
@@ -333,6 +326,17 @@ impl<K: Ord + Pod + Debug, V: Pod> SSTable<K, V> {
         }
 
         Ok(records)
+    }
+}
+
+impl From<u8> for RecordFlag {
+    fn from(value: u8) -> Self {
+        match value {
+            7 => RecordFlag::Synced,
+            11 => RecordFlag::Unsynced,
+            19 => RecordFlag::SyncedAndUnsynced,
+            _ => RecordFlag::Invalid,
+        }
     }
 }
 

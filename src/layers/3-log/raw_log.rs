@@ -108,7 +108,7 @@ pub struct RawLogStore<D> {
 
 impl<D: BlockSet> RawLogStore<D> {
     pub fn debug_state(&self) {
-        println!("{:#?}", self.state.lock().persistent);
+        println!("{:?}\n", self.state.lock().persistent);
     }
 
     /// Creates a new store of raw logs given a chunk allocator and an untrusted disk.
