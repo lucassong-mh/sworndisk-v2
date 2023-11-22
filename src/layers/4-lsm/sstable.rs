@@ -94,13 +94,13 @@ impl<K: Ord + Pod + Debug, V: Pod> SSTable<K, V> {
 
     /// Search a target records block position in the SST (from cache).
     fn search_in_cache(&self, key: &K) -> Option<BlockId> {
-        // TODO: Use iter::find
-        for (i, entry) in self.footer.index.iter().enumerate() {
+        self.footer.index.iter().find_map(|entry| {
             if (entry.first..=entry.last).contains(key) {
-                return Some(self.footer.index[i].pos);
+                Some(entry.pos)
+            } else {
+                None
             }
-        }
-        None
+        })
     }
 
     /// Search a target record in the SST (from log).

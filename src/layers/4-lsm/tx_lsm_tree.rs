@@ -398,7 +398,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
         );
         self.tx_log_store.debug_state();
 
-        let from_level = to_level.upper_level().unwrap();
+        let from_level = to_level.upper_level();
         let mut tx = self.tx_log_store.new_tx();
         let tx_type = TxType::Compaction { to_level };
         let event_listener = self.listener_factory.new_event_listener(tx_type);
@@ -510,7 +510,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
         self.tx_log_store.debug_state();
 
         if self.sst_manager.read().require_major_compaction(to_level) {
-            self.do_major_compaction(to_level.lower_level().unwrap())?;
+            self.do_major_compaction(to_level.lower_level())?;
         }
         Ok(())
     }
@@ -696,27 +696,14 @@ impl LsmLevel {
         Self::LEVEL_BUCKETS.iter().cloned()
     }
 
-    // TODO: Use `TryFrom`
-    pub fn upper_level(&self) -> Option<LsmLevel> {
-        match self {
-            LsmLevel::L0 => None,
-            LsmLevel::L1 => Some(LsmLevel::L0),
-            LsmLevel::L2 => Some(LsmLevel::L1),
-            LsmLevel::L3 => Some(LsmLevel::L2),
-            LsmLevel::L4 => Some(LsmLevel::L3),
-            LsmLevel::L5 => Some(LsmLevel::L4),
-        }
+    pub fn upper_level(&self) -> LsmLevel {
+        debug_assert!(*self != LsmLevel::L0);
+        LsmLevel::from(*self as u8 - 1)
     }
 
-    pub fn lower_level(&self) -> Option<LsmLevel> {
-        match self {
-            LsmLevel::L0 => Some(LsmLevel::L1),
-            LsmLevel::L1 => Some(LsmLevel::L2),
-            LsmLevel::L2 => Some(LsmLevel::L3),
-            LsmLevel::L3 => Some(LsmLevel::L4),
-            LsmLevel::L4 => Some(LsmLevel::L5),
-            LsmLevel::L5 => None,
-        }
+    pub fn lower_level(&self) -> LsmLevel {
+        debug_assert!(*self != LsmLevel::L5);
+        LsmLevel::from(*self as u8 + 1)
     }
 
     const fn bucket(&self) -> &str {
@@ -727,6 +714,20 @@ impl LsmLevel {
             LsmLevel::L3 => "L3",
             LsmLevel::L4 => "L4",
             LsmLevel::L5 => "L5",
+        }
+    }
+}
+
+impl From<u8> for LsmLevel {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => LsmLevel::L0,
+            1 => LsmLevel::L1,
+            2 => LsmLevel::L2,
+            3 => LsmLevel::L3,
+            4 => LsmLevel::L4,
+            5 => LsmLevel::L5,
+            _ => unreachable!(),
         }
     }
 }

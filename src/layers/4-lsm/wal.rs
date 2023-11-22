@@ -170,7 +170,7 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
                 WalAppendFlag::Sync => {
                     let sync_id =
                         u64::from_le_bytes(buf_slice[offset..offset + 8].try_into().unwrap());
-                    max_sync_id.insert(sync_id);
+                    let _ = max_sync_id.insert(sync_id);
                     synced_len = records.len();
                     offset += 8;
                 }
