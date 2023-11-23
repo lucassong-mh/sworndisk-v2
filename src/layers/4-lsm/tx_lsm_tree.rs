@@ -22,6 +22,8 @@ use pod::Pod;
 
 static MASTER_SYNC_ID: AtomicU64 = AtomicU64::new(0);
 
+const ENABLE_DEBUG: bool = false;
+
 /// A LSM-Tree built upon `TxLogStore`.
 pub struct TxLsmTree<K, V, D>
 where
@@ -219,8 +221,10 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
 
         recov_self.do_migration_tx()?;
 
-        println!("===after recovery {:?}\n", recov_self.sst_manager.read());
-        recov_self.tx_log_store.debug_state();
+        if ENABLE_DEBUG {
+            println!("===after recovery {:?}\n", recov_self.sst_manager.read());
+            recov_self.tx_log_store.debug_state();
+        }
 
         Ok(recov_self)
     }
@@ -316,11 +320,13 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
 
     /// Compaction TX { to_level: LsmLevel::L0 }.
     fn do_minor_compaction(&self) -> Result<()> {
-        println!(
-            "===do_minor_compaction before {:?}\n",
-            self.sst_manager.read()
-        );
-        self.tx_log_store.debug_state();
+        if ENABLE_DEBUG {
+            println!(
+                "===do_minor_compaction before {:?}\n",
+                self.sst_manager.read()
+            );
+            self.tx_log_store.debug_state();
+        }
 
         let mut tx = self.tx_log_store.new_tx();
         let tx_type = TxType::Compaction {
@@ -381,22 +387,26 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
         // Discard current WAL
         self.wal_append_tx.discard()?;
 
-        println!(
-            "===do_minor_compaction after {:?}\n",
-            self.sst_manager.read()
-        );
-        self.tx_log_store.debug_state();
+        if ENABLE_DEBUG {
+            println!(
+                "===do_minor_compaction after {:?}\n",
+                self.sst_manager.read()
+            );
+            self.tx_log_store.debug_state();
+        }
 
         Ok(())
     }
 
     /// Compaction TX { to_level: LsmLevel::L1~LsmLevel::L5 }.
     fn do_major_compaction(&self, to_level: LsmLevel) -> Result<()> {
-        println!(
-            "===do_major_compaction before {:?}\n",
-            self.sst_manager.read()
-        );
-        self.tx_log_store.debug_state();
+        if ENABLE_DEBUG {
+            println!(
+                "===do_major_compaction before {:?}\n",
+                self.sst_manager.read()
+            );
+            self.tx_log_store.debug_state();
+        }
 
         let from_level = to_level.upper_level();
         let mut tx = self.tx_log_store.new_tx();
@@ -503,11 +513,13 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
             .for_each(|(id, level)| sst_manager.remove(id, level));
         drop(sst_manager);
 
-        println!(
-            "===do_major_compaction after {:?}\n",
-            self.sst_manager.read()
-        );
-        self.tx_log_store.debug_state();
+        if ENABLE_DEBUG {
+            println!(
+                "===do_major_compaction after {:?}\n",
+                self.sst_manager.read()
+            );
+            self.tx_log_store.debug_state();
+        }
 
         if self.sst_manager.read().require_major_compaction(to_level) {
             self.do_major_compaction(to_level.lower_level())?;
@@ -826,7 +838,7 @@ mod tests {
         let tx_lsm_tree: TxLsmTree<BlockId, RecordValue, MemDisk> =
             TxLsmTree::format(tx_log_store.clone(), Arc::new(Factory), None)?;
 
-        let cap = 1024;
+        let cap = super::TxLsmTree::<BlockId, RecordValue, MemDisk>::MEMTABLE_CAPACITY;
         let start = 0;
         for i in start..start + cap {
             let (k, v) = (

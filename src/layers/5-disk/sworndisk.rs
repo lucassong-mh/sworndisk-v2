@@ -54,7 +54,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let hba = self
             .block_validity_bitmap
             .alloc()
-            .ok_or(Error::with_msg(NoMemory, "block allocation failed"))?;
+            .ok_or(Error::with_msg(OutOfMemory, "block allocation failed"))?;
         let key = Key::random();
         let mut wbuf = Buf::alloc(1)?;
         let mac = OsAead::new().encrypt(
@@ -293,7 +293,7 @@ mod tests {
         let root_key = Key::random();
         let sworndisk = SwornDisk::create(mem_disk, root_key)?;
 
-        let num_rw = 3 * 1024;
+        let num_rw = 4 * 1024;
         let mut rw_buf = Buf::alloc(1)?;
         for i in 0..num_rw {
             rw_buf.as_mut_slice().fill(i as u8);

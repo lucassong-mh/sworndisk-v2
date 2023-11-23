@@ -90,6 +90,7 @@ impl<K: Copy + Ord + Debug, V: Copy> MemTable<K, V> {
                 self.on_drop_record
                     .as_ref()
                     .map(|on_drop_record| on_drop_record(&(key, replaced)));
+                self.size -= 1;
                 return Some(replaced);
             }
         }

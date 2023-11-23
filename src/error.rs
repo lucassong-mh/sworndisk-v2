@@ -15,6 +15,8 @@ pub enum Errno {
     IoFailed,
     /// Permission denied.
     PermissionDenied,
+    /// Unsupported.
+    Unsupported,
     /// OS-specific unknown error.
     OsSpecUnknown,
     /// Encryption operation failed.

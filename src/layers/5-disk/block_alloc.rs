@@ -7,6 +7,7 @@ use crate::os::Mutex;
 use crate::prelude::*;
 
 use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use pod::Pod;
 use serde::{Deserialize, Serialize};
 
@@ -26,7 +27,10 @@ pub(super) struct BlockAlloc<D> {
 type AllocDiffTable = Mutex<BTreeMap<Hba, AllocDiff>>;
 
 /// Block validity bitmap.
-pub(super) struct AllocBitmap(Mutex<BitMap>);
+pub(super) struct AllocBitmap {
+    bitmap: Mutex<BitMap>,
+    min_avail: AtomicUsize,
+}
 
 impl<D: BlockSet + 'static> BlockAlloc<D> {
     pub fn new(bitmap: Arc<AllocBitmap>, store: Arc<TxLogStore<D>>) -> Self {
@@ -99,14 +103,19 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
 
     pub fn update_bitmap(&self) {
         let diff_table = self.diff_table.lock();
-        let mut bitmap = self.bitmap.0.lock();
+        let mut bitmap = self.bitmap.bitmap.lock();
+        let mut min_avail = self.bitmap.min_avail.load(Ordering::Relaxed);
         for (block_id, block_diff) in diff_table.iter() {
             let validity = match block_diff {
                 AllocDiff::Alloc => false,
-                AllocDiff::Dealloc => true,
+                AllocDiff::Dealloc => {
+                    min_avail = min_avail.min(*block_id);
+                    true
+                }
             };
             bitmap.set(*block_id, validity);
         }
+        self.bitmap.min_avail.store(min_avail, Ordering::Release);
         drop(bitmap);
     }
 
@@ -136,7 +145,10 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
 
 impl AllocBitmap {
     pub fn new(nblocks: usize) -> Self {
-        Self(Mutex::new(BitMap::repeat(true, nblocks)))
+        Self {
+            bitmap: Mutex::new(BitMap::repeat(true, nblocks)),
+            min_avail: AtomicUsize::new(0),
+        }
     }
 
     pub fn recover<D: BlockSet + 'static>(&self, store: &Arc<TxLogStore<D>>) -> Result<()> {
@@ -170,22 +182,20 @@ impl AllocBitmap {
     }
 
     pub fn alloc(&self) -> Option<Hba> {
-        let mut bitmap = self.0.lock();
-        for (nth, mut is_valid) in bitmap.iter_mut().enumerate() {
-            if *is_valid {
-                *is_valid = false;
-                return Some(nth as Hba);
-            }
-        }
-        None
+        let mut bitmap = self.bitmap.lock();
+        let min_avail = self.min_avail.load(Ordering::Relaxed);
+        let hba = bitmap[min_avail..].first_one()? + min_avail;
+        bitmap.set(hba, false);
+        self.min_avail.store(hba + 1, Ordering::Release);
+        Some(hba as Hba)
     }
 
     pub fn set_allocated(&self, nth: usize) {
-        self.0.lock().set(nth, false);
+        self.bitmap.lock().set(nth, false);
     }
 
     pub fn set_deallocated(&self, nth: usize) {
-        self.0.lock().set(nth, true);
+        self.bitmap.lock().set(nth, true);
     }
 }
 

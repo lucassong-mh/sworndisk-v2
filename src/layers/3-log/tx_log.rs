@@ -80,7 +80,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
             Arc::new(Mutex::new(Journal::format(
                 journal_area,
                 all_state,
-                16384, // TBD
+                1048576, // TBD
                 JournalCompactPolicy {},
             )?))
         };

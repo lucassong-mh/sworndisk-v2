@@ -7,20 +7,21 @@ use self::util::{DisplayData, DisplayThroughput};
 
 use spin::Mutex;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
 pub(crate) type Result<T> = core::result::Result<T, Error>;
 
 fn main() {
+    let total_bytes = 4 * MiB;
     // Specify all benchmarks
     let mut benches = [
         BenchBuilder::new("sworndisk::write_seq")
             .disk_type(DiskType::SwornDisk)
             .io_type(IoType::Write)
             .io_pattern(IoPattern::Seq)
-            .total_bytes(4 * MiB)
+            .total_bytes(total_bytes)
             .concurrency(1)
             .build()
             .unwrap(),
@@ -28,7 +29,7 @@ fn main() {
             .disk_type(DiskType::EncDisk)
             .io_type(IoType::Write)
             .io_pattern(IoPattern::Seq)
-            .total_bytes(4 * MiB)
+            .total_bytes(total_bytes)
             .concurrency(1)
             .build()
             .unwrap(),
@@ -176,9 +177,12 @@ mod benches {
                 return_errno_with_msg!(Errno::InvalidArgs, "concurrency must be greater than 0");
             }
 
+            let disk = Self::create_disk(disk_type, total_bytes)?;
+
             Ok(Box::new(SimpleDiskBench {
                 name,
                 disk_type,
+                disk,
                 io_type,
                 io_pattern,
                 buf_size,
@@ -186,11 +190,24 @@ mod benches {
                 concurrency,
             }))
         }
+
+        fn create_disk(disk_type: DiskType, total_bytes: usize) -> Result<Arc<dyn BenchDisk>> {
+            let total_nblocks = total_bytes / BLOCK_SIZE;
+            let disk: Arc<dyn BenchDisk> = match disk_type {
+                DiskType::SwornDisk => Arc::new(SwornDisk::create(
+                    FileAsDisk::create(total_nblocks * 2, "sworndisk.image"),
+                    AeadKey::default(),
+                )?),
+                DiskType::EncDisk => Arc::new(EncDisk::create(total_nblocks)),
+            };
+            Ok(disk)
+        }
     }
 
     pub struct SimpleDiskBench {
         name: String,
         disk_type: DiskType,
+        disk: Arc<dyn BenchDisk>,
         io_type: IoType,
         io_pattern: IoPattern,
         buf_size: usize,
@@ -214,20 +231,13 @@ mod benches {
             let total_nblock = self.total_bytes / BLOCK_SIZE;
             let concurrency = self.concurrency;
 
-            let disk: Arc<dyn BenchDisk> = match self.disk_type {
-                DiskType::SwornDisk => Arc::new(SwornDisk::create(
-                    FileAsDisk::create(2 * total_nblock, "sworndisk.image"),
-                    AeadKey::default(),
-                )?),
-                DiskType::EncDisk => Arc::new(EncDisk::create(total_nblock)),
-            };
             match (io_type, io_pattern) {
-                (IoType::Read, IoPattern::Seq) => disk.read_seq(total_nblock, buf_size),
+                (IoType::Read, IoPattern::Seq) => self.disk.read_seq(total_nblock, buf_size),
                 //(IoType::Read, IoPattern::Rnd) => disk.read_rnd(total_bytes, buf_size).await,
-                (IoType::Write, IoPattern::Seq) => disk.write_seq(total_nblock, buf_size),
+                (IoType::Write, IoPattern::Seq) => self.disk.write_seq(total_nblock, buf_size),
                 //(IoType::Write, IoPattern::Rnd) => disk.write_rnd(total_bytes, buf_size).await,
                 _ => Err(Error::with_msg(
-                    Errno::NotSupported,
+                    Errno::Unsupported,
                     "random I/O is not supported yet",
                 )),
             }
@@ -415,22 +425,23 @@ mod disks {
 
         fn write_seq(&self, total_nblocks: usize, buf_size: usize) -> Result<()> {
             let buf = Buf::alloc(buf_size)?;
-            let plain = Buf::alloc(1)?;
-            let mut cipher = Buf::alloc(1)?;
-
             for i in 0..total_nblocks / buf_size {
                 for _ in 0..buf_size {
-                    Aead::new().encrypt(
-                        plain.as_slice(),
-                        &AeadKey::default(),
-                        &AeadIv::default(),
-                        &[],
-                        cipher.as_mut_slice(),
-                    )?;
+                    let key = AeadKey::random();
+                    let plain = Buf::alloc(1)?;
+                    let mut cipher = Buf::alloc(1)?;
+                    Aead::new()
+                        .encrypt(
+                            plain.as_slice(),
+                            &key,
+                            &AeadIv::default(),
+                            &[],
+                            cipher.as_mut_slice(),
+                        )
+                        .unwrap();
                 }
                 self.file_disk.write(i * buf_size, buf.as_ref())?;
             }
-
             self.file_disk.flush()
         }
     }
@@ -503,7 +514,7 @@ mod util {
                 (unit_str, unit_val)
             };
             let throughput_in_unit = self.0 / (unit_val as f64);
-            write!(f, "{:.1} {}", throughput_in_unit, unit_str)
+            write!(f, "{:.2} {}", throughput_in_unit, unit_str)
         }
     }
 }
