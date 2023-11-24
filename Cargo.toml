@@ -24,6 +24,14 @@ spin = "0.9.8"
 static_assertions = "1.1.0"
 typetag = "0.2"
 
+[target.'cfg(target_env = "sgx")'.dependencies]
+sgx_alloc = {git = "https://github.com/occlum/incubator-teaclave-sgx-sdk", branch = "sgx_2.20_for_occlum"}
+sgx_libc = {git = "https://github.com/occlum/incubator-teaclave-sgx-sdk", branch = "sgx_2.20_for_occlum"}
+sgx_rand = {git = "https://github.com/occlum/incubator-teaclave-sgx-sdk", branch = "sgx_2.20_for_occlum"}
+sgx_tcrypto = {git = "https://github.com/occlum/incubator-teaclave-sgx-sdk", branch = "sgx_2.20_for_occlum"}
+sgx_tstd = {git = "https://github.com/occlum/incubator-teaclave-sgx-sdk", branch = "sgx_2.20_for_occlum", features = ["backtrace"]}
+sgx_types = {git = "https://github.com/occlum/incubator-teaclave-sgx-sdk", branch = "sgx_2.20_for_occlum"}
+
 [lib]
 doctest = false
 
