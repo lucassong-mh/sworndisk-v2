@@ -6,7 +6,7 @@ use self::disks::{DiskType, FileAsDisk};
 use self::util::{DisplayData, DisplayThroughput};
 
 use spin::Mutex;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,10 +25,58 @@ fn main() {
             .concurrency(1)
             .build()
             .unwrap(),
+        // BenchBuilder::new("sworndisk::write_rnd")
+        //     .disk_type(DiskType::SwornDisk)
+        //     .io_type(IoType::Write)
+        //     .io_pattern(IoPattern::Rnd)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
+        // BenchBuilder::new("sworndisk::read_seq")
+        //     .disk_type(DiskType::SwornDisk)
+        //     .io_type(IoType::Read)
+        //     .io_pattern(IoPattern::Seq)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
+        // BenchBuilder::new("sworndisk::read_rnd")
+        //     .disk_type(DiskType::SwornDisk)
+        //     .io_type(IoType::Read)
+        //     .io_pattern(IoPattern::Rnd)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
         BenchBuilder::new("encdisk::write_seq")
             .disk_type(DiskType::EncDisk)
             .io_type(IoType::Write)
             .io_pattern(IoPattern::Seq)
+            .total_bytes(total_bytes)
+            .concurrency(1)
+            .build()
+            .unwrap(),
+        BenchBuilder::new("encdisk::write_rnd")
+            .disk_type(DiskType::EncDisk)
+            .io_type(IoType::Write)
+            .io_pattern(IoPattern::Rnd)
+            .total_bytes(total_bytes)
+            .concurrency(1)
+            .build()
+            .unwrap(),
+        BenchBuilder::new("encdisk::read_seq")
+            .disk_type(DiskType::EncDisk)
+            .io_type(IoType::Read)
+            .io_pattern(IoPattern::Seq)
+            .total_bytes(total_bytes)
+            .concurrency(1)
+            .build()
+            .unwrap(),
+        BenchBuilder::new("encdisk::read_rnd")
+            .disk_type(DiskType::EncDisk)
+            .io_type(IoType::Read)
+            .io_pattern(IoPattern::Rnd)
             .total_bytes(total_bytes)
             .concurrency(1)
             .build()
@@ -177,7 +225,7 @@ mod benches {
                 return_errno_with_msg!(Errno::InvalidArgs, "concurrency must be greater than 0");
             }
 
-            let disk = Self::create_disk(disk_type, total_bytes)?;
+            let disk = Self::prepare_disk(disk_type, total_bytes, io_type)?;
 
             Ok(Box::new(SimpleDiskBench {
                 name,
@@ -191,7 +239,11 @@ mod benches {
             }))
         }
 
-        fn create_disk(disk_type: DiskType, total_bytes: usize) -> Result<Arc<dyn BenchDisk>> {
+        fn prepare_disk(
+            disk_type: DiskType,
+            total_bytes: usize,
+            io_type: IoType,
+        ) -> Result<Arc<dyn BenchDisk>> {
             let total_nblocks = total_bytes / BLOCK_SIZE;
             let disk: Arc<dyn BenchDisk> = match disk_type {
                 DiskType::SwornDisk => Arc::new(SwornDisk::create(
@@ -200,6 +252,11 @@ mod benches {
                 )?),
                 DiskType::EncDisk => Arc::new(EncDisk::create(total_nblocks)),
             };
+
+            if io_type == IoType::Read {
+                disk.write_seq(total_nblocks, 1).unwrap();
+            }
+
             Ok(disk)
         }
     }
@@ -233,13 +290,10 @@ mod benches {
 
             match (io_type, io_pattern) {
                 (IoType::Read, IoPattern::Seq) => self.disk.read_seq(total_nblock, buf_size),
-                //(IoType::Read, IoPattern::Rnd) => disk.read_rnd(total_bytes, buf_size).await,
                 (IoType::Write, IoPattern::Seq) => self.disk.write_seq(total_nblock, buf_size),
-                //(IoType::Write, IoPattern::Rnd) => disk.write_rnd(total_bytes, buf_size).await,
-                _ => Err(Error::with_msg(
-                    Errno::Unsupported,
-                    "random I/O is not supported yet",
-                )),
+
+                (IoType::Read, IoPattern::Rnd) => self.disk.read_rnd(total_nblock, buf_size),
+                (IoType::Write, IoPattern::Rnd) => self.disk.write_rnd(total_nblock, buf_size),
             }
         }
     }
@@ -295,6 +349,9 @@ mod disks {
     pub trait BenchDisk {
         fn read_seq(&self, total_nblocks: usize, buf_size: usize) -> Result<()>;
         fn write_seq(&self, total_nblocks: usize, buf_size: usize) -> Result<()>;
+
+        fn read_rnd(&self, total_nblocks: usize, buf_size: usize) -> Result<()>;
+        fn write_rnd(&self, total_nblocks: usize, buf_size: usize) -> Result<()>;
     }
 
     #[derive(Clone)]
@@ -306,7 +363,12 @@ mod disks {
 
     impl FileAsDisk {
         pub fn create(nblocks: usize, path: &str) -> Self {
-            let file = File::create(path).unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(path)
+                .unwrap();
             file.set_len((nblocks * BLOCK_SIZE) as _).unwrap();
             Self {
                 file: Arc::new(Mutex::new(file)),
@@ -385,6 +447,34 @@ mod disks {
 
             self.sync()
         }
+
+        fn read_rnd(&self, total_nblocks: usize, buf_size: usize) -> Result<()> {
+            let mut buf = Buf::alloc(buf_size)?;
+            let mut read_cnt = 0;
+            while read_cnt <= total_nblocks / buf_size {
+                let rnd_pos = gen_rnd_pos(total_nblocks);
+                self.read(rnd_pos, buf.as_mut())?;
+                read_cnt += 1;
+            }
+            Ok(())
+        }
+
+        fn write_rnd(&self, total_nblocks: usize, buf_size: usize) -> Result<()> {
+            let buf = Buf::alloc(buf_size)?;
+            let mut write_cnt = 0;
+            while write_cnt <= total_nblocks / buf_size {
+                let rnd_pos = gen_rnd_pos(total_nblocks);
+                self.write(rnd_pos, buf.as_ref())?;
+                write_cnt += 1;
+            }
+            Ok(())
+        }
+    }
+
+    fn gen_rnd_pos(total_nblocks: usize) -> BlockId {
+        let mut rnd_pos_bytes = [0u8; 8];
+        Rng::new(&[]).fill_bytes(&mut rnd_pos_bytes).unwrap();
+        BlockId::from_le_bytes(rnd_pos_bytes) % total_nblocks
     }
 
     #[derive(Clone)]
@@ -398,24 +488,43 @@ mod disks {
                 file_disk: FileAsDisk::create(nblocks, "encdisk.image"),
             }
         }
+
+        fn dummy_encrypt() -> Result<()> {
+            let key = AeadKey::random();
+            let plain = Buf::alloc(1)?;
+            let mut cipher = Buf::alloc(1)?;
+            let _ = Aead::new().encrypt(
+                plain.as_slice(),
+                &key,
+                &AeadIv::default(),
+                &[],
+                cipher.as_mut_slice(),
+            )?;
+            Ok(())
+        }
+
+        fn dummy_decrypt() -> Result<()> {
+            let cipher = Buf::alloc(1)?;
+            let mut plain = Buf::alloc(1)?;
+            let _ = Aead::new().decrypt(
+                cipher.as_slice(),
+                &AeadKey::default(),
+                &AeadIv::default(),
+                &[],
+                &AeadMac::default(),
+                plain.as_mut_slice(),
+            );
+            Ok(())
+        }
     }
 
     impl BenchDisk for EncDisk {
         fn read_seq(&self, total_nblocks: usize, buf_size: usize) -> Result<()> {
             let mut buf = Buf::alloc(buf_size)?;
-            let cipher = Buf::alloc(1)?;
-            let mut plain = Buf::alloc(1)?;
 
             for i in 0..total_nblocks / buf_size {
                 for _ in 0..buf_size {
-                    Aead::new().decrypt(
-                        cipher.as_slice(),
-                        &AeadKey::default(),
-                        &AeadIv::default(),
-                        &[],
-                        &AeadMac::default(),
-                        plain.as_mut_slice(),
-                    )?;
+                    Self::dummy_decrypt().unwrap();
                 }
                 self.file_disk.read(i * buf_size, buf.as_mut())?;
             }
@@ -427,22 +536,39 @@ mod disks {
             let buf = Buf::alloc(buf_size)?;
             for i in 0..total_nblocks / buf_size {
                 for _ in 0..buf_size {
-                    let key = AeadKey::random();
-                    let plain = Buf::alloc(1)?;
-                    let mut cipher = Buf::alloc(1)?;
-                    Aead::new()
-                        .encrypt(
-                            plain.as_slice(),
-                            &key,
-                            &AeadIv::default(),
-                            &[],
-                            cipher.as_mut_slice(),
-                        )
-                        .unwrap();
+                    Self::dummy_encrypt().unwrap();
                 }
                 self.file_disk.write(i * buf_size, buf.as_ref())?;
             }
             self.file_disk.flush()
+        }
+
+        fn read_rnd(&self, total_nblocks: usize, buf_size: usize) -> Result<()> {
+            let mut buf = Buf::alloc(buf_size)?;
+            let mut read_cnt = 0;
+            while read_cnt <= total_nblocks / buf_size {
+                for _ in 0..buf_size {
+                    Self::dummy_decrypt().unwrap();
+                }
+                let rnd_pos = gen_rnd_pos(total_nblocks);
+                self.file_disk.read(rnd_pos, buf.as_mut())?;
+                read_cnt += 1;
+            }
+            Ok(())
+        }
+
+        fn write_rnd(&self, total_nblocks: usize, buf_size: usize) -> Result<()> {
+            let buf = Buf::alloc(buf_size)?;
+            let mut write_cnt = 0;
+            while write_cnt <= total_nblocks / buf_size {
+                for _ in 0..buf_size {
+                    Self::dummy_encrypt().unwrap();
+                }
+                let rnd_pos = gen_rnd_pos(total_nblocks);
+                self.file_disk.write(rnd_pos, buf.as_ref())?;
+                write_cnt += 1;
+            }
+            Ok(())
         }
     }
 }
