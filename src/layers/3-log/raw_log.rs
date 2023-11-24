@@ -8,7 +8,8 @@
 //! Internally, `RawLogStore<D>` manages the disk space with `ChunkAlloc`
 //! so that the disk space can be allocated and deallocated in the units of
 //! chunk. An allocated chunk belongs to exactly one raw log. And one raw log
-//! may be backed by multiple chunks.
+//! may be backed by multiple chunks. The raw log is represented externally
+//! as a `BlockLog`.
 //!
 //! # Examples
 //!
@@ -92,12 +93,11 @@ use crate::util::LazyDelete;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Weak;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use lending_iterator::LendingIterator;
 use serde::{Deserialize, Serialize};
 
 pub type RawLogId = u64;
 
-/// A store for raw logs.
+/// A store of raw logs.
 pub struct RawLogStore<D> {
     state: Arc<Mutex<State>>,
     disk: D,
@@ -526,14 +526,17 @@ impl<'a> RawLogHeadRef<'a> {
         debug_assert!(offset + nblocks <= self.entry.head.num_blocks as _);
 
         let prepared_blocks = self.prepare_blocks(offset, nblocks);
-        debug_assert_eq!(prepared_blocks.len(), nblocks);
+        debug_assert!(prepared_blocks.len() == nblocks && prepared_blocks.is_sorted());
 
-        // TODO: Batch read
-        let mut iter_mut = buf.iter_mut();
-        let mut i = 0;
-        while let Some(block_buf) = iter_mut.next() {
-            disk.read(prepared_blocks[i], block_buf)?;
-            i += 1;
+        // Batch read
+        let mut offset = 0;
+        for consecutive_blocks in prepared_blocks.group_by(|b1, b2| b2 - b1 == 1) {
+            let len = consecutive_blocks.len();
+            let first_bid = *consecutive_blocks.first().unwrap();
+            let buf_slice =
+                &mut buf.as_mut_slice()[offset * BLOCK_SIZE..(offset + len) * BLOCK_SIZE];
+            disk.read(first_bid, BufMut::try_from(buf_slice).unwrap())?;
+            offset += len;
         }
 
         Ok(())
@@ -600,14 +603,17 @@ impl<'a> RawLogTailRef<'a> {
         debug_assert!(offset + nblocks <= tail_nblocks);
 
         let prepared_blocks = self.prepare_blocks(offset, nblocks);
-        debug_assert_eq!(prepared_blocks.len(), nblocks);
+        debug_assert!(prepared_blocks.len() == nblocks && prepared_blocks.is_sorted());
 
-        // TODO: Batch read
-        let mut iter_mut = buf.iter_mut();
-        let mut i = 0;
-        while let Some(block_buf) = iter_mut.next() {
-            disk.read(prepared_blocks[i], block_buf)?;
-            i += 1;
+        // Batch read
+        let mut offset = 0;
+        for consecutive_blocks in prepared_blocks.group_by(|b1, b2| b2 - b1 == 1) {
+            let len = consecutive_blocks.len();
+            let first_bid = *consecutive_blocks.first().unwrap();
+            let buf_slice =
+                &mut buf.as_mut_slice()[offset * BLOCK_SIZE..(offset + len) * BLOCK_SIZE];
+            disk.read(first_bid, BufMut::try_from(buf_slice).unwrap())?;
+            offset += len;
         }
 
         Ok(())
@@ -617,11 +623,16 @@ impl<'a> RawLogTailRef<'a> {
         let nblocks = buf.nblocks();
 
         let prepared_blocks = self.prepare_blocks(self.len() as _, nblocks);
-        debug_assert_eq!(prepared_blocks.len(), nblocks);
+        debug_assert!(prepared_blocks.len() == nblocks && prepared_blocks.is_sorted());
 
-        // TODO: Batch write
-        for (i, block_buf) in buf.iter().enumerate() {
-            disk.write(prepared_blocks[i], block_buf)?;
+        // Batch write
+        let mut offset = 0;
+        for consecutive_blocks in prepared_blocks.group_by(|b1, b2| b2 - b1 == 1) {
+            let len = consecutive_blocks.len();
+            let first_bid = *consecutive_blocks.first().unwrap();
+            let buf_slice = &buf.as_slice()[offset * BLOCK_SIZE..(offset + len) * BLOCK_SIZE];
+            disk.write(first_bid, BufRef::try_from(buf_slice).unwrap())?;
+            offset += len;
         }
 
         Ok(())

@@ -1,4 +1,63 @@
 //! A store of transactional logs.
+//!
+//! `TxLogStore<D>` supports creating, deleting, listing, reading,
+//! and writing `TxLog<D>`s within transactions. Each `TxLog<D>`
+//! is uniquely identified by its ID (`TxLogId`). Writing to a TX log
+//! is append only. TX logs are categorized into pre-determined buckets.
+//!
+//! File content of `TxLog<D>` is stored securely using a `CryptoLog<RawLog<D>>`,
+//! whose storage space is backed by untrusted log `RawLog<D>`,
+//! whose host blocks are managed by `ChunkAlloc`. The whole untrusted
+//! host disk that `TxLogSore<D>` used is represented by a `BlockSet`.
+//!
+//! # Examples
+//!
+//! TX logs are manipulated and accessed within transactions.
+//!
+//! ```
+//! fn create_and_read_log<D: BlockSet>(
+//!     tx_log_store: &TxLogStore<D>,
+//!     bucket: &str
+//! ) -> Result<()> {
+//!     let content = 5_u8;
+//!
+//!     // TX 1: Create then write a new log
+//!     let mut tx = tx_log_store.new_tx();
+//!     let res: Result<_> = tx.context(|| {
+//!         let new_log = tx_log_store.create_log(bucket)?;
+//!         let mut buf = Buf::alloc(1)?;
+//!         buf.as_mut_slice().fill(content);
+//!         new_log.append(buf.as_ref())
+//!     });
+//!     if res.is_err() {
+//!         tx.abort();
+//!     }
+//!     tx.commit()?;
+//!
+//!     // TX 2: Open then read the created log
+//!     let mut tx = tx_log_store.new_tx();
+//!     let res: Result<_> = tx.context(|| {
+//!         let log = tx_log_store.open_log_in(bucket)?;
+//!         let mut buf = Buf::alloc(1)?;
+//!         log.read(0 as BlockId, buf.as_mut())?;
+//!         assert_eq!(buf.as_slice()[0], content);
+//!         Ok(())
+//!     });
+//!     if res.is_err() {
+//!         tx.abort();
+//!     }
+//!     tx.commit()
+//! }
+//! ```
+//!
+//! `TxLogStore<D>`'s API is designed to be a limited POSIX FS
+//! and must be called within transactions (`Tx`). It mitigates user burden by
+//! minimizing the odds of conflicts among TXs:
+//! 1) Prohibiting concurrent TXs from opening the same log for
+//! writing (no write conflicts);
+//! 2) Implementing lazy log deletion to avoid interference with
+//! other TXs utilizing the log (no deletion conflicts);
+//! 3) Identifying logs by system-generated IDs (no name conflicts).
 use self::journaling::{AllEdit, AllState, Journal, JournalCompactPolicy};
 use super::chunk::{ChunkAlloc, ChunkAllocEdit, ChunkAllocState};
 use super::raw_log::{RawLog, RawLogId, RawLogStore, RawLogStoreEdit, RawLogStoreState};
@@ -214,7 +273,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         tx_provider.register_commit_handler({
             let state = new_self.state.clone();
             let raw_log_store = new_self.raw_log_store.clone();
-            move |current: CurrentTx<'_>| {
+            move |mut current: CurrentTx<'_>| {
                 Self::do_lazy_deletion(&state, &current);
 
                 current.data_with(|store_edit: &TxLogStoreEdit| {
@@ -230,7 +289,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
                     }
                 });
 
-                Self::apply_log_caches(&state, &current);
+                Self::apply_log_caches(&state, &mut current);
             }
         });
 
@@ -297,14 +356,19 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     }
 
     // TODO: Need performance improvement
-    fn apply_log_caches(state: &Arc<Mutex<State>>, current_tx: &CurrentTx<'_>) {
+    fn apply_log_caches(state: &Arc<Mutex<State>>, current_tx: &mut CurrentTx<'_>) {
         // Apply per-TX log cache
-        current_tx.data_with(|open_cache_table: &OpenLogCache| {
+        current_tx.data_mut_with(|open_cache_table: &mut OpenLogCache| {
             let mut state = state.lock();
             let log_caches = &mut state.log_caches;
-            for (log_id, open_cache) in open_cache_table.open_table.iter() {
+            for (log_id, open_cache) in open_cache_table.open_table.iter_mut() {
                 let log_cache = log_caches.get_mut(log_id).unwrap();
                 let mut cache_inner = log_cache.inner.write();
+                if cache_inner.lru_cache.is_empty() {
+                    core::mem::swap(&mut cache_inner.lru_cache, &mut open_cache.lru_cache);
+                    return;
+                }
+
                 open_cache.lru_cache.iter().for_each(|(&pos, node)| {
                     cache_inner.lru_cache.put(pos, node.clone());
                 });
@@ -383,6 +447,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
 
         Ok(Arc::new(TxLog {
             inner_log,
+            tx_provider: self.tx_provider.clone(),
             can_append: true,
         }))
     }
@@ -398,7 +463,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     pub fn open_log(&self, log_id: TxLogId, can_append: bool) -> Result<Arc<TxLog<D>>> {
         let mut current_tx = self.tx_provider.current();
         let inner_log = self.open_inner_log(log_id, can_append, &mut current_tx)?;
-        let tx_log = TxLog::new(inner_log, can_append);
+        let tx_log = TxLog::new(inner_log, self.tx_provider.clone(), can_append);
         Ok(Arc::new(tx_log))
     }
 
@@ -599,6 +664,7 @@ impl Superblock {
 #[derive(Clone)]
 pub struct TxLog<D> {
     inner_log: Arc<TxLogInner<D>>,
+    tx_provider: Arc<TxProvider>,
     can_append: bool,
 }
 
@@ -612,9 +678,10 @@ struct TxLogInner<D> {
 }
 
 impl<D: BlockSet + 'static> TxLog<D> {
-    fn new(inner_log: Arc<TxLogInner<D>>, can_append: bool) -> Self {
+    fn new(inner_log: Arc<TxLogInner<D>>, tx_provider: Arc<TxProvider>, can_append: bool) -> Self {
         Self {
             inner_log,
+            tx_provider,
             can_append,
         }
     }
@@ -645,6 +712,8 @@ impl<D: BlockSet + 'static> TxLog<D> {
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
     pub fn read(&self, pos: BlockId, buf: BufMut) -> Result<()> {
+        debug_assert_eq!(self.tx_id(), self.tx_provider.current().id());
+
         self.inner_log.crypto_log.read(pos, buf)
     }
 
@@ -654,6 +723,8 @@ impl<D: BlockSet + 'static> TxLog<D> {
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
     pub fn append(&self, buf: BufRef) -> Result<()> {
+        debug_assert_eq!(self.tx_id(), self.tx_provider.current().id());
+
         if !self.can_append {
             return_errno_with_msg!(PermissionDenied, "tx log not in append mode");
         }
@@ -668,6 +739,8 @@ impl<D: BlockSet + 'static> TxLog<D> {
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
     pub fn nblocks(&self) -> usize {
+        debug_assert_eq!(self.tx_id(), self.tx_provider.current().id());
+
         self.inner_log.crypto_log.nblocks()
     }
 }
@@ -1254,6 +1327,36 @@ mod tests {
             let res = tx_log_store.open_log(log_id, false).map(|_| ());
             res.expect_err("result must be NotFound");
         });
+        tx.commit()
+    }
+
+    fn main<D: BlockSet + 'static>(tx_log_store: &TxLogStore<D>, bucket: &str) -> Result<()> {
+        let content = 5_u8;
+        // TX 1: Create then write a new log
+        let mut tx = tx_log_store.new_tx();
+        let res: Result<_> = tx.context(|| {
+            let new_log = tx_log_store.create_log(bucket)?;
+            let mut buf = Buf::alloc(1)?;
+            buf.as_mut_slice().fill(content);
+            new_log.append(buf.as_ref())
+        });
+        if res.is_err() {
+            tx.abort();
+        }
+        tx.commit()?;
+
+        // TX 2: Open then read the created log
+        let mut tx = tx_log_store.new_tx();
+        let res: Result<_> = tx.context(|| {
+            let log = tx_log_store.open_log_in(bucket)?;
+            let mut buf = Buf::alloc(1)?;
+            log.read(0 as BlockId, buf.as_mut())?;
+            assert_eq!(buf.as_slice()[0], content);
+            Ok(())
+        });
+        if res.is_err() {
+            tx.abort();
+        }
         tx.commit()
     }
 }
