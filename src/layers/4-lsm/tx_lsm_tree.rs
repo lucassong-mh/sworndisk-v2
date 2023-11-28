@@ -744,7 +744,7 @@ impl From<u8> for LsmLevel {
     }
 }
 
-impl<K: Ord + Pod + Debug, V: Pod> SstManager<K, V> {
+impl<K: Ord + Pod + Debug, V: Pod + Debug> SstManager<K, V> {
     const MAX_NUM_LEVELS: usize = 6;
 
     pub fn new() -> Self {

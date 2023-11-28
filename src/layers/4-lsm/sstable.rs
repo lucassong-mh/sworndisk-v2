@@ -60,7 +60,7 @@ enum RecordFlag {
     SyncedAndUnsynced = 19,
 }
 
-impl<K: Ord + Pod + Debug, V: Pod> SSTable<K, V> {
+impl<K: Ord + Pod + Debug, V: Pod + Debug> SSTable<K, V> {
     const K_SIZE: usize = size_of::<K>();
     const V_SIZE: usize = size_of::<V>();
     const MAX_RECORD_SIZE: usize = BID_SIZE + 1 + 2 * Self::V_SIZE;

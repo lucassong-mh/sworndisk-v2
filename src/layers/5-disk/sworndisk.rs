@@ -34,7 +34,10 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     /// Read a specified number of block contents at a logical block address on the device.
     pub fn read(&self, lba: Lba, mut buf: BufMut) -> Result<usize> {
         // TODO: batch read
-        let record = self.tx_lsm_tree.get(&RecordKey { lba }).unwrap();
+        let record = self
+            .tx_lsm_tree
+            .get(&RecordKey { lba })
+            .ok_or(Error::with_msg(NotFound, "record not found in lsm tree"))?;
         let mut rbuf = Buf::alloc(1)?;
         self.user_data_disk.read(record.hba, rbuf.as_mut())?;
         OsAead::new().decrypt(
@@ -153,6 +156,9 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         disk.subset(disk.nblocks() / 10 * 5..disk.nblocks()) // TBD
     }
 }
+
+unsafe impl<D: BlockSet> Send for SwornDisk<D> {}
+unsafe impl<D: BlockSet> Sync for SwornDisk<D> {}
 
 struct TxLsmTreeListenerFactory<D> {
     store: Arc<TxLogStore<D>>,

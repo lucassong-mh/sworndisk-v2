@@ -1,12 +1,17 @@
 //! Occlum specific implementations.
 
-use crate::prelude::*;
+use crate::error::Errno;
+use crate::prelude::{Error, Result};
 
+use core::marker::PhantomData;
+use core::ptr::NonNull;
+use pod::Pod;
+use serde::{Deserialize, Serialize};
 use sgx_rand::{thread_rng, Rng};
 use sgx_tcrypto::{rsgx_aes_ctr_decrypt, rsgx_aes_ctr_encrypt};
 use sgx_tcrypto::{rsgx_rijndael128GCM_decrypt, rsgx_rijndael128GCM_encrypt};
+use sgx_tstd::alloc::{alloc, dealloc, Layout};
 use sgx_types::sgx_status_t;
-use std::alloc::{alloc, dealloc, Layout};
 
 /// Reuse lock implementation of crate spin.
 pub use spin::{

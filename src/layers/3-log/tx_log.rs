@@ -766,6 +766,7 @@ impl CryptoLogCache {
     }
 }
 
+// TODO: Test cache hitness
 impl NodeCache for CryptoLogCache {
     fn get(&self, pos: BlockId) -> Option<Arc<dyn Any + Send + Sync>> {
         let mut current = self.tx_provider.current();
