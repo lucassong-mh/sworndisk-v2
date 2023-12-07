@@ -14,17 +14,17 @@ use std::time::Instant;
 pub(crate) type Result<T> = core::result::Result<T, Error>;
 
 fn main() {
-    let total_bytes = 4 * MiB;
+    let total_bytes = 3 * GiB;
     // Specify all benchmarks
     let benches = vec![
-        BenchBuilder::new("sworndisk::write_seq")
-            .disk_type(DiskType::SwornDisk)
-            .io_type(IoType::Write)
-            .io_pattern(IoPattern::Seq)
-            .total_bytes(total_bytes)
-            .concurrency(1)
-            .build()
-            .unwrap(),
+        // BenchBuilder::new("sworndisk::write_seq")
+        //     .disk_type(DiskType::SwornDisk)
+        //     .io_type(IoType::Write)
+        //     .io_pattern(IoPattern::Seq)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
         BenchBuilder::new("sworndisk::write_rnd")
             .disk_type(DiskType::SwornDisk)
             .io_type(IoType::Write)
@@ -33,54 +33,54 @@ fn main() {
             .concurrency(1)
             .build()
             .unwrap(),
-        BenchBuilder::new("sworndisk::read_seq")
-            .disk_type(DiskType::SwornDisk)
-            .io_type(IoType::Read)
-            .io_pattern(IoPattern::Seq)
-            .total_bytes(total_bytes)
-            .concurrency(1)
-            .build()
-            .unwrap(),
-        BenchBuilder::new("sworndisk::read_rnd")
-            .disk_type(DiskType::SwornDisk)
-            .io_type(IoType::Read)
-            .io_pattern(IoPattern::Rnd)
-            .total_bytes(total_bytes)
-            .concurrency(1)
-            .build()
-            .unwrap(),
-        BenchBuilder::new("encdisk::write_seq")
-            .disk_type(DiskType::EncDisk)
-            .io_type(IoType::Write)
-            .io_pattern(IoPattern::Seq)
-            .total_bytes(total_bytes)
-            .concurrency(1)
-            .build()
-            .unwrap(),
-        BenchBuilder::new("encdisk::write_rnd")
-            .disk_type(DiskType::EncDisk)
-            .io_type(IoType::Write)
-            .io_pattern(IoPattern::Rnd)
-            .total_bytes(total_bytes)
-            .concurrency(1)
-            .build()
-            .unwrap(),
-        BenchBuilder::new("encdisk::read_seq")
-            .disk_type(DiskType::EncDisk)
-            .io_type(IoType::Read)
-            .io_pattern(IoPattern::Seq)
-            .total_bytes(total_bytes)
-            .concurrency(1)
-            .build()
-            .unwrap(),
-        BenchBuilder::new("encdisk::read_rnd")
-            .disk_type(DiskType::EncDisk)
-            .io_type(IoType::Read)
-            .io_pattern(IoPattern::Rnd)
-            .total_bytes(total_bytes)
-            .concurrency(1)
-            .build()
-            .unwrap(),
+        // BenchBuilder::new("sworndisk::read_seq")
+        //     .disk_type(DiskType::SwornDisk)
+        //     .io_type(IoType::Read)
+        //     .io_pattern(IoPattern::Seq)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
+        // BenchBuilder::new("sworndisk::read_rnd")
+        //     .disk_type(DiskType::SwornDisk)
+        //     .io_type(IoType::Read)
+        //     .io_pattern(IoPattern::Rnd)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
+        // BenchBuilder::new("encdisk::write_seq")
+        //     .disk_type(DiskType::EncDisk)
+        //     .io_type(IoType::Write)
+        //     .io_pattern(IoPattern::Seq)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
+        // BenchBuilder::new("encdisk::write_rnd")
+        //     .disk_type(DiskType::EncDisk)
+        //     .io_type(IoType::Write)
+        //     .io_pattern(IoPattern::Rnd)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
+        // BenchBuilder::new("encdisk::read_seq")
+        //     .disk_type(DiskType::EncDisk)
+        //     .io_type(IoType::Read)
+        //     .io_pattern(IoPattern::Seq)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
+        // BenchBuilder::new("encdisk::read_rnd")
+        //     .disk_type(DiskType::EncDisk)
+        //     .io_type(IoType::Read)
+        //     .io_pattern(IoPattern::Rnd)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
     ];
 
     // Run all benchmarks and output the results
@@ -248,7 +248,7 @@ mod benches {
             let total_nblocks = total_bytes / BLOCK_SIZE;
             let disk: Arc<dyn BenchDisk> = match disk_type {
                 DiskType::SwornDisk => Arc::new(SwornDisk::create(
-                    FileAsDisk::create(total_nblocks * 16, "sworndisk.image"),
+                    FileAsDisk::create(total_nblocks * 4, "sworndisk.image"),
                     AeadKey::default(),
                 )?),
                 DiskType::EncDisk => Arc::new(EncDisk::create(total_nblocks)),
@@ -455,7 +455,10 @@ mod disks {
         }
 
         fn flush(&self) -> Result<()> {
-            self.file.lock().sync_all().unwrap();
+            // TODO: use raw file
+            // self.file.lock().flush().unwrap();
+            // self.file.lock().sync_all().unwrap();
+            self.file.lock().sync_data().unwrap();
             Ok(())
         }
 
@@ -488,7 +491,9 @@ mod disks {
                 self.write(pos + i * buf_nblocks, buf.as_ref())?;
             }
 
-            self.sync()
+            self.sync()?;
+            self.display_cost();
+            Ok(())
         }
 
         fn read_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()> {
@@ -510,7 +515,10 @@ mod disks {
                 self.write(pos + rnd_pos, buf.as_ref())?;
                 write_cnt += 1;
             }
-            self.sync()
+
+            self.sync()?;
+            self.display_cost();
+            Ok(())
         }
     }
 

@@ -1,4 +1,5 @@
 // #![no_std]
+#![feature(anonymous_lifetime_in_impl_trait)]
 #![feature(is_sorted)]
 #![feature(let_chains)]
 #![feature(negative_impls)]

@@ -1,6 +1,8 @@
+mod cost;
 mod crypto;
 mod lazy_delete;
 
+pub use self::cost::{Cost, COST};
 pub use self::crypto::{Aead, RandomInit, Rng, Skcipher};
 pub use self::lazy_delete::LazyDelete;
 
