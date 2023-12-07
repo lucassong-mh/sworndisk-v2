@@ -504,6 +504,10 @@ impl<L: BlockLog> MhtStorage<L> {
     fn append_data_nodes(&self, nodes: &[Arc<DataNode>]) -> Result<Vec<MhtNodeEntry>> {
         let num_append = nodes.len();
         let mut node_entries = Vec::with_capacity(num_append);
+        if num_append == 0 {
+            return Ok(node_entries);
+        }
+
         let mut cipher_buf = Buf::alloc(num_append)?;
         let mut pos = self.block_log.nblocks() as BlockId;
         let start_pos = pos;

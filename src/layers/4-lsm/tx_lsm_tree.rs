@@ -10,6 +10,7 @@ use super::sstable::SSTable;
 use super::wal::{WalAppendTx, BUCKET_WAL};
 use crate::layers::bio::BlockSet;
 use crate::layers::log::{TxLogId, TxLogStore};
+use crate::layers::lsm::compaction::Compactor;
 use crate::os::RwLock;
 use crate::prelude::*;
 use crate::tx::Tx;
@@ -52,7 +53,7 @@ pub enum LsmLevel {
     L2,
     L3,
     L4,
-    L5, // Indicate over 300 TB data
+    L5, // Include over 300 TB data
 }
 
 /// SST manager of the `TxLsmTree`,
@@ -104,7 +105,7 @@ pub enum TxType {
 }
 
 impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V, D> {
-    const MEMTABLE_CAPACITY: usize = 1024;
+    const MEMTABLE_CAPACITY: usize = 73728;
     const SSTABLE_CAPACITY: usize = Self::MEMTABLE_CAPACITY;
 
     /// Format a `TxLsmTree` from a given `TxLogStore`.
@@ -248,25 +249,42 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
 
     pub fn put(&self, key: K, value: V) -> Result<()> {
         let record = (key, value);
+        let time = Cost::activate();
+
         // 1. Write WAL
         self.wal_append_tx.append(&record)?;
 
         // 2. Put into MemTable
         let _ = self.active_mem_table().write().put(key, value);
         if !self.active_mem_table().read().at_capacity() {
+            Cost::acc_lsm_put_wal(time);
             return Ok(());
         }
 
         self.wal_append_tx.commit()?;
+        // TODO: Should wal's TX combine with minor compaction TX?
+
+        Cost::acc_lsm_put_wal(time);
 
         // 3. Trigger compaction if needed
         self.immut_idx.fetch_xor(1, Ordering::Release);
         // Do major compaction first if needed
-        if self.sst_manager.read().require_minor_compaction() {
+        if self
+            .sst_manager
+            .read()
+            .require_major_compaction(LsmLevel::L0)
+        {
+            let time = Cost::activate();
             self.do_compaction_tx(LsmLevel::L1)?;
+            Cost::acc_lsm_put_compaction_major(time);
         }
+
+        let time = Cost::activate();
         // Do minor compaction
-        self.do_compaction_tx(LsmLevel::L0)
+        self.do_compaction_tx(LsmLevel::L0)?;
+        Cost::acc_lsm_put_compaction_minor(time);
+
+        Ok(())
     }
 
     // FIXME: Do we actually need this API?
@@ -276,8 +294,15 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
     pub fn sync(&self) -> Result<()> {
         // TODO: Store master sync id to trusted storage
         let master_sync_id = MASTER_SYNC_ID.fetch_add(1, Ordering::Release) + 1;
+
+        let time = Cost::activate();
         self.wal_append_tx.sync(master_sync_id)?;
-        self.active_mem_table().write().sync(master_sync_id)
+        Cost::acc_lsm_sync_wal(time);
+
+        let time = Cost::activate();
+        self.active_mem_table().write().sync(master_sync_id)?;
+        Cost::acc_lsm_sync_memtable(time);
+        Ok(())
     }
 
     /// TXs in `TxLsmTree`
@@ -346,23 +371,20 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
             let tx_log = self.tx_log_store.create_log(LsmLevel::L0.bucket())?;
 
             let immut_mem_table = self.immut_mem_table().read();
-            let records: Vec<_> = immut_mem_table
-                .keys_values()
-                .map(|(k, v_ex)| (*k, v_ex.clone()))
-                .collect();
-            for (k, v_ex) in records.iter() {
+            let records_iter = immut_mem_table.iter().map(|(k, v_ex)| {
                 match v_ex {
                     ValueEx::Synced(v) | ValueEx::Unsynced(v) => {
-                        event_listener.on_add_record(&(*k, *v))?;
+                        event_listener.on_add_record(&(k, v)).unwrap();
                     }
                     ValueEx::SyncedAndUnsynced(cv, ucv) => {
-                        event_listener.on_add_record(&(*k, *cv))?;
-                        event_listener.on_add_record(&(*k, *ucv))?;
+                        event_listener.on_add_record(&(k, cv)).unwrap();
+                        event_listener.on_add_record(&(k, ucv)).unwrap();
                     }
                 }
-            }
+                (k, v_ex)
+            });
             let sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
-            let sst = SSTable::build(&records, sync_id, &tx_log)?;
+            let sst = SSTable::build(records_iter, sync_id, &tx_log)?;
             self.sst_manager.write().insert(sst, LsmLevel::L0);
             Ok(())
         });
@@ -409,6 +431,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
         }
 
         let from_level = to_level.upper_level();
+
         let mut tx = self.tx_log_store.new_tx();
         let tx_type = TxType::Compaction { to_level };
         let event_listener = self.listener_factory.new_event_listener(tx_type);
@@ -421,68 +444,90 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
             );
         }
 
-        let tx_log_store = self.tx_log_store.clone();
-        let mut compacted_sst_ids = Vec::new();
-        let mut compacted_ssts = Vec::new();
-        let mut compacted_records = Vec::new();
         let master_sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
+        let tx_log_store = self.tx_log_store.clone();
         let listener = event_listener.clone();
         let res: Result<_> = tx.context(move || {
             // Collect overlapped SSTs
             let sst_manager = self.sst_manager.read();
-
-            let upper_range = {
-                let (id, sst) = sst_manager.list_level(from_level).last().unwrap();
-                compacted_sst_ids.push((*id, from_level));
-                compacted_ssts.push(sst.clone());
-                sst.range()
-            };
-            let lower_ssts = sst_manager.list_level(to_level);
-
-            let _: Vec<()> = lower_ssts
-                .filter(|(_, sst)| sst.overlap_with(&upper_range))
-                .map(|(id, sst)| {
-                    compacted_sst_ids.push((*id, to_level));
-                    compacted_ssts.push(sst.clone());
+            let (upper_sst_id, upper_sst) = sst_manager
+                .list_level(from_level)
+                .last()
+                .map(|(id, sst)| (*id, sst.clone()))
+                .unwrap();
+            let lower_ssts: Vec<(TxLogId, Arc<SSTable<K, V>>)> = sst_manager
+                .list_level(to_level)
+                .filter_map(|(id, sst)| {
+                    if sst.overlap_with(&upper_sst.range()) {
+                        Some((*id, sst.clone()))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
             drop(sst_manager);
 
-            for sst in compacted_ssts {
-                let sync_id = sst.sync_id();
-                let mut records =
-                    sst.collect_all_records(&tx_log_store.open_log(sst.id(), false)?)?;
-                debug_assert!(sync_id <= master_sync_id);
-                if sync_id < master_sync_id {
-                    for (k, v_ex) in records.iter_mut() {
-                        match v_ex {
-                            ValueEx::Unsynced(v) => *v_ex = ValueEx::Synced(*v),
-                            ValueEx::SyncedAndUnsynced(cv, ucv) => {
-                                listener.on_drop_record(&(*k, *cv))?;
-                                *v_ex = ValueEx::Synced(*ucv);
-                            }
-                            _ => {}
-                        }
-                    }
+            let upper_records = {
+                let tx_log = tx_log_store.open_log(upper_sst_id, false)?;
+                let (records, dropped_records) =
+                    upper_sst.collect_all_records(&tx_log, master_sync_id, false)?;
+                Compactor::on_drop_records(&listener, dropped_records.into_iter())?;
+                records
+            };
+
+            let lower_records_vec = {
+                let mut records_vec = Vec::with_capacity(lower_ssts.len());
+                for (id, sst) in &lower_ssts {
+                    let tx_log = tx_log_store.open_log(*id, false)?;
+                    let (records, dropped_records) =
+                        sst.collect_all_records(&tx_log, master_sync_id, false)?;
+                    Compactor::on_drop_records(&listener, dropped_records.into_iter())?;
+                    records_vec.push(records);
                 }
-                compacted_records.push(records);
-            }
+                records_vec
+            };
 
             // Collect and sort records during compaction
-            let sorted_records = Self::merge_sort(compacted_records, &listener)?;
+            println!(
+                "merge sort start, upper len: {}, lower len: {}",
+                upper_records.len(),
+                lower_records_vec.len()
+            );
+            let compacted_records = {
+                if !lower_records_vec.is_empty() {
+                    let (compacted_records, dropped_records) = Compactor::compact_records(
+                        upper_records.into_iter(),
+                        lower_records_vec
+                            .into_iter()
+                            .flat_map(|records| records.into_iter()),
+                    );
+                    Compactor::on_drop_records(&listener, dropped_records.into_iter())?;
+                    compacted_records
+                } else {
+                    upper_records
+                }
+            };
+            debug_assert!(compacted_records.is_sorted_by_key(|(k, _)| k));
+            println!("merge sort done");
 
             let (mut created_ssts, mut deleted_ssts) = (vec![], vec![]);
             // Create new SSTs
-            for records in sorted_records.chunks(Self::SSTABLE_CAPACITY) {
+            for records in compacted_records.chunks(Self::SSTABLE_CAPACITY) {
                 let new_log = tx_log_store.create_log(to_level.bucket())?;
-                let new_sst = SSTable::build(records, master_sync_id, &new_log)?;
+                let new_sst = SSTable::build(
+                    records.iter().map(|(k, v)| (k, v)),
+                    master_sync_id,
+                    &new_log,
+                )?;
                 created_ssts.push((new_sst, to_level));
             }
 
             // Delete old SSTs
-            for (id, level) in compacted_sst_ids {
+            tx_log_store.delete_log(upper_sst_id)?;
+            deleted_ssts.push((upper_sst_id, from_level));
+            for id in lower_ssts.iter().map(|(id, _)| *id) {
                 tx_log_store.delete_log(id)?;
-                deleted_ssts.push((id, level));
+                deleted_ssts.push((id, to_level));
             }
             Ok((created_ssts, deleted_ssts))
         });
@@ -503,6 +548,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
 
         tx.commit()?;
         event_listener.on_tx_commit();
+
         // Update SST cache
         let mut sst_manager = self.sst_manager.write();
         created_ssts
@@ -527,83 +573,6 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
         Ok(())
     }
 
-    // Merge all records arrays into one
-    fn merge_sort(
-        mut arrays: Vec<Vec<(K, ValueEx<V>)>>,
-        event_listener: &Arc<dyn TxEventListener<K, V>>,
-    ) -> Result<Vec<(K, ValueEx<V>)>> {
-        debug_assert!(!arrays.is_empty());
-        if arrays.len() == 1 {
-            return Ok(arrays.pop().unwrap());
-        }
-
-        let mid = arrays.len() / 2;
-
-        let left_arrays = arrays.drain(..mid).collect::<Vec<Vec<(K, ValueEx<V>)>>>();
-        let right_arrays = arrays;
-
-        let left_sorted = Self::merge_sort(left_arrays, event_listener)?;
-        let right_sorted = Self::merge_sort(right_arrays, event_listener)?;
-
-        Self::merge(left_sorted, right_sorted, event_listener)
-    }
-
-    // Merge two records arrays
-    fn merge(
-        mut left: Vec<(K, ValueEx<V>)>,
-        mut right: Vec<(K, ValueEx<V>)>,
-        event_listener: &Arc<dyn TxEventListener<K, V>>,
-    ) -> Result<Vec<(K, ValueEx<V>)>> {
-        let mut merged = Vec::new();
-
-        while !left.is_empty() && !right.is_empty() {
-            let lkey = left[0].0;
-            let rkey = right[0].0;
-            if lkey == rkey {
-                match (left.remove(0).1, right.remove(0).1) {
-                    (ValueEx::Synced(lv), ValueEx::Synced(rv)) => {
-                        event_listener.on_drop_record(&(rkey, rv))?;
-                        merged.push((lkey, ValueEx::Synced(lv)));
-                    }
-                    (ValueEx::Synced(_), ValueEx::Unsynced(_)) => unreachable!(),
-                    (ValueEx::Synced(_), ValueEx::SyncedAndUnsynced(_, _)) => {
-                        unreachable!()
-                    }
-                    (ValueEx::Unsynced(lv), ValueEx::Synced(rv)) => {
-                        merged.push((lkey, ValueEx::SyncedAndUnsynced(rv, lv)))
-                    }
-                    (ValueEx::Unsynced(lv), ValueEx::Unsynced(rv)) => {
-                        event_listener.on_drop_record(&(rkey, rv))?;
-                        merged.push((lkey, ValueEx::Unsynced(lv)));
-                    }
-                    (ValueEx::Unsynced(lv), ValueEx::SyncedAndUnsynced(rcv, rucv)) => {
-                        event_listener.on_drop_record(&(rkey, rucv))?;
-                        merged.push((lkey, ValueEx::SyncedAndUnsynced(rcv, lv)));
-                    }
-                    (ValueEx::SyncedAndUnsynced(lcv, lucv), ValueEx::Synced(rcv)) => {
-                        event_listener.on_drop_record(&(rkey, rcv))?;
-                        merged.push((lkey, ValueEx::SyncedAndUnsynced(lcv, lucv)));
-                    }
-                    (ValueEx::SyncedAndUnsynced(_, _), ValueEx::Unsynced(_)) => {
-                        unreachable!()
-                    }
-                    (ValueEx::SyncedAndUnsynced(_, _), ValueEx::SyncedAndUnsynced(_, _)) => {
-                        unreachable!()
-                    }
-                }
-            } else if lkey < rkey {
-                merged.push(left.remove(0));
-            } else {
-                merged.push(right.remove(0));
-            }
-        }
-
-        merged.extend(left);
-        merged.extend(right);
-
-        Ok(merged)
-    }
-
     /// Migration TX.
     fn do_migration_tx(&self) -> Result<()> {
         // Discard all unsynced records in SSTs
@@ -625,29 +594,23 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
             for (level, bucket) in LsmLevel::iter() {
                 let ssts = sst_manager.list_level(level);
                 for (&id, sst) in ssts.filter(|(_, sst)| sst.sync_id() == master_sync_id) {
-                    // Collect records
+                    // Only collect synced records
                     let log = tx_log_store.open_log(id, false)?;
-                    let records = sst.collect_all_records(&log)?;
-                    let records: Vec<_> = records
-                        .into_iter()
-                        .filter_map(|(k, v)| match v {
-                            ValueEx::Synced(v) => Some((k, ValueEx::Synced(v))),
-                            ValueEx::Unsynced(v) => {
-                                listener.on_drop_record(&(k, v)).unwrap();
-                                None
-                            }
-                            ValueEx::SyncedAndUnsynced(cv, ucv) => {
-                                listener.on_drop_record(&(k, ucv)).unwrap();
-                                Some((k, ValueEx::Synced(cv)))
-                            }
-                        })
-                        .collect();
-                    if records.is_empty() {
+                    let (synced_records, dropped_records) =
+                        sst.collect_all_records(&log, master_sync_id, true)?;
+                    for (k, v) in dropped_records {
+                        listener.on_drop_record(&(k, v))?;
+                    }
+                    if synced_records.is_empty() {
                         continue;
                     }
                     // Create new migrated SST
                     let new_log = tx_log_store.create_log(bucket)?;
-                    let new_sst = SSTable::build(&records, master_sync_id, &new_log)?;
+                    let new_sst = SSTable::build(
+                        synced_records.iter().map(|(k, v)| (k, v)),
+                        master_sync_id,
+                        &new_log,
+                    )?;
                     created_ssts.push((new_sst, level));
                     deleted_ssts.push((id, level));
                     // Delete old SST
@@ -692,7 +655,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
 }
 
 impl LsmLevel {
-    const LEVEL0_RATIO: u16 = 1; // 4
+    const LEVEL0_RATIO: u16 = 4; // 4
     const LEVELI_RATIO: u16 = 10;
 
     const LEVEL_BUCKETS: [(LsmLevel, &str); 6] = [
@@ -773,12 +736,12 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug> SstManager<K, V> {
         debug_assert!(removed.is_some());
     }
 
-    pub fn require_minor_compaction(&self) -> bool {
-        self.list_level(LsmLevel::L0).count() >= LsmLevel::LEVEL0_RATIO as _
-    }
-
     pub fn require_major_compaction(&self, from_level: LsmLevel) -> bool {
-        debug_assert!(from_level != LsmLevel::L0 && from_level != LsmLevel::L5);
+        debug_assert!(from_level != LsmLevel::L5);
+
+        if from_level == LsmLevel::L0 {
+            return self.list_level(LsmLevel::L0).count() >= LsmLevel::LEVEL0_RATIO as _;
+        }
         self.list_level(from_level).count() >= LsmLevel::LEVELI_RATIO.pow(from_level as _) as _
     }
 }
@@ -790,6 +753,16 @@ impl<K, V> AsKv<K, V> for (K, V) {
 
     fn value(&self) -> &V {
         &self.1
+    }
+}
+
+impl<K, V> AsKv<K, V> for (&K, &V) {
+    fn key(&self) -> &K {
+        self.0
+    }
+
+    fn value(&self) -> &V {
+        self.1
     }
 }
 

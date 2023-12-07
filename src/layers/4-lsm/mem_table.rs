@@ -90,10 +90,13 @@ impl<K: Copy + Ord + Debug, V: Copy> MemTable<K, V> {
                 self.on_drop_record
                     .as_ref()
                     .map(|on_drop_record| on_drop_record(&(key, replaced)));
-                self.size -= 1;
                 return Some(replaced);
+            } else {
+                self.size += 1;
+                return None;
             }
         }
+
         self.table.insert(key, ValueEx::new(value));
         self.size += 1;
         None
@@ -113,7 +116,7 @@ impl<K: Copy + Ord + Debug, V: Copy> MemTable<K, V> {
     }
 
     // Records should be tagged with sync id
-    pub fn keys_values(&self) -> impl Iterator<Item = (&K, &ValueEx<V>)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &ValueEx<V>)> {
         self.table.iter()
     }
 

@@ -360,6 +360,8 @@ impl<D: BlockSet> BlockLog for RawLog<D> {
         log_ref.append(buf)?;
 
         let pos = self.append_pos.fetch_add(nblocks, Ordering::Release);
+
+        Cost::acc_lsm_amound(nblocks);
         Ok(pos)
     }
 

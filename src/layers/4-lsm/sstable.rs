@@ -2,7 +2,7 @@
 use super::mem_table::ValueEx;
 use crate::layers::bio::{BlockSet, Buf, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogId};
-use crate::prelude::*;
+use crate::{prelude::*, BufRef};
 
 use core::fmt::{self, Debug};
 use core::marker::PhantomData;
@@ -65,6 +65,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug> SSTable<K, V> {
     const V_SIZE: usize = size_of::<V>();
     const MAX_RECORD_SIZE: usize = BID_SIZE + 1 + 2 * Self::V_SIZE;
     const INDEX_ENTRY_SIZE: usize = BID_SIZE + Self::K_SIZE;
+    const BUF_CAP: usize = 1024 * BLOCK_SIZE;
     // TODO: Optimize search&build
 
     pub fn id(&self) -> TxLogId {
@@ -160,60 +161,80 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug> SSTable<K, V> {
     /// # Panics
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
-    pub fn build<D: BlockSet + 'static>(
-        records: &[(K, ValueEx<V>)],
+    pub fn build<'a, D: BlockSet + 'static, I>(
+        records_iter: I,
         sync_id: u64,
-        tx_log: &TxLog<D>,
-    ) -> Result<Self> {
-        debug_assert!(!records.is_empty());
-        let total_records = records.len();
-        let mut index = Vec::new();
-        let mut buf = Vec::with_capacity(BLOCK_SIZE);
-        let mut append_buf = Buf::alloc(1)?;
+        tx_log: &'a TxLog<D>,
+    ) -> Result<Self>
+    where
+        I: Iterator<Item = (&'a K, &'a ValueEx<V>)>,
+        Self: 'a,
+    {
+        let total_records = records_iter.size_hint().0;
+        debug_assert!(total_records > 0);
+
+        let mut index_vec = Vec::new();
+        let mut append_buf = Vec::with_capacity(Self::BUF_CAP);
         let mut pos = 0 as BlockId;
         let mut first_k = None;
-        for (i, record) in records.iter().enumerate() {
-            if buf.is_empty() {
-                let _ = first_k.insert(record.0);
+        let mut inner_offset = 0;
+        for (i, record) in records_iter.enumerate() {
+            if inner_offset == 0 {
+                let _ = first_k.insert(*record.0);
             }
-            buf.extend_from_slice(record.0.as_bytes());
+
+            append_buf.extend_from_slice(record.0.as_bytes());
+            inner_offset += Self::K_SIZE;
             match record.1 {
                 ValueEx::Synced(v) => {
-                    buf.push(RecordFlag::Synced as u8);
-                    buf.extend_from_slice(v.as_bytes());
+                    append_buf.push(RecordFlag::Synced as u8);
+                    append_buf.extend_from_slice(v.as_bytes());
+                    inner_offset += 1 + Self::V_SIZE;
                 }
                 ValueEx::Unsynced(v) => {
-                    buf.push(RecordFlag::Unsynced as u8);
-                    buf.extend_from_slice(v.as_bytes());
+                    append_buf.push(RecordFlag::Unsynced as u8);
+                    append_buf.extend_from_slice(v.as_bytes());
+                    inner_offset += 1 + Self::V_SIZE;
                 }
                 ValueEx::SyncedAndUnsynced(cv, ucv) => {
-                    buf.push(RecordFlag::SyncedAndUnsynced as u8);
-                    buf.extend_from_slice(cv.as_bytes());
-                    buf.extend_from_slice(ucv.as_bytes());
+                    append_buf.push(RecordFlag::SyncedAndUnsynced as u8);
+                    append_buf.extend_from_slice(cv.as_bytes());
+                    append_buf.extend_from_slice(ucv.as_bytes());
+                    inner_offset += Self::MAX_RECORD_SIZE;
                 }
             }
-            if BLOCK_SIZE - buf.len() < Self::MAX_RECORD_SIZE || i == total_records - 1 {
-                append_buf.as_mut_slice()[..buf.len()].copy_from_slice(&buf);
-                tx_log.append(append_buf.as_ref())?;
-                index.push(IndexEntry {
+
+            if BLOCK_SIZE - inner_offset < Self::MAX_RECORD_SIZE || i == total_records - 1 {
+                let aligned_len = align_up(append_buf.len(), BLOCK_SIZE);
+                append_buf.resize(aligned_len, 0);
+                index_vec.push(IndexEntry {
                     pos,
                     first: first_k.unwrap(),
-                    last: record.0,
+                    last: *record.0,
                 });
                 pos += 1;
-                buf.clear();
-                append_buf.as_mut_slice().fill(0);
+                inner_offset = 0;
+            }
+
+            if append_buf.len() >= Self::BUF_CAP || i == total_records - 1 {
+                tx_log.append(BufRef::try_from(&append_buf[..]).unwrap())?;
+                append_buf.clear();
             }
         }
 
-        debug_assert!(buf.is_empty());
-        for entry in &index {
-            buf.extend_from_slice(&entry.pos.to_le_bytes());
-            buf.extend_from_slice(entry.first.as_bytes());
+        debug_assert!(append_buf.is_empty());
+        for entry in &index_vec {
+            append_buf.extend_from_slice(&entry.pos.to_le_bytes());
+            append_buf.extend_from_slice(entry.first.as_bytes());
+            append_buf.extend_from_slice(entry.last.as_bytes());
         }
         let index_nblocks = {
-            let nblocks = align_up(buf.len(), BLOCK_SIZE) / BLOCK_SIZE;
-            if nblocks * BLOCK_SIZE - buf.len() <= FOOTER_META_SIZE {
+            let buf_len = append_buf.len();
+            let nblocks = align_up(buf_len, BLOCK_SIZE) / BLOCK_SIZE;
+            let aligned_len = nblocks * BLOCK_SIZE;
+            append_buf.resize(aligned_len, 0);
+
+            if aligned_len - buf_len <= FOOTER_META_SIZE {
                 nblocks
             } else {
                 nblocks + 1
@@ -221,19 +242,18 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug> SSTable<K, V> {
         };
         let meta = FooterMeta {
             index_nblocks: index_nblocks as _,
-            num_index: index.len() as _,
+            num_index: index_vec.len() as _,
             total_records: total_records as _,
             sync_id,
         };
-        let mut append_buf = Buf::alloc(index_nblocks)?;
-        append_buf.as_mut_slice()[..buf.len()].copy_from_slice(&buf);
-        append_buf.as_mut_slice()[index_nblocks * BLOCK_SIZE - FOOTER_META_SIZE..]
-            .copy_from_slice(meta.as_bytes());
-        tx_log.append(append_buf.as_ref())?;
+        tx_log.append(BufRef::try_from(&append_buf[..]).unwrap())?;
 
         Ok(Self {
             id: tx_log.id(),
-            footer: Footer { meta, index },
+            footer: Footer {
+                meta,
+                index: index_vec,
+            },
             phantom: PhantomData,
         })
     }
@@ -279,10 +299,16 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug> SSTable<K, V> {
     pub fn collect_all_records<D: BlockSet + 'static>(
         &self,
         tx_log: &Arc<TxLog<D>>,
-    ) -> Result<Vec<(K, ValueEx<V>)>> {
+        sync_id: u64,
+        discard_unsynced: bool,
+    ) -> Result<(Vec<(K, ValueEx<V>)>, Vec<(K, V)>)> {
+        debug_assert!(sync_id >= self.sync_id());
+        let all_synced = sync_id > self.sync_id();
         let mut records = Vec::with_capacity(self.footer.meta.total_records as _);
+        let mut dropped_records = Vec::new();
         let mut rbuf = Buf::alloc(1)?;
         for entry in self.footer.index.iter() {
+            // TODO: Opt
             tx_log.read(entry.pos, rbuf.as_mut())?;
             let rbuf_slice = rbuf.as_slice();
 
@@ -294,6 +320,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug> SSTable<K, V> {
 
                 let k = K::from_bytes(&rbuf_slice[offset..offset + Self::K_SIZE]);
                 offset += Self::K_SIZE;
+
                 let v_ex = {
                     let flag = RecordFlag::from(rbuf_slice[offset]);
                     offset += 1;
@@ -309,23 +336,41 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug> SSTable<K, V> {
                         RecordFlag::Unsynced => {
                             let v = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
                             offset += Self::V_SIZE;
-                            ValueEx::Unsynced(v)
+                            if all_synced {
+                                ValueEx::Synced(v)
+                            } else if discard_unsynced {
+                                dropped_records.push((k, v));
+                                continue;
+                            } else {
+                                ValueEx::Unsynced(v)
+                            }
                         }
                         RecordFlag::SyncedAndUnsynced => {
+                            // TODO: Rename
                             let cv = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
                             offset += Self::V_SIZE;
                             let ucv = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
                             offset += Self::V_SIZE;
-                            ValueEx::SyncedAndUnsynced(cv, ucv)
+                            if all_synced {
+                                dropped_records.push((k, cv));
+                                ValueEx::Synced(ucv)
+                            } else if discard_unsynced {
+                                dropped_records.push((k, ucv));
+                                ValueEx::Synced(cv)
+                            } else {
+                                ValueEx::SyncedAndUnsynced(cv, ucv)
+                            }
                         }
                         _ => unreachable!(),
                     }
                 };
+
                 records.push((k, v_ex));
             }
         }
 
-        Ok(records)
+        debug_assert!(records.is_sorted_by_key(|(k, _)| k));
+        Ok((records, dropped_records))
     }
 }
 

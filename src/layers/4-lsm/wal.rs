@@ -3,9 +3,10 @@ use super::AsKv;
 use crate::layers::bio::{BlockId, BlockSet, Buf};
 use crate::layers::log::{TxLog, TxLogId, TxLogStore};
 use crate::os::Mutex;
-use crate::prelude::*;
 use crate::tx::Tx;
+use crate::{prelude::*, BufRef};
 
+use core::cell::{RefCell, RefMut};
 use core::fmt::Debug;
 use core::mem::size_of;
 use pod::Pod;
@@ -21,7 +22,7 @@ where
 }
 
 struct WalAppendTxInner<D> {
-    wal_tx_and_log: Option<(Tx, Arc<TxLog<D>>)>, // Cache append TX and WAL log
+    wal_tx_and_log: Option<(RefCell<Tx>, Arc<TxLog<D>>)>, // Cache append TX and WAL log
     log_id: Option<TxLogId>,
     record_buf: Vec<u8>, // Cache appended WAL record
     tx_log_store: Arc<TxLogStore<D>>,
@@ -34,7 +35,7 @@ enum WalAppendFlag {
 }
 
 impl<D: BlockSet + 'static> WalAppendTx<D> {
-    const BUF_CAP: usize = 128 * BLOCK_SIZE;
+    const BUF_CAP: usize = 1024 * BLOCK_SIZE;
 
     pub fn new(store: &Arc<TxLogStore<D>>) -> Self {
         Self {
@@ -65,9 +66,9 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
             return Ok(());
         }
 
-        let record_buf = inner.record_buf.clone();
-        let (wal_tx, wal_log) = inner.wal_tx_and_log.as_mut().unwrap();
-        self.flush_buf(&record_buf, wal_tx, wal_log)?;
+        inner.align_record_buf();
+        let (wal_tx, wal_log) = inner.wal_tx_and_log.as_ref().unwrap();
+        self.flush_buf(&inner.record_buf, wal_tx.borrow_mut(), wal_log)?;
         inner.record_buf.clear();
 
         Ok(())
@@ -76,17 +77,17 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
     /// Commit phase for Append TX, mainly to commit (or abort) the TX.
     pub fn commit(&self) -> Result<()> {
         let mut inner = self.inner.lock();
-        if inner.wal_tx_and_log.is_none() {
+        if inner.wal_tx_and_log.is_none() || inner.record_buf.is_empty() {
             return Ok(());
         }
 
-        let (mut wal_tx, wal_log) = inner.wal_tx_and_log.take().unwrap();
-        // Append cached records
-        // Append master sync id
-        self.flush_buf(&inner.record_buf, &mut wal_tx, &wal_log)?;
+        inner.align_record_buf();
+        let (wal_tx, wal_log) = inner.wal_tx_and_log.take().unwrap();
+        self.flush_buf(&inner.record_buf, wal_tx.borrow_mut(), &wal_log)?;
         inner.record_buf.clear();
 
         drop(wal_log);
+        let mut wal_tx = wal_tx.borrow_mut();
         wal_tx.commit()
     }
 
@@ -98,26 +99,29 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
         inner.record_buf.push(WalAppendFlag::Sync as u8);
         inner.record_buf.extend_from_slice(&sync_id.to_le_bytes());
 
-        let (mut wal_tx, wal_log) = inner.wal_tx_and_log.take().unwrap();
-        // Append cached records
-        // Append master sync id
-        self.flush_buf(&inner.record_buf, &mut wal_tx, &wal_log)?;
+        inner.align_record_buf();
+        let (wal_tx, wal_log) = inner.wal_tx_and_log.take().unwrap();
+        self.flush_buf(&inner.record_buf, wal_tx.borrow_mut(), &wal_log)?;
         inner.record_buf.clear();
 
         drop(wal_log);
+        let mut wal_tx = wal_tx.borrow_mut();
         wal_tx.commit()
     }
 
-    fn flush_buf(&self, record_buf: &[u8], tx: &mut Tx, log: &Arc<TxLog<D>>) -> Result<()> {
-        let mut buf = Buf::alloc(align_up(record_buf.len(), BLOCK_SIZE) / BLOCK_SIZE)?;
-        buf.as_mut_slice()[..record_buf.len()].copy_from_slice(&record_buf);
-        let res = tx.context(|| {
-            // Append cached records
-            // Append master sync id
-            log.append(buf.as_ref())
+    fn flush_buf(
+        &self,
+        record_buf: &[u8],
+        mut wal_tx: RefMut<Tx>,
+        log: &Arc<TxLog<D>>,
+    ) -> Result<()> {
+        debug_assert!(!record_buf.is_empty() && record_buf.len() % BLOCK_SIZE == 0);
+        let res = wal_tx.context(|| {
+            let buf = BufRef::try_from(record_buf).unwrap();
+            log.append(buf)
         });
         if res.is_err() {
-            tx.abort();
+            wal_tx.abort();
         }
         res
     }
@@ -188,7 +192,7 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
 
 impl<D: BlockSet + 'static> WalAppendTxInner<D> {
     /// Prepare phase for Append TX, mainly to create new TX and WAL log.
-    fn perpare(&mut self) -> Result<()> {
+    pub fn perpare(&mut self) -> Result<()> {
         debug_assert!(self.wal_tx_and_log.is_none());
         let wal_tx_and_log = {
             let store = &self.tx_log_store;
@@ -206,10 +210,15 @@ impl<D: BlockSet + 'static> WalAppendTxInner<D> {
             }
             let wal_log = res?;
             let _ = self.log_id.insert(wal_log.id());
-            (wal_tx, wal_log)
+            (RefCell::new(wal_tx), wal_log)
         };
         let _ = self.wal_tx_and_log.insert(wal_tx_and_log);
         Ok(())
+    }
+
+    pub fn align_record_buf(&mut self) {
+        let aligned_len = align_up(self.record_buf.len(), BLOCK_SIZE);
+        self.record_buf.resize(aligned_len, 0);
     }
 }
 

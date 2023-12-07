@@ -53,11 +53,14 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
     /// Write a specified number of block contents at a logical block address on the device.
     pub fn write(&self, lba: Lba, buf: BufRef) -> Result<usize> {
+        let time = Cost::activate();
+
         // TODO: batch write
         let hba = self
             .block_validity_bitmap
             .alloc()
             .ok_or(Error::with_msg(OutOfMemory, "block allocation failed"))?;
+
         let key = Key::random();
         let mut wbuf = Buf::alloc(1)?;
         let mac = OsAead::new().encrypt(
@@ -67,17 +70,37 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             &[],
             wbuf.as_mut_slice(),
         )?;
-
         self.user_data_disk.write(hba, wbuf.as_ref())?;
+
+        Cost::acc_data_write(time);
+        Cost::acc_data_amound(buf.nblocks());
+        let time = Cost::activate();
+
         self.tx_lsm_tree
             .put(RecordKey { lba }, RecordValue { hba, key, mac })?;
+
+        Cost::acc_lsm_put(time);
+
         Ok(buf.nblocks())
     }
 
     /// Sync all cached data in the device to the storage medium for durability.
     pub fn sync(&self) -> Result<()> {
+        let time = Cost::activate();
+
         self.tx_lsm_tree.sync()?;
-        self.user_data_disk.flush()
+
+        Cost::acc_lsm_sync(time);
+        let time = Cost::activate();
+
+        self.user_data_disk.flush()?;
+
+        Cost::acc_data_sync(time);
+        Ok(())
+    }
+
+    pub fn display_cost(&self) {
+        Cost::display();
     }
 
     /// Return the total number of blocks in the device.
