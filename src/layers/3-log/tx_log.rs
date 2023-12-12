@@ -72,6 +72,7 @@ use crate::util::{LazyDelete, RandomInit};
 
 use alloc::collections::{BTreeMap, BTreeSet}; // TODO: Find alternatives to adapt 'rust-for-linux'
 use core::any::Any;
+use core::fmt::{self, Debug};
 use core::sync::atomic::{AtomicBool, Ordering};
 use lru::LruCache;
 use pod::Pod;
@@ -745,6 +746,17 @@ impl<D: BlockSet + 'static> TxLog<D> {
     }
 }
 
+impl<D: BlockSet + 'static> Debug for TxLog<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TxLog")
+            .field("id", &self.inner_log.log_id)
+            .field("bucket", &self.inner_log.bucket)
+            .field("crypto_log", &self.inner_log.crypto_log)
+            .field("is_dirty", &self.inner_log.is_dirty.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 pub struct CryptoLogCache {
     inner: RwLock<CacheInner>,
     log_id: TxLogId,
@@ -770,10 +782,16 @@ impl CryptoLogCache {
 impl NodeCache for CryptoLogCache {
     fn get(&self, pos: BlockId) -> Option<Arc<dyn Any + Send + Sync>> {
         let mut current = self.tx_provider.current();
-        current.data_mut_with(|open_cache_table: &mut OpenLogCache| {
-            let open_cache = open_cache_table.open_table.get_mut(&self.log_id)?;
-            open_cache.lru_cache.get(&pos).cloned()
-        })?;
+        let value_opt = current.data_mut_with(|open_cache_table: &mut OpenLogCache| {
+            open_cache_table
+                .open_table
+                .get_mut(&self.log_id)
+                .map(|open_cache| open_cache.lru_cache.get(&pos).cloned())
+                .flatten()
+        });
+        if value_opt.is_some() {
+            return value_opt;
+        }
 
         let mut inner = self.inner.write();
         inner.lru_cache.get(&pos).cloned()
@@ -786,7 +804,7 @@ impl NodeCache for CryptoLogCache {
     ) -> Option<Arc<dyn Any + Send + Sync>> {
         let mut current = self.tx_provider.current();
         current.data_mut_with(|open_cache_table: &mut OpenLogCache| {
-            let open_cache = open_cache_table.open_table.get_mut(&self.log_id)?;
+            let open_cache = open_cache_table.open_table.get_mut(&self.log_id).unwrap();
             open_cache.lru_cache.put(pos, value)
         })
     }

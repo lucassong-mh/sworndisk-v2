@@ -738,7 +738,7 @@ impl LevelBuilder {
     }
 
     // Building last MHT node of the level can be complicated, since
-    // the last node may be incompelte
+    // the last node may be incomplete
     fn build_last_node(&self, entries: &[&MhtNodeEntry]) -> Arc<MhtNode> {
         let num_data_nodes = {
             let max_data_nodes = MhtNode::max_num_data_nodes(self.height);
@@ -993,6 +993,7 @@ impl<L: BlockLog> Debug for Mht<L> {
             .field("root_meta", &self.root_meta())
             .field("root_node", &self.root_node())
             .field("root_key", &self.root_key)
+            .field("total_data_nodes", &self.total_data_nodes())
             .field("buffered_data_nodes", &self.data_buf.num_append())
             .finish()
     }

@@ -2,12 +2,16 @@
 use super::mem_table::ValueEx;
 use crate::layers::bio::{BlockSet, Buf, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogId};
+use crate::os::RwLock;
 use crate::{prelude::*, BufRef};
 
 use core::fmt::{self, Debug};
+use core::hash::Hash;
 use core::marker::PhantomData;
 use core::mem::size_of;
+use core::num::NonZeroUsize;
 use core::ops::RangeInclusive;
+use lru::LruCache;
 use pod::Pod;
 
 /// Sorted String Table (SST) for LSM-Tree
@@ -21,13 +25,15 @@ use pod::Pod;
 ///
 // TODO: Add bloom filter and second-level index
 pub(super) struct SSTable<K, V> {
-    // Cache txlog id, and footer block
+    // Cache log id, and footer blocks
     id: TxLogId,
     footer: Footer<K>,
+    cache: RwLock<LruCache<K, V>>,
     phantom: PhantomData<(K, V)>,
 }
 
 /// Footer of SSTable, contains metadata and index entry arrays of SSTable.
+#[derive(Debug)]
 struct Footer<K> {
     meta: FooterMeta,
     index: Vec<IndexEntry<K>>,
@@ -45,6 +51,7 @@ struct FooterMeta {
 const FOOTER_META_SIZE: usize = size_of::<FooterMeta>();
 
 /// Index entry of SSTable.
+#[derive(Debug)]
 struct IndexEntry<K> {
     pos: BlockId,
     first: K,
@@ -60,12 +67,13 @@ enum RecordFlag {
     SyncedAndUnsynced = 19,
 }
 
-impl<K: Ord + Pod + Debug, V: Pod + Debug> SSTable<K, V> {
+impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
     const K_SIZE: usize = size_of::<K>();
     const V_SIZE: usize = size_of::<V>();
     const MAX_RECORD_SIZE: usize = BID_SIZE + 1 + 2 * Self::V_SIZE;
-    const INDEX_ENTRY_SIZE: usize = BID_SIZE + Self::K_SIZE;
-    const BUF_CAP: usize = 1024 * BLOCK_SIZE;
+    const INDEX_ENTRY_SIZE: usize = BID_SIZE + 2 * Self::K_SIZE;
+    const BUF_CAP: usize = 4 * BLOCK_SIZE;
+    const CACHE_CAP: usize = 73728;
     // TODO: Optimize search&build
 
     pub fn id(&self) -> TxLogId {
@@ -83,12 +91,20 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug> SSTable<K, V> {
         )
     }
 
+    pub fn is_within_range(&self, key: &K) -> bool {
+        self.range().contains(key)
+    }
+
     pub fn overlap_with(&self, rhs_range: &RangeInclusive<K>) -> bool {
         let lhs_range = self.range();
         !(lhs_range.end() < rhs_range.start() || lhs_range.start() > rhs_range.end())
     }
 
     pub fn search<D: BlockSet + 'static>(&self, key: &K, tx_log: &Arc<TxLog<D>>) -> Option<V> {
+        debug_assert!(self.range().contains(key));
+        if let Some(value) = self.cache.write().get(key) {
+            return Some(value.clone());
+        }
         let target_block_pos = self.search_in_cache(key)?;
         self.search_in_log(key, target_block_pos, tx_log).ok()
     }
@@ -147,9 +163,11 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug> SSTable<K, V> {
                 }
                 _ => unreachable!(),
             };
+
             if k != *key {
                 continue;
             }
+            self.cache.write().put(k, target_value.clone());
             return Ok(target_value);
         }
 
@@ -178,6 +196,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug> SSTable<K, V> {
         let mut pos = 0 as BlockId;
         let mut first_k = None;
         let mut inner_offset = 0;
+        let mut cache = LruCache::new(NonZeroUsize::new(Self::CACHE_CAP).unwrap());
         for (i, record) in records_iter.enumerate() {
             if inner_offset == 0 {
                 let _ = first_k.insert(*record.0);
@@ -190,17 +209,20 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug> SSTable<K, V> {
                     append_buf.push(RecordFlag::Synced as u8);
                     append_buf.extend_from_slice(v.as_bytes());
                     inner_offset += 1 + Self::V_SIZE;
+                    cache.put(*record.0, v.clone());
                 }
                 ValueEx::Unsynced(v) => {
                     append_buf.push(RecordFlag::Unsynced as u8);
                     append_buf.extend_from_slice(v.as_bytes());
                     inner_offset += 1 + Self::V_SIZE;
+                    cache.put(*record.0, v.clone());
                 }
                 ValueEx::SyncedAndUnsynced(cv, ucv) => {
                     append_buf.push(RecordFlag::SyncedAndUnsynced as u8);
                     append_buf.extend_from_slice(cv.as_bytes());
                     append_buf.extend_from_slice(ucv.as_bytes());
                     inner_offset += Self::MAX_RECORD_SIZE;
+                    cache.put(*record.0, ucv.clone());
                 }
             }
 
@@ -228,24 +250,16 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug> SSTable<K, V> {
             append_buf.extend_from_slice(entry.first.as_bytes());
             append_buf.extend_from_slice(entry.last.as_bytes());
         }
-        let index_nblocks = {
-            let buf_len = append_buf.len();
-            let nblocks = align_up(buf_len, BLOCK_SIZE) / BLOCK_SIZE;
-            let aligned_len = nblocks * BLOCK_SIZE;
-            append_buf.resize(aligned_len, 0);
-
-            if aligned_len - buf_len <= FOOTER_META_SIZE {
-                nblocks
-            } else {
-                nblocks + 1
-            }
-        };
+        let index_nblocks = align_up(append_buf.len() + FOOTER_META_SIZE, BLOCK_SIZE) / BLOCK_SIZE;
+        append_buf.resize(index_nblocks * BLOCK_SIZE, 0);
         let meta = FooterMeta {
             index_nblocks: index_nblocks as _,
             num_index: index_vec.len() as _,
             total_records: total_records as _,
             sync_id,
         };
+        append_buf[index_nblocks * BLOCK_SIZE - FOOTER_META_SIZE..]
+            .copy_from_slice(meta.as_bytes());
         tx_log.append(BufRef::try_from(&append_buf[..]).unwrap())?;
 
         Ok(Self {
@@ -254,6 +268,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug> SSTable<K, V> {
                 meta,
                 index: index_vec,
             },
+            cache: RwLock::new(cache),
             phantom: PhantomData,
         })
     }
@@ -287,6 +302,7 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug> SSTable<K, V> {
         Ok(Self {
             id: tx_log.id(),
             footer,
+            cache: RwLock::new(LruCache::new(NonZeroUsize::new(Self::CACHE_CAP).unwrap())),
             phantom: PhantomData,
         })
     }

@@ -287,7 +287,7 @@ struct Record {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, Pod, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 struct RecordKey {
     pub lba: Lba,
 }

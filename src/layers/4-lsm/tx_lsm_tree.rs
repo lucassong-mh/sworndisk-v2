@@ -17,6 +17,7 @@ use crate::tx::Tx;
 
 use alloc::collections::BTreeMap;
 use core::fmt::Debug;
+use core::hash::Hash;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use pod::Pod;
@@ -104,9 +105,9 @@ pub enum TxType {
     Migration,
 }
 
-impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V, D> {
-    const MEMTABLE_CAPACITY: usize = 73728;
-    const SSTABLE_CAPACITY: usize = Self::MEMTABLE_CAPACITY;
+impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V, D> {
+    pub(super) const MEMTABLE_CAPACITY: usize = 73728;
+    pub(super) const SSTABLE_CAPACITY: usize = Self::MEMTABLE_CAPACITY;
 
     /// Format a `TxLsmTree` from a given `TxLogStore`.
     pub fn format(
@@ -207,7 +208,6 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
                 tx.abort();
                 return_errno_with_msg!(TxAborted, "recover TxLsmTree failed");
             }
-            res.unwrap();
             RwLock::new(manager)
         };
 
@@ -316,6 +316,9 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
             let sst_manager = self.sst_manager.read();
             for (level, bucket) in LsmLevel::iter() {
                 for (id, sst) in sst_manager.list_level(level) {
+                    if !sst.is_within_range(key) {
+                        continue;
+                    }
                     let tx_log = self.tx_log_store.open_log(*id, false)?;
                     debug_assert!(tx_log.bucket() == bucket);
                     if let Some(target_value) = sst.search(key, &tx_log) {
@@ -488,11 +491,6 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
             };
 
             // Collect and sort records during compaction
-            println!(
-                "merge sort start, upper len: {}, lower len: {}",
-                upper_records.len(),
-                lower_records_vec.len()
-            );
             let compacted_records = {
                 if !lower_records_vec.is_empty() {
                     let (compacted_records, dropped_records) = Compactor::compact_records(
@@ -508,7 +506,6 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
                 }
             };
             debug_assert!(compacted_records.is_sorted_by_key(|(k, _)| k));
-            println!("merge sort done");
 
             let (mut created_ssts, mut deleted_ssts) = (vec![], vec![]);
             // Create new SSTs
@@ -601,22 +598,23 @@ impl<K: Ord + Pod + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V
                     for (k, v) in dropped_records {
                         listener.on_drop_record(&(k, v))?;
                     }
-                    if synced_records.is_empty() {
+                    if !synced_records.is_empty() {
+                        // Create new migrated SST
+                        let new_log = tx_log_store.create_log(bucket)?;
+                        let new_sst = SSTable::build(
+                            synced_records.iter().map(|(k, v)| (k, v)),
+                            master_sync_id,
+                            &new_log,
+                        )?;
+                        created_ssts.push((new_sst, level));
                         continue;
                     }
-                    // Create new migrated SST
-                    let new_log = tx_log_store.create_log(bucket)?;
-                    let new_sst = SSTable::build(
-                        synced_records.iter().map(|(k, v)| (k, v)),
-                        master_sync_id,
-                        &new_log,
-                    )?;
-                    created_ssts.push((new_sst, level));
                     deleted_ssts.push((id, level));
                     // Delete old SST
                     tx_log_store.delete_log(id)?;
                 }
             }
+
             Ok((created_ssts, deleted_ssts))
         });
         if res.is_err() {
@@ -707,7 +705,7 @@ impl From<u8> for LsmLevel {
     }
 }
 
-impl<K: Ord + Pod + Debug, V: Pod + Debug> SstManager<K, V> {
+impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SstManager<K, V> {
     const MAX_NUM_LEVELS: usize = 6;
 
     pub fn new() -> Self {
@@ -811,7 +809,7 @@ mod tests {
         let tx_lsm_tree: TxLsmTree<BlockId, RecordValue, MemDisk> =
             TxLsmTree::format(tx_log_store.clone(), Arc::new(Factory), None)?;
 
-        let cap = super::TxLsmTree::<BlockId, RecordValue, MemDisk>::MEMTABLE_CAPACITY;
+        let cap = TxLsmTree::<BlockId, RecordValue, MemDisk>::MEMTABLE_CAPACITY;
         let start = 0;
         for i in start..start + cap {
             let (k, v) = (
@@ -872,7 +870,7 @@ mod tests {
         let tx_lsm_tree: TxLsmTree<BlockId, RecordValue, MemDisk> =
             TxLsmTree::recover(tx_log_store.clone(), Arc::new(Factory), None)?;
 
-        assert!(tx_lsm_tree.get(&1500).is_none());
+        assert!(tx_lsm_tree.get(&(600 + cap)).is_none());
         let target_value = tx_lsm_tree.get(&500).unwrap();
         assert_eq!(target_value.hba, 500);
         Ok(())
