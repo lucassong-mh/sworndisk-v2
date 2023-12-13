@@ -361,7 +361,7 @@ impl<D: BlockSet> BlockLog for RawLog<D> {
 
         let pos = self.append_pos.fetch_add(nblocks, Ordering::Release);
 
-        Cost::acc_lsm_amound(nblocks);
+        AmplificationMetrics::acc_index_amount(AmpType::Write, nblocks);
         Ok(pos)
     }
 

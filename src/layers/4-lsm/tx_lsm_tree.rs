@@ -239,8 +239,14 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
             return Some(value.clone());
         }
 
+        // let timer = LatencyMetrics::start_timer(ReqType::Read, "read_tx", "lsmtree");
+
         // 2. Search from SSTs (do Read TX)
-        self.do_read_tx(key).ok()
+        let res = self.do_read_tx(key).unwrap();
+
+        // LatencyMetrics::stop_timer(timer);
+
+        Some(res)
     }
 
     pub fn get_range(&self, range: &Range<K>) -> Vec<V> {
@@ -249,7 +255,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
 
     pub fn put(&self, key: K, value: V) -> Result<()> {
         let record = (key, value);
-        let time = Cost::activate();
+        let timer = LatencyMetrics::start_timer(ReqType::Write, "wal", "lsmtree");
 
         // 1. Write WAL
         self.wal_append_tx.append(&record)?;
@@ -257,14 +263,14 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
         // 2. Put into MemTable
         let _ = self.active_mem_table().write().put(key, value);
         if !self.active_mem_table().read().at_capacity() {
-            Cost::acc_lsm_put_wal(time);
+            LatencyMetrics::stop_timer(timer);
             return Ok(());
         }
 
+        // TODO: Think of combining WAL's TX with minor compaction TX?
         self.wal_append_tx.commit()?;
-        // TODO: Should wal's TX combine with minor compaction TX?
 
-        Cost::acc_lsm_put_wal(time);
+        LatencyMetrics::stop_timer(timer);
 
         // 3. Trigger compaction if needed
         self.immut_idx.fetch_xor(1, Ordering::Release);
@@ -274,15 +280,19 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
             .read()
             .require_major_compaction(LsmLevel::L0)
         {
-            let time = Cost::activate();
+            let timer = LatencyMetrics::start_timer(ReqType::Write, "major_compaction", "lsmtree");
+
             self.do_compaction_tx(LsmLevel::L1)?;
-            Cost::acc_lsm_put_compaction_major(time);
+
+            LatencyMetrics::stop_timer(timer);
         }
 
-        let time = Cost::activate();
+        let timer = LatencyMetrics::start_timer(ReqType::Write, "minor_compaction", "lsmtree");
+
         // Do minor compaction
         self.do_compaction_tx(LsmLevel::L0)?;
-        Cost::acc_lsm_put_compaction_minor(time);
+
+        LatencyMetrics::stop_timer(timer);
 
         Ok(())
     }
@@ -295,13 +305,18 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
         // TODO: Store master sync id to trusted storage
         let master_sync_id = MASTER_SYNC_ID.fetch_add(1, Ordering::Release) + 1;
 
-        let time = Cost::activate();
-        self.wal_append_tx.sync(master_sync_id)?;
-        Cost::acc_lsm_sync_wal(time);
+        let timer = LatencyMetrics::start_timer(ReqType::Sync, "wal", "lsmtree");
 
-        let time = Cost::activate();
+        self.wal_append_tx.sync(master_sync_id)?;
+
+        LatencyMetrics::stop_timer(timer);
+
+        let timer = LatencyMetrics::start_timer(ReqType::Sync, "memtable", "lsmtree");
+
         self.active_mem_table().write().sync(master_sync_id)?;
-        Cost::acc_lsm_sync_memtable(time);
+
+        LatencyMetrics::stop_timer(timer);
+
         Ok(())
     }
 
@@ -319,13 +334,28 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
                     if !sst.is_within_range(key) {
                         continue;
                     }
+                    if let Some(value) = sst.search_in_cache(key) {
+                        return Ok(value);
+                    }
+
+                    // let timer = LatencyMetrics::start_timer(ReqType::Read, "open_log", "read_tx");
                     let tx_log = self.tx_log_store.open_log(*id, false)?;
+                    // LatencyMetrics::stop_timer(timer);
+
                     debug_assert!(tx_log.bucket() == bucket);
+
+                    // let timer = LatencyMetrics::start_timer(ReqType::Read, "sst", "read_tx");
+
                     if let Some(target_value) = sst.search(key, &tx_log) {
+                        // LatencyMetrics::stop_timer(timer);
+
                         return Ok(target_value);
                     }
+
+                    // LatencyMetrics::stop_timer(timer);
                 }
             }
+
             return_errno_with_msg!(NotFound, "target sst not found");
         });
         if read_res.as_ref().is_err_and(|e| e.errno() != NotFound) {
@@ -333,7 +363,10 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
             return_errno_with_msg!(TxAborted, "read TX failed")
         }
 
+        // let timer = LatencyMetrics::start_timer(ReqType::Read, "tx_commit", "read_tx");
         tx.commit()?;
+        // LatencyMetrics::stop_timer(timer);
+
         read_res
     }
 

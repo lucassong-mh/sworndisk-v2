@@ -33,22 +33,22 @@ fn main() {
         //     .concurrency(1)
         //     .build()
         //     .unwrap(),
-        BenchBuilder::new("SwornDisk::read_seq")
-            .disk_type(DiskType::SwornDisk)
-            .io_type(IoType::Read)
-            .io_pattern(IoPattern::Seq)
-            .total_bytes(total_bytes)
-            .concurrency(1)
-            .build()
-            .unwrap(),
-        // BenchBuilder::new("SwornDisk::read_rnd")
+        // BenchBuilder::new("SwornDisk::read_seq")
         //     .disk_type(DiskType::SwornDisk)
         //     .io_type(IoType::Read)
-        //     .io_pattern(IoPattern::Rnd)
+        //     .io_pattern(IoPattern::Seq)
         //     .total_bytes(total_bytes)
         //     .concurrency(1)
         //     .build()
         //     .unwrap(),
+        BenchBuilder::new("SwornDisk::read_rnd")
+            .disk_type(DiskType::SwornDisk)
+            .io_type(IoType::Read)
+            .io_pattern(IoPattern::Rnd)
+            .total_bytes(total_bytes)
+            .concurrency(1)
+            .build()
+            .unwrap(),
         // BenchBuilder::new("EncDisk::write_seq")
         //     .disk_type(DiskType::EncDisk)
         //     .io_type(IoType::Write)
@@ -106,6 +106,7 @@ fn run_benches(benches: Vec<Box<dyn Bench>>) {
         let elapsed = end - start;
         let throughput = DisplayThroughput::new(b.total_bytes(), elapsed);
         println!("{}", throughput);
+        b.display_ext();
         benched_count += 1;
     }
 
@@ -132,6 +133,9 @@ mod benches {
 
         /// Run the benchmark.
         fn run(&self) -> Result<()>;
+
+        /// Display extra information.
+        fn display_ext(&self) {}
     }
 
     pub struct BenchBuilder {
@@ -330,6 +334,10 @@ mod benches {
                 Some(e) => Err(e),
             }
         }
+
+        fn display_ext(&self) {
+            self.disk.display_ext();
+        }
     }
 
     impl fmt::Display for SimpleDiskBench {
@@ -386,6 +394,8 @@ mod disks {
 
         fn read_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()>;
         fn write_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()>;
+
+        fn display_ext(&self) {}
     }
 
     #[derive(Clone)]
@@ -455,7 +465,7 @@ mod disks {
         }
 
         fn flush(&self) -> Result<()> {
-            // TODO: use raw file
+            // TODO: Use raw file of libc for better concurrency
             // self.file.lock().flush().unwrap();
             // self.file.lock().sync_all().unwrap();
             self.file.lock().sync_data().unwrap();
@@ -492,7 +502,6 @@ mod disks {
             }
 
             self.sync()?;
-            self.display_cost();
             Ok(())
         }
 
@@ -517,8 +526,11 @@ mod disks {
             }
 
             self.sync()?;
-            self.display_cost();
             Ok(())
+        }
+
+        fn display_ext(&self) {
+            self.display_metrics();
         }
     }
 

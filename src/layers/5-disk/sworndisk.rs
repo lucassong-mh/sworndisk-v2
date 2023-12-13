@@ -33,11 +33,18 @@ pub struct SwornDisk<D: BlockSet> {
 impl<D: BlockSet + 'static> SwornDisk<D> {
     /// Read a specified number of block contents at a logical block address on the device.
     pub fn read(&self, lba: Lba, mut buf: BufMut) -> Result<usize> {
+        let timer = LatencyMetrics::start_timer(ReqType::Read, "lsmtree", "");
+
         // TODO: batch read
         let record = self
             .tx_lsm_tree
             .get(&RecordKey { lba })
             .ok_or(Error::with_msg(NotFound, "record not found in lsm tree"))?;
+
+        LatencyMetrics::stop_timer(timer);
+
+        let timer = LatencyMetrics::start_timer(ReqType::Read, "data", "");
+
         let mut rbuf = Buf::alloc(1)?;
         self.user_data_disk.read(record.hba, rbuf.as_mut())?;
         OsAead::new().decrypt(
@@ -48,12 +55,15 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             &record.mac,
             buf.as_mut_slice(),
         )?;
+
+        LatencyMetrics::stop_timer(timer);
+
         Ok(buf.nblocks())
     }
 
     /// Write a specified number of block contents at a logical block address on the device.
     pub fn write(&self, lba: Lba, buf: BufRef) -> Result<usize> {
-        let time = Cost::activate();
+        let timer = LatencyMetrics::start_timer(ReqType::Write, "data", "");
 
         // TODO: batch write
         let hba = self
@@ -72,35 +82,39 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         )?;
         self.user_data_disk.write(hba, wbuf.as_ref())?;
 
-        Cost::acc_data_write(time);
-        Cost::acc_data_amound(buf.nblocks());
-        let time = Cost::activate();
+        LatencyMetrics::stop_timer(timer);
+
+        AmplificationMetrics::acc_data_amount(AmpType::Write, buf.nblocks());
+
+        let timer = LatencyMetrics::start_timer(ReqType::Write, "lsmtree", "");
 
         self.tx_lsm_tree
             .put(RecordKey { lba }, RecordValue { hba, key, mac })?;
 
-        Cost::acc_lsm_put(time);
+        LatencyMetrics::stop_timer(timer);
 
         Ok(buf.nblocks())
     }
 
     /// Sync all cached data in the device to the storage medium for durability.
     pub fn sync(&self) -> Result<()> {
-        let time = Cost::activate();
+        let timer = LatencyMetrics::start_timer(ReqType::Sync, "lsmtree", "");
 
         self.tx_lsm_tree.sync()?;
 
-        Cost::acc_lsm_sync(time);
-        let time = Cost::activate();
+        LatencyMetrics::stop_timer(timer);
+
+        let timer = LatencyMetrics::start_timer(ReqType::Sync, "data", "");
 
         self.user_data_disk.flush()?;
 
-        Cost::acc_data_sync(time);
+        LatencyMetrics::stop_timer(timer);
+
         Ok(())
     }
 
-    pub fn display_cost(&self) {
-        Cost::display();
+    pub fn display_metrics(&self) {
+        Metrics::display();
     }
 
     /// Return the total number of blocks in the device.

@@ -102,22 +102,23 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
 
     pub fn search<D: BlockSet + 'static>(&self, key: &K, tx_log: &Arc<TxLog<D>>) -> Option<V> {
         debug_assert!(self.range().contains(key));
-        if let Some(value) = self.cache.write().get(key) {
-            return Some(value.clone());
+        if let Some(value) = self.search_in_cache(key) {
+            return Some(value);
         }
-        let target_block_pos = self.search_in_cache(key)?;
-        self.search_in_log(key, target_block_pos, tx_log).ok()
-    }
 
-    /// Search a target records block position in the SST (from cache).
-    fn search_in_cache(&self, key: &K) -> Option<BlockId> {
-        self.footer.index.iter().find_map(|entry| {
+        let target_pos = self.footer.index.iter().find_map(|entry| {
             if (entry.first..=entry.last).contains(key) {
                 Some(entry.pos)
             } else {
                 None
             }
-        })
+        })?;
+        self.search_in_log(key, target_pos, tx_log).ok()
+    }
+
+    /// Search a target record in the SST (from cache).
+    pub fn search_in_cache(&self, key: &K) -> Option<V> {
+        self.cache.write().get(key).cloned()
     }
 
     /// Search a target record in the SST (from log).
