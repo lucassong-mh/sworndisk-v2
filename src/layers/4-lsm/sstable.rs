@@ -28,7 +28,7 @@ pub(super) struct SSTable<K, V> {
     // Cache log id, and footer blocks
     id: TxLogId,
     footer: Footer<K>,
-    cache: RwLock<LruCache<K, V>>,
+    cache: RwLock<LruCache<K, V>>, // TODO: Refactor this cache
     phantom: PhantomData<(K, V)>,
 }
 

@@ -72,10 +72,15 @@ impl Metrics {
     }
 
     pub fn display() {
-        println!("\n========= SwornDisk Breakdown Cost =========");
+        println!("========= SwornDisk Metrics =========");
         LatencyMetrics::display();
         AmplificationMetrics::display();
-        println!("========= SwornDisk Breakdown Cost =========",);
+        println!("========= SwornDisk Metrics =========\n",);
+    }
+
+    pub fn reset() {
+        LatencyMetrics::reset();
+        AmplificationMetrics::reset();
     }
 }
 
@@ -127,6 +132,14 @@ impl LatencyMetrics {
         if latency.level == 0 {
             req_latency.total += elapsed;
         }
+    }
+
+    pub fn reset() {
+        let mut metrics = METRICS.write();
+        metrics.latency.table.values_mut().for_each(|req_latency| {
+            req_latency.table.clear();
+            req_latency.total = Duration::ZERO;
+        });
     }
 
     pub fn display() {
@@ -203,6 +216,16 @@ impl AmplificationMetrics {
         let mut metrics = METRICS.write();
         let amp = metrics.amplification.table.get_mut(&amp_type).unwrap();
         amp.journal += amount;
+    }
+
+    pub fn reset() {
+        let mut metrics = METRICS.write();
+        metrics.amplification.table.values_mut().for_each(|amp| {
+            amp.data = 0;
+            amp.index = 0;
+            amp.journal = 0;
+            amp.total = 0;
+        });
     }
 
     pub fn display() {

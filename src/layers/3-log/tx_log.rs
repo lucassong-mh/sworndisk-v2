@@ -502,6 +502,13 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
             log_entry
         };
 
+        // Prepare cache before opening `CryptoLog`
+        current_tx.data_mut_with(|open_cache_table: &mut OpenLogCache| {
+            let _ = open_cache_table
+                .open_table
+                .insert(log_id, CacheInner::new());
+        });
+
         let bucket = log_entry.bucket.clone();
         let crypto_log = {
             let raw_log = self.raw_log_store.open_log(log_id, can_append)?;
@@ -523,12 +530,6 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
 
         current_tx.data_mut_with(|open_log_table: &mut OpenLogTable<D>| {
             open_log_table.open_table.insert(log_id, inner_log.clone());
-        });
-
-        current_tx.data_mut_with(|open_cache_table: &mut OpenLogCache| {
-            open_cache_table
-                .open_table
-                .insert(log_id, CacheInner::new());
         });
 
         if can_append {
@@ -804,6 +805,7 @@ impl NodeCache for CryptoLogCache {
     ) -> Option<Arc<dyn Any + Send + Sync>> {
         let mut current = self.tx_provider.current();
         current.data_mut_with(|open_cache_table: &mut OpenLogCache| {
+            debug_assert!(open_cache_table.open_table.contains_key(&self.log_id));
             let open_cache = open_cache_table.open_table.get_mut(&self.log_id).unwrap();
             open_cache.lru_cache.put(pos, value)
         })

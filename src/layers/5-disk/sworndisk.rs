@@ -115,6 +115,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
     pub fn display_metrics(&self) {
         Metrics::display();
+        Metrics::reset();
     }
 
     /// Return the total number of blocks in the device.
