@@ -12,12 +12,12 @@ use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
     AsKv, LsmLevel, TxEventListener, TxEventListenerFactory, TxLsmTree, TxType,
 };
-use crate::os::{Aead as OsAead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac};
+use crate::os::{Aead as OsAead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, RwLock};
 use crate::prelude::*;
 use crate::tx::Tx;
 use crate::util::Aead;
 
-use hashbrown::HashMap;
+use alloc::collections::BTreeMap;
 use lending_iterator::LendingIterator;
 use pod::Pod;
 
@@ -29,7 +29,7 @@ pub struct SwornDisk<D: BlockSet> {
     tx_lsm_tree: TxLsmTree<RecordKey, RecordValue, D>,
     user_data_disk: D,
     block_validity_bitmap: Arc<AllocBitmap>,
-    // data_buf: DataBuf, // TODO: Support data buffering.
+    data_buf: DataBuf,
     root_key: Key,
 }
 
@@ -48,6 +48,10 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
     fn read_one_block(&self, lba: Lba, mut buf: BufMut) -> Result<()> {
         debug_assert_eq!(buf.nblocks(), 1);
+        if self.data_buf.get(RecordKey { lba }, &mut buf).is_some() {
+            return Ok(());
+        }
+
         let timer = LatencyMetrics::start_timer(ReqType::Read, "lsmtree", "");
 
         let record = self.tx_lsm_tree.get(&RecordKey { lba })?;
@@ -72,37 +76,46 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     }
 
     /// Write a specified number of block contents at a logical block address on the device.
-    pub fn write(&self, lba: Lba, buf: BufRef) -> Result<usize> {
-        let timer = LatencyMetrics::start_timer(ReqType::Write, "data", "");
+    pub fn write(&self, mut lba: Lba, buf: BufRef) -> Result<usize> {
+        for block_buf in buf.iter() {
+            self.data_buf.put(RecordKey { lba }, block_buf);
+            lba += 1;
+        }
 
-        // TODO: batch write
-        let hba = self
-            .block_validity_bitmap
-            .alloc()
-            .ok_or(Error::with_msg(OutOfMemory, "block allocation failed"))?;
+        if self.data_buf.len() < Self::BUF_CAP {
+            return Ok(buf.nblocks());
+        }
 
-        let key = Key::random();
         let mut cipher = Buf::alloc(1)?;
-        let mac = OsAead::new().encrypt(
-            buf.as_slice(),
-            &key,
-            &Iv::new_zeroed(),
-            &[],
-            cipher.as_mut_slice(),
-        )?;
-        self.user_data_disk.write(hba, cipher.as_ref())?;
+        for (lba, data_block) in self.data_buf.all_blocks() {
+            let timer = LatencyMetrics::start_timer(ReqType::Write, "data", "");
+            let hba = self
+                .block_validity_bitmap
+                .alloc()
+                .ok_or(Error::with_msg(OutOfMemory, "block allocation failed"))?;
 
-        LatencyMetrics::stop_timer(timer);
+            let key = Key::random();
+            let mac = OsAead::new().encrypt(
+                &data_block.0,
+                &key,
+                &Iv::new_zeroed(),
+                &[],
+                cipher.as_mut_slice(),
+            )?;
+            self.user_data_disk.write(hba, cipher.as_ref())?;
 
-        AmplificationMetrics::acc_data_amount(AmpType::Write, buf.nblocks());
+            LatencyMetrics::stop_timer(timer);
 
-        let timer = LatencyMetrics::start_timer(ReqType::Write, "lsmtree", "");
+            AmplificationMetrics::acc_data_amount(AmpType::Write, buf.nblocks());
 
-        self.tx_lsm_tree
-            .put(RecordKey { lba }, RecordValue { hba, key, mac })?;
+            let timer = LatencyMetrics::start_timer(ReqType::Write, "lsmtree", "");
 
-        LatencyMetrics::stop_timer(timer);
+            self.tx_lsm_tree.put(lba, RecordValue { hba, key, mac })?;
 
+            LatencyMetrics::stop_timer(timer);
+        }
+
+        self.data_buf.clear();
         Ok(buf.nblocks())
     }
 
@@ -159,8 +172,9 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         Ok(Self {
             tx_lsm_tree,
             user_data_disk: data_disk,
-            root_key,
             block_validity_bitmap,
+            data_buf: DataBuf::new(),
+            root_key,
         })
     }
 
@@ -191,8 +205,9 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         Ok(Self {
             tx_lsm_tree,
             user_data_disk: data_disk,
-            root_key,
             block_validity_bitmap,
+            data_buf: DataBuf::new(),
+            root_key,
         })
     }
 
@@ -207,10 +222,6 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
 unsafe impl<D: BlockSet> Send for SwornDisk<D> {}
 unsafe impl<D: BlockSet> Sync for SwornDisk<D> {}
-
-// struct DataBuf {
-//     buf: HashMap<RecordKey, RecordValue>,
-// }
 
 struct TxLsmTreeListenerFactory<D> {
     store: Arc<TxLogStore<D>>,
@@ -306,6 +317,56 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
         match self.tx_type {
             TxType::Compaction { .. } | TxType::Migration => self.block_alloc.update_bitmap(),
         }
+    }
+}
+
+struct DataBuf {
+    buf: RwLock<BTreeMap<RecordKey, Arc<DataBlock>>>,
+}
+
+struct DataBlock([u8; BLOCK_SIZE]);
+
+impl DataBuf {
+    pub fn new() -> Self {
+        Self {
+            buf: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn get(&self, key: RecordKey, buf: &mut BufMut) -> Option<()> {
+        if let Some(block) = self.buf.read().get(&key) {
+            buf.as_mut_slice().copy_from_slice(&block.0);
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    pub fn put(&self, key: RecordKey, buf: BufRef) {
+        let _ = self.buf.write().insert(key, DataBlock::from_buf(buf));
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.read().len()
+    }
+
+    pub fn clear(&self) {
+        self.buf.write().clear();
+    }
+
+    pub fn all_blocks(&self) -> Vec<(RecordKey, Arc<DataBlock>)> {
+        self.buf
+            .read()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+}
+
+impl DataBlock {
+    pub fn from_buf(buf: BufRef) -> Arc<Self> {
+        debug_assert_eq!(buf.nblocks(), 1);
+        Arc::new(DataBlock(buf.as_slice().try_into().unwrap()))
     }
 }
 
