@@ -427,7 +427,8 @@ impl<L: BlockLog> Mht<L> {
     pub fn flush(&mut self) -> Result<()> {
         let data_node_entries = self.data_buf.flush()?;
         self.do_build(data_node_entries)?;
-        self.storage.flush()
+        self.storage.flush()?;
+        Ok(())
     }
 
     fn do_build(&mut self, data_node_entries: Vec<MhtNodeEntry>) -> Result<()> {

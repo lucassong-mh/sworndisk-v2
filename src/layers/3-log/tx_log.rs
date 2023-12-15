@@ -37,7 +37,7 @@
 //!     // TX 2: Open then read the created log
 //!     let mut tx = tx_log_store.new_tx();
 //!     let res: Result<_> = tx.context(|| {
-//!         let log = tx_log_store.open_log_in(bucket)?;
+//!         let log = tx_log_store.open_log_in(bucket, false)?;
 //!         let mut buf = Buf::alloc(1)?;
 //!         log.read(0 as BlockId, buf.as_mut())?;
 //!         assert_eq!(buf.as_slice()[0], content);
@@ -545,13 +545,13 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     /// # Panics
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
-    pub fn open_log_in(&self, bucket: &str) -> Result<Arc<TxLog<D>>> {
+    pub fn open_log_in(&self, bucket: &str, can_append: bool) -> Result<Arc<TxLog<D>>> {
         let log_ids = self.list_logs(bucket)?;
         let max_log_id = log_ids
             .iter()
             .max()
             .ok_or(Error::with_msg(NotFound, "tx log not found"))?;
-        self.open_log(*max_log_id, false)
+        self.open_log(*max_log_id, can_append)
     }
 
     /// Checks whether the log of a given log ID exists or not.
@@ -618,6 +618,12 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     /// Returns the current transaction.
     pub fn current_tx(&self) -> CurrentTx<'_> {
         self.tx_provider.current()
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        self.raw_log_store.sync()?;
+        self.journal.lock().flush()?;
+        Ok(())
     }
 }
 
@@ -1262,7 +1268,7 @@ mod tests {
             log.read(0, buf.as_mut())?;
             assert_eq!(buf.as_slice()[0], content);
 
-            let log = tx_log_store.open_log_in(bucket)?;
+            let log = tx_log_store.open_log_in(bucket, false)?;
             assert_eq!(log.id(), log_id);
             log.read(0 as BlockId, buf.as_mut())?;
             assert_eq!(buf.as_slice()[0], content);
@@ -1370,7 +1376,7 @@ mod tests {
         // TX 2: Open then read the created log
         let mut tx = tx_log_store.new_tx();
         let res: Result<_> = tx.context(|| {
-            let log = tx_log_store.open_log_in(bucket)?;
+            let log = tx_log_store.open_log_in(bucket, false)?;
             let mut buf = Buf::alloc(1)?;
             log.read(0 as BlockId, buf.as_mut())?;
             assert_eq!(buf.as_slice()[0], content);

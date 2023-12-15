@@ -1,7 +1,7 @@
 //! Block allocation.
 
 use super::sworndisk::Hba;
-use crate::layers::bio::{BlockSet, Buf};
+use crate::layers::bio::{BlockSet, Buf, BufRef};
 use crate::layers::log::{TxLog, TxLogStore};
 use crate::os::Mutex;
 use crate::prelude::*;
@@ -42,7 +42,7 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
         }
     }
 
-    /// Allocate a specifiied block, means update in-memory metadata.
+    /// Allocate a specified block, means update in-memory metadata.
     pub fn alloc_block(&self, block_id: Hba) -> Result<()> {
         let mut diff_table = self.diff_table.lock();
         let replaced = diff_table.insert(block_id, AllocDiff::Alloc);
@@ -52,7 +52,7 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
         Ok(())
     }
 
-    /// Deallocate a specifiied block, means update in-memory metadata.
+    /// Deallocate a specified block, means update in-memory metadata.
     pub fn dealloc_block(&self, block_id: Hba) -> Result<()> {
         let mut diff_table = self.diff_table.lock();
         let replaced = diff_table.insert(block_id, AllocDiff::Dealloc);
@@ -68,13 +68,13 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
     pub fn prepare_diff_log(&self) -> Result<()> {
-        // FIXME: not in append mode
-        let mut diff_log = self.store.open_log_in(BUCKET_BLOCK_ALLOC_LOG);
-        if let Err(e) = &diff_log && e.errno() == NotFound {
-            diff_log = self.store.create_log(BUCKET_BLOCK_ALLOC_LOG);
-        }
-        let diff_log = diff_log?;
-        let _ = self.diff_log.lock().insert(diff_log.clone());
+        // let diff_log_res = self.store.open_log_in(BUCKET_BLOCK_ALLOC_LOG, true);
+        // if let Err(e) = &diff_log_res && e.errno() == NotFound {
+        //     let diff_log = self.store.create_log(BUCKET_BLOCK_ALLOC_LOG)?;
+        //     let _ = self.diff_log.lock().insert(diff_log.clone());
+        //     return Ok(());
+        // }
+        // diff_log_res
         Ok(())
     }
 
@@ -88,17 +88,21 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
         if diff_table.is_empty() {
             return Ok(());
         }
-        let mut diff_buf = Vec::new();
+
+        let diff_log = if let Ok(log) = self.store.open_log_in(BUCKET_BLOCK_ALLOC_LOG, true) {
+            log
+        } else {
+            self.store.create_log(BUCKET_BLOCK_ALLOC_LOG)?
+        };
+
+        let mut diff_buf = Vec::with_capacity(BLOCK_SIZE);
         for (block_id, block_diff) in diff_table.iter() {
             diff_buf.push(*block_diff as u8);
             diff_buf.extend_from_slice(block_id.as_bytes());
         }
-        let mut buf = Buf::alloc(align_up(diff_buf.len(), BLOCK_SIZE) / BLOCK_SIZE)?;
-        buf.as_mut_slice()[..diff_buf.len()].copy_from_slice(&diff_buf);
-
-        let diff_log = self.diff_log.lock();
-        let diff_log = diff_log.as_ref().unwrap();
-        diff_log.append(buf.as_ref())
+        diff_buf.resize(align_up(diff_buf.len(), BLOCK_SIZE), 0);
+        let buf = BufRef::try_from(&diff_buf[..]).unwrap();
+        diff_log.append(buf)
     }
 
     pub fn update_bitmap(&self) {
@@ -154,7 +158,7 @@ impl AllocBitmap {
     pub fn recover<D: BlockSet + 'static>(&self, store: &Arc<TxLogStore<D>>) -> Result<()> {
         let mut tx = store.new_tx();
         let res: Result<_> = tx.context(|| {
-            let diff_log = store.open_log_in(BUCKET_BLOCK_ALLOC_LOG)?;
+            let diff_log = store.open_log_in(BUCKET_BLOCK_ALLOC_LOG, false)?;
             let mut buf = Buf::alloc(diff_log.nblocks())?;
             diff_log.read(0, buf.as_mut())?;
             let buf_slice = buf.as_slice();

@@ -5,9 +5,7 @@ use self::consts::*;
 use self::disks::{DiskType, FileAsDisk};
 use self::util::{DisplayData, DisplayThroughput};
 
-use spin::Mutex;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use libc::{fsync, ftruncate, open, pread, pwrite, unlink, O_CREAT, O_RDWR, O_TRUNC};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -380,7 +378,7 @@ mod consts {
 
 mod disks {
     use super::*;
-    use std::ops::Range;
+    use std::{ffi::CString, ops::Range};
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum DiskType {
@@ -400,24 +398,33 @@ mod disks {
 
     #[derive(Clone)]
     pub struct FileAsDisk {
-        file: Arc<Mutex<File>>,
+        fd: i32,
         path: String,
         range: Range<BlockId>,
     }
 
     impl FileAsDisk {
         pub fn create(nblocks: usize, path: &str) -> Self {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(path)
-                .unwrap();
-            file.set_len((nblocks * BLOCK_SIZE) as _).unwrap();
-            Self {
-                file: Arc::new(Mutex::new(file)),
-                path: path.to_string(),
-                range: 0..nblocks,
+            unsafe {
+                let oflag = O_RDWR | O_CREAT | O_TRUNC;
+                // let oflag = O_RDWR | O_CREAT | O_TRUNC | O_DIRECT;
+                let fd = open(CString::new(path).unwrap().as_ptr() as _, oflag, 0o666);
+                if fd == -1 {
+                    println!("open error: {}", std::io::Error::last_os_error());
+                }
+                assert!(fd > 0);
+
+                let res = ftruncate(fd, (nblocks * BLOCK_SIZE) as _);
+                if res == -1 {
+                    println!("ftruncate error: {}", std::io::Error::last_os_error());
+                }
+                assert!(res >= 0);
+
+                Self {
+                    fd,
+                    path: path.to_string(),
+                    range: 0..nblocks,
+                }
             }
         }
     }
@@ -427,11 +434,18 @@ mod disks {
             pos += self.range.start;
             debug_assert!(pos + buf.nblocks() <= self.range.end);
 
-            self.file
-                .lock()
-                .seek(SeekFrom::Start((pos * BLOCK_SIZE) as _))
-                .unwrap();
-            self.file.lock().read(buf.as_mut_slice()).unwrap();
+            let buf_mut_slice = buf.as_mut_slice();
+            unsafe {
+                let res = pread(
+                    self.fd,
+                    buf_mut_slice.as_ptr() as _,
+                    buf_mut_slice.len(),
+                    (pos * BLOCK_SIZE) as _,
+                );
+                if res == -1 {
+                    return_errno_with_msg!(Errno::IoFailed, "file read failed");
+                }
+            }
 
             Ok(())
         }
@@ -440,11 +454,18 @@ mod disks {
             pos += self.range.start;
             debug_assert!(pos + buf.nblocks() <= self.range.end);
 
-            self.file
-                .lock()
-                .seek(SeekFrom::Start((pos * BLOCK_SIZE) as _))
-                .unwrap();
-            self.file.lock().write(buf.as_slice()).unwrap();
+            let buf_slice = buf.as_slice();
+            unsafe {
+                let res = pwrite(
+                    self.fd,
+                    buf_slice.as_ptr() as _,
+                    buf_slice.len(),
+                    (pos * BLOCK_SIZE) as _,
+                );
+                if res == -1 {
+                    return_errno_with_msg!(Errno::IoFailed, "file write failed");
+                }
+            }
 
             Ok(())
         }
@@ -455,7 +476,7 @@ mod disks {
         {
             debug_assert!(self.range.start + range.end <= self.range.end);
             Ok(Self {
-                file: self.file.clone(),
+                fd: self.fd,
                 path: self.path.clone(),
                 range: Range {
                     start: self.range.start + range.start,
@@ -465,10 +486,12 @@ mod disks {
         }
 
         fn flush(&self) -> Result<()> {
-            // TODO: Use raw file of libc for better concurrency
-            // self.file.lock().flush().unwrap();
-            // self.file.lock().sync_all().unwrap();
-            self.file.lock().sync_data().unwrap();
+            unsafe {
+                let res = fsync(self.fd);
+                if res == -1 {
+                    return_errno_with_msg!(Errno::IoFailed, "file sync failed");
+                }
+            }
             Ok(())
         }
 
@@ -479,7 +502,9 @@ mod disks {
 
     impl Drop for FileAsDisk {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
+            unsafe {
+                unlink(self.path.as_ptr() as _);
+            }
         }
     }
 

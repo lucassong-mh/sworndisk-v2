@@ -23,7 +23,7 @@ use pod::Pod;
 /// |  BLOCK_SIZE   |  BLOCK_SIZE   |...|                           |
 /// ```
 ///
-// TODO: Add bloom filter and second-level index
+// TODO: Use Iterator for range search and support variable records block size.
 pub(super) struct SSTable<K, V> {
     // Cache log id, and footer blocks
     id: TxLogId,
@@ -100,20 +100,25 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
         !(lhs_range.end() < rhs_range.start() || lhs_range.start() > rhs_range.end())
     }
 
-    pub fn search<D: BlockSet + 'static>(&self, key: &K, tx_log: &Arc<TxLog<D>>) -> Option<V> {
+    pub fn search<D: BlockSet + 'static>(&self, key: &K, tx_log: &Arc<TxLog<D>>) -> Result<V> {
         debug_assert!(self.range().contains(key));
         if let Some(value) = self.search_in_cache(key) {
-            return Some(value);
+            return Ok(value);
         }
 
-        let target_pos = self.footer.index.iter().find_map(|entry| {
-            if (entry.first..=entry.last).contains(key) {
-                Some(entry.pos)
-            } else {
-                None
-            }
-        })?;
-        self.search_in_log(key, target_pos, tx_log).ok()
+        let target_pos = self
+            .footer
+            .index
+            .iter()
+            .find_map(|entry| {
+                if (entry.first..=entry.last).contains(key) {
+                    Some(entry.pos)
+                } else {
+                    None
+                }
+            })
+            .ok_or(Error::with_msg(NotFound, "target value not found"))?;
+        self.search_in_log(key, target_pos, tx_log)
     }
 
     /// Search a target record in the SST (from cache).

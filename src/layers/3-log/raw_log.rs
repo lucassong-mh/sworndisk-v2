@@ -213,6 +213,10 @@ impl<D: BlockSet> RawLogStore<D> {
         self.tx_provider.new_tx()
     }
 
+    pub fn sync(&self) -> Result<()> {
+        self.disk.flush()
+    }
+
     /// Creates a new raw log with a new log id.
     ///
     /// # Panics
@@ -257,10 +261,9 @@ impl<D: BlockSet> RawLogStore<D> {
 
         let log_entry_opt = state.persistent.find_log(log_id);
         // The log is already created by other TX
-        if log_entry_opt.is_some() {
-            let log_entry = log_entry_opt.as_ref().unwrap();
+        if let Some(log_entry) = log_entry_opt.as_ref() {
             if can_append {
-                // Prevent other TX from opening this log in the append mode.
+                // Prevent other TX from opening this log in the append mode
                 state.add_to_write_set(log_id)?;
 
                 // If the log is open in the append mode, edit must be prepared
@@ -366,7 +369,9 @@ impl<D: BlockSet> BlockLog for RawLog<D> {
     }
 
     fn flush(&self) -> Result<()> {
-        self.log_store.disk.flush()
+        // FIXME: Should we sync the disk here?
+        self.log_store.disk.flush()?;
+        Ok(())
     }
 
     /// # Panics

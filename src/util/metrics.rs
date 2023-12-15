@@ -99,7 +99,7 @@ impl LatencyMetrics {
     pub fn start_timer(req_type: ReqType, category: &str, parent_category: &str) -> Timer {
         let mut metrics = METRICS.write();
         let table = &mut metrics.latency.table.get_mut(&req_type).unwrap().table;
-        let level = if !parent_category.is_empty() {
+        let level = if !parent_category.is_empty() && table.contains_key(parent_category) {
             table.get(parent_category).unwrap().level + 1
         } else {
             0

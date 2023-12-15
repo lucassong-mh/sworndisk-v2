@@ -74,7 +74,7 @@ pub trait TxEventListenerFactory<K, V> {
 /// An event listener that get informed when
 /// 1) A new record is added,
 /// 2) An existing record is dropped,
-/// 3) After a TX begined,
+/// 3) After a TX began,
 /// 4) Before a TX ended,
 /// 5) After a TX committed.
 /// `tx_type` indicates an internal transaction of `TxLsmTree`.
@@ -85,7 +85,7 @@ pub trait TxEventListener<K, V> {
     /// Notify the listener that an existing record is dropped from a LSM-Tree.
     fn on_drop_record(&self, record: &dyn AsKv<K, V>) -> Result<()>;
 
-    /// Notify the listener after a TX just begined.
+    /// Notify the listener after a TX just began.
     fn on_tx_begin(&self, tx: &mut Tx) -> Result<()>;
 
     /// Notify the listener before a tx ended.
@@ -150,7 +150,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
         let synced_records = {
             let mut tx = tx_log_store.new_tx();
             let res: Result<_> = tx.context(|| {
-                let wal_res = tx_log_store.open_log_in(BUCKET_WAL);
+                let wal_res = tx_log_store.open_log_in(BUCKET_WAL, false);
                 if let Err(e) = &wal_res && e.errno() == NotFound {
                     return Ok(vec![]);
                 }
@@ -230,23 +230,20 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
         Ok(recov_self)
     }
 
-    pub fn get(&self, key: &K) -> Option<V> {
+    pub fn get(&self, key: &K) -> Result<V> {
         // 1. Search from MemTables
         if let Some(value) = self.active_mem_table().read().get(key) {
-            return Some(value.clone());
+            return Ok(value.clone());
         }
         if let Some(value) = self.immut_mem_table().read().get(key) {
-            return Some(value.clone());
+            return Ok(value.clone());
         }
 
         // let timer = LatencyMetrics::start_timer(ReqType::Read, "read_tx", "lsmtree");
 
         // 2. Search from SSTs (do Read TX)
-        let res = self.do_read_tx(key).unwrap();
-
+        self.do_read_tx(key)
         // LatencyMetrics::stop_timer(timer);
-
-        Some(res)
     }
 
     pub fn get_range(&self, range: &Range<K>) -> Vec<V> {
@@ -317,6 +314,8 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
 
         LatencyMetrics::stop_timer(timer);
 
+        self.tx_log_store.sync()?;
+
         Ok(())
     }
 
@@ -346,7 +345,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
 
                     // let timer = LatencyMetrics::start_timer(ReqType::Read, "sst", "read_tx");
 
-                    if let Some(target_value) = sst.search(key, &tx_log) {
+                    if let Ok(target_value) = sst.search(key, &tx_log) {
                         // LatencyMetrics::stop_timer(timer);
 
                         return Ok(target_value);
@@ -903,7 +902,7 @@ mod tests {
         let tx_lsm_tree: TxLsmTree<BlockId, RecordValue, MemDisk> =
             TxLsmTree::recover(tx_log_store.clone(), Arc::new(Factory), None)?;
 
-        assert!(tx_lsm_tree.get(&(600 + cap)).is_none());
+        assert!(tx_lsm_tree.get(&(600 + cap)).is_err());
         let target_value = tx_lsm_tree.get(&500).unwrap();
         assert_eq!(target_value.hba, 500);
         Ok(())

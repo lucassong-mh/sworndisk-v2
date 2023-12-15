@@ -2,7 +2,7 @@
 //!
 //! API: read(), write(), flush(), flush_blocks(), discard(), total_blocks(), open(), create()
 //!
-//! Responisble for managing a `TxLsmTree`, an untrusted disk
+//! Responsible for managing a `TxLsmTree`, an untrusted disk
 //! storing user data, a `BlockAlloc` for managing data block
 //! validity manage tx logs (WAL and SSTs). `TxLsmTree` and
 //! `BlockAlloc` are manipulated based on internal transactions.
@@ -17,6 +17,8 @@ use crate::prelude::*;
 use crate::tx::Tx;
 use crate::util::Aead;
 
+use hashbrown::HashMap;
+use lending_iterator::LendingIterator;
 use pod::Pod;
 
 pub type Lba = BlockId;
@@ -27,28 +29,37 @@ pub struct SwornDisk<D: BlockSet> {
     tx_lsm_tree: TxLsmTree<RecordKey, RecordValue, D>,
     user_data_disk: D,
     block_validity_bitmap: Arc<AllocBitmap>,
+    // data_buf: DataBuf, // TODO: Support data buffering.
     root_key: Key,
 }
 
 impl<D: BlockSet + 'static> SwornDisk<D> {
+    const BUF_CAP: usize = 1024;
+
     /// Read a specified number of block contents at a logical block address on the device.
-    pub fn read(&self, lba: Lba, mut buf: BufMut) -> Result<usize> {
+    pub fn read(&self, mut lba: Lba, mut buf: BufMut) -> Result<usize> {
+        let mut iter_mut = buf.iter_mut();
+        while let Some(block_buf) = iter_mut.next() {
+            self.read_one_block(lba, block_buf)?;
+            lba += 1;
+        }
+        Ok(buf.nblocks())
+    }
+
+    fn read_one_block(&self, lba: Lba, mut buf: BufMut) -> Result<()> {
+        debug_assert_eq!(buf.nblocks(), 1);
         let timer = LatencyMetrics::start_timer(ReqType::Read, "lsmtree", "");
 
-        // TODO: batch read
-        let record = self
-            .tx_lsm_tree
-            .get(&RecordKey { lba })
-            .ok_or(Error::with_msg(NotFound, "record not found in lsm tree"))?;
+        let record = self.tx_lsm_tree.get(&RecordKey { lba })?;
 
         LatencyMetrics::stop_timer(timer);
 
         let timer = LatencyMetrics::start_timer(ReqType::Read, "data", "");
 
-        let mut rbuf = Buf::alloc(1)?;
-        self.user_data_disk.read(record.hba, rbuf.as_mut())?;
+        let mut cipher = Buf::alloc(1)?;
+        self.user_data_disk.read(record.hba, cipher.as_mut())?;
         OsAead::new().decrypt(
-            rbuf.as_slice(),
+            cipher.as_slice(),
             &record.key,
             &Iv::new_zeroed(),
             &[],
@@ -57,8 +68,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         )?;
 
         LatencyMetrics::stop_timer(timer);
-
-        Ok(buf.nblocks())
+        Ok(())
     }
 
     /// Write a specified number of block contents at a logical block address on the device.
@@ -72,15 +82,15 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             .ok_or(Error::with_msg(OutOfMemory, "block allocation failed"))?;
 
         let key = Key::random();
-        let mut wbuf = Buf::alloc(1)?;
+        let mut cipher = Buf::alloc(1)?;
         let mac = OsAead::new().encrypt(
             buf.as_slice(),
             &key,
             &Iv::new_zeroed(),
             &[],
-            wbuf.as_mut_slice(),
+            cipher.as_mut_slice(),
         )?;
-        self.user_data_disk.write(hba, wbuf.as_ref())?;
+        self.user_data_disk.write(hba, cipher.as_ref())?;
 
         LatencyMetrics::stop_timer(timer);
 
@@ -198,6 +208,10 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 unsafe impl<D: BlockSet> Send for SwornDisk<D> {}
 unsafe impl<D: BlockSet> Sync for SwornDisk<D> {}
 
+// struct DataBuf {
+//     buf: HashMap<RecordKey, RecordValue>,
+// }
+
 struct TxLsmTreeListenerFactory<D> {
     store: Arc<TxLogStore<D>>,
     alloc_bitmap: Arc<AllocBitmap>,
@@ -271,20 +285,20 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
     }
 
     fn on_tx_begin(&self, tx: &mut Tx) -> Result<()> {
-        // match self.tx_type {
-        //     TxType::Compaction { .. } | TxType::Migration => {
-        //         tx.context(|| self.block_alloc.prepare_diff_log().unwrap())
-        //     }
-        // }
+        match self.tx_type {
+            TxType::Compaction { .. } | TxType::Migration => {
+                tx.context(|| self.block_alloc.prepare_diff_log().unwrap())
+            }
+        }
         Ok(())
     }
 
     fn on_tx_precommit(&self, tx: &mut Tx) -> Result<()> {
-        // match self.tx_type {
-        //     TxType::Compaction { .. } | TxType::Migration => {
-        //         tx.context(|| self.block_alloc.update_diff_log().unwrap())
-        //     }
-        // }
+        match self.tx_type {
+            TxType::Compaction { .. } | TxType::Migration => {
+                tx.context(|| self.block_alloc.update_diff_log().unwrap())
+            }
+        }
         Ok(())
     }
 
