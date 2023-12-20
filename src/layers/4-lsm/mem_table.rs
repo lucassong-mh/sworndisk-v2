@@ -25,44 +25,6 @@ pub(super) enum ValueEx<V> {
     SyncedAndUnsynced(V, V),
 }
 
-impl<V: Copy> ValueEx<V> {
-    fn new(value: V) -> Self {
-        Self::Unsynced(value)
-    }
-
-    fn get(&self) -> &V {
-        match self {
-            ValueEx::Synced(v) => v,
-            ValueEx::Unsynced(v) => v,
-            ValueEx::SyncedAndUnsynced(_, v) => v,
-        }
-    }
-
-    fn put(&mut self, value: V) -> Option<V> {
-        // TODO: Optimize this by using `mem::take`
-        let (updated, replaced) = match self {
-            ValueEx::Synced(v) => (Self::SyncedAndUnsynced(*v, value), None),
-            ValueEx::Unsynced(v) => (Self::Unsynced(value), Some(*v)),
-            ValueEx::SyncedAndUnsynced(cv, _ucv) => {
-                (Self::SyncedAndUnsynced(*cv, value), Some(*cv))
-            }
-        };
-        *self = updated;
-        replaced
-    }
-
-    fn sync(&mut self) -> Option<V> {
-        // TODO: Optimize this by using `mem::take`
-        let (updated, replaced) = match self {
-            ValueEx::Synced(_v) => (None, None),
-            ValueEx::Unsynced(v) => (Some(Self::Synced(*v)), None),
-            ValueEx::SyncedAndUnsynced(cv, ucv) => (Some(Self::Synced(*cv)), Some(*ucv)),
-        };
-        updated.map(|updated| *self = updated);
-        replaced
-    }
-}
-
 impl<K: Copy + Ord + Debug, V: Copy> MemTable<K, V> {
     pub fn new(
         cap: usize,
@@ -131,5 +93,43 @@ impl<K: Copy + Ord + Debug, V: Copy> MemTable<K, V> {
     pub fn clear(&mut self) {
         self.table.clear();
         self.size = 0;
+    }
+}
+
+impl<V: Copy> ValueEx<V> {
+    fn new(value: V) -> Self {
+        Self::Unsynced(value)
+    }
+
+    fn get(&self) -> &V {
+        match self {
+            ValueEx::Synced(v) => v,
+            ValueEx::Unsynced(v) => v,
+            ValueEx::SyncedAndUnsynced(_, v) => v,
+        }
+    }
+
+    fn put(&mut self, value: V) -> Option<V> {
+        // TODO: Optimize this by using `mem::take`
+        let (updated, replaced) = match self {
+            ValueEx::Synced(v) => (Self::SyncedAndUnsynced(*v, value), None),
+            ValueEx::Unsynced(v) => (Self::Unsynced(value), Some(*v)),
+            ValueEx::SyncedAndUnsynced(cv, _ucv) => {
+                (Self::SyncedAndUnsynced(*cv, value), Some(*cv))
+            }
+        };
+        *self = updated;
+        replaced
+    }
+
+    fn sync(&mut self) -> Option<V> {
+        // TODO: Optimize this by using `mem::take`
+        let (updated, replaced) = match self {
+            ValueEx::Synced(_v) => (None, None),
+            ValueEx::Unsynced(v) => (Some(Self::Synced(*v)), None),
+            ValueEx::SyncedAndUnsynced(cv, ucv) => (Some(Self::Synced(*cv)), Some(*ucv)),
+        };
+        updated.map(|updated| *self = updated);
+        replaced
     }
 }

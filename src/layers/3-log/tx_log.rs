@@ -107,11 +107,6 @@ pub struct Superblock {
 }
 
 impl<D: BlockSet + 'static> TxLogStore<D> {
-    pub fn debug_state(&self) {
-        self.raw_log_store.debug_state();
-        println!("{:?}\n", self.state.lock().persistent);
-    }
-
     /// Formats the disk to create a new instance of `TxLogStore`.
     ///
     /// Each instance will be assigned a unique, automatically-generated root
@@ -389,12 +384,16 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         current_tx.data_with(|store_edit: &TxLogStoreEdit| {
             for (&log_id, log_edit) in &store_edit.edit_table {
                 match log_edit {
-                    TxLogEdit::Create(_) => {
-                        log_id_set.insert(log_id);
+                    TxLogEdit::Create(create) => {
+                        if create.bucket == bucket_name {
+                            log_id_set.insert(log_id);
+                        }
                     }
                     TxLogEdit::Append(_) => {}
                     TxLogEdit::Delete => {
-                        log_id_set.remove(&log_id);
+                        if log_id_set.contains(&log_id) {
+                            log_id_set.remove(&log_id);
+                        }
                     }
                 }
             }
@@ -624,6 +623,18 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         self.raw_log_store.sync()?;
         self.journal.lock().flush()?;
         Ok(())
+    }
+}
+
+impl<D: BlockSet + 'static> Debug for TxLogStore<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.state.lock();
+        f.debug_struct("TxLogStore")
+            .field("persistent_log_table", &state.persistent.log_table)
+            .field("persistent_bucket_table", &state.persistent.bucket_table)
+            .field("raw_log_store", &self.raw_log_store)
+            .field("key", &self.key)
+            .finish()
     }
 }
 
@@ -924,7 +935,7 @@ impl TxLogStoreState {
     pub fn list_logs(&self, bucket_name: &str) -> Result<BTreeSet<TxLogId>> {
         let bucket = self
             .bucket_table
-            .get(&bucket_name.to_string())
+            .get(bucket_name)
             .ok_or(Error::with_msg(NotFound, "bucket not found"))?;
         Ok(bucket.log_ids.clone())
     }
@@ -1355,36 +1366,6 @@ mod tests {
             let res = tx_log_store.open_log(log_id, false).map(|_| ());
             res.expect_err("result must be NotFound");
         });
-        tx.commit()
-    }
-
-    fn main<D: BlockSet + 'static>(tx_log_store: &TxLogStore<D>, bucket: &str) -> Result<()> {
-        let content = 5_u8;
-        // TX 1: Create then write a new log
-        let mut tx = tx_log_store.new_tx();
-        let res: Result<_> = tx.context(|| {
-            let new_log = tx_log_store.create_log(bucket)?;
-            let mut buf = Buf::alloc(1)?;
-            buf.as_mut_slice().fill(content);
-            new_log.append(buf.as_ref())
-        });
-        if res.is_err() {
-            tx.abort();
-        }
-        tx.commit()?;
-
-        // TX 2: Open then read the created log
-        let mut tx = tx_log_store.new_tx();
-        let res: Result<_> = tx.context(|| {
-            let log = tx_log_store.open_log_in(bucket, false)?;
-            let mut buf = Buf::alloc(1)?;
-            log.read(0 as BlockId, buf.as_mut())?;
-            assert_eq!(buf.as_slice()[0], content);
-            Ok(())
-        });
-        if res.is_err() {
-            tx.abort();
-        }
         tx.commit()
     }
 }

@@ -42,6 +42,7 @@ use crate::prelude::*;
 use crate::tx::{CurrentTx, Tx, TxData, TxProvider};
 
 use alloc::collections::BTreeMap;
+use core::fmt::{self, Debug};
 use serde::{Deserialize, Serialize};
 
 /// The ID of a chunk.
@@ -175,6 +176,16 @@ impl ChunkAlloc {
     /// Returns the number of free chunks.
     pub fn free_count(&self) -> usize {
         self.state.lock().free_count()
+    }
+}
+
+impl Debug for ChunkAlloc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.state.lock();
+        f.debug_struct("ChunkAlloc")
+            .field("bitmap_free_count", &state.free_count)
+            .field("bitmap_min_free", &state.min_free)
+            .finish()
     }
 }
 

@@ -16,7 +16,7 @@ use crate::prelude::*;
 use crate::tx::Tx;
 
 use alloc::collections::BTreeMap;
-use core::fmt::Debug;
+use core::fmt::{self, Debug};
 use core::hash::Hash;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -106,7 +106,7 @@ pub enum TxType {
 }
 
 impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V, D> {
-    pub(super) const MEMTABLE_CAPACITY: usize = 73728;
+    pub(super) const MEMTABLE_CAPACITY: usize = 81920;
     pub(super) const SSTABLE_CAPACITY: usize = Self::MEMTABLE_CAPACITY;
 
     /// Format a `TxLsmTree` from a given `TxLogStore`.
@@ -223,8 +223,9 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
         recov_self.do_migration_tx()?;
 
         if ENABLE_DEBUG {
-            println!("===after recovery {:?}\n", recov_self.sst_manager.read());
-            recov_self.tx_log_store.debug_state();
+            println!("===== TxLsmTree Recovery =====");
+            println!("{:?}", recov_self);
+            println!("===== TxLsmTree Recovery =====");
         }
 
         Ok(recov_self)
@@ -380,14 +381,6 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
 
     /// Compaction TX { to_level: LsmLevel::L0 }.
     fn do_minor_compaction(&self) -> Result<()> {
-        if ENABLE_DEBUG {
-            println!(
-                "===do_minor_compaction before {:?}\n",
-                self.sst_manager.read()
-            );
-            self.tx_log_store.debug_state();
-        }
-
         let mut tx = self.tx_log_store.new_tx();
         let tx_type = TxType::Compaction {
             to_level: LsmLevel::L0,
@@ -445,26 +438,15 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
         self.wal_append_tx.discard()?;
 
         if ENABLE_DEBUG {
-            println!(
-                "===do_minor_compaction after {:?}\n",
-                self.sst_manager.read()
-            );
-            self.tx_log_store.debug_state();
+            println!("===== TxLsmTree Minor Compaction =====",);
+            println!("{:?}", self);
+            println!("===== TxLsmTree Minor Compaction =====",);
         }
-
         Ok(())
     }
 
     /// Compaction TX { to_level: LsmLevel::L1~LsmLevel::L5 }.
     fn do_major_compaction(&self, to_level: LsmLevel) -> Result<()> {
-        if ENABLE_DEBUG {
-            println!(
-                "===do_major_compaction before {:?}\n",
-                self.sst_manager.read()
-            );
-            self.tx_log_store.debug_state();
-        }
-
         let from_level = to_level.upper_level();
 
         let mut tx = self.tx_log_store.new_tx();
@@ -588,16 +570,14 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
             .for_each(|(id, level)| sst_manager.remove(id, level));
         drop(sst_manager);
 
-        if ENABLE_DEBUG {
-            println!(
-                "===do_major_compaction after {:?}\n",
-                self.sst_manager.read()
-            );
-            self.tx_log_store.debug_state();
-        }
-
         if self.sst_manager.read().require_major_compaction(to_level) {
             self.do_major_compaction(to_level.lower_level())?;
+        }
+
+        if ENABLE_DEBUG {
+            println!("===== TxLsmTree Major Compaction =====",);
+            println!("{:?}", self);
+            println!("===== TxLsmTree Major Compaction =====",);
         }
         Ok(())
     }
@@ -684,8 +664,24 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
     }
 }
 
+impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> Debug
+    for TxLsmTree<K, V, D>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TxLsmTree")
+            .field(
+                "active_memtable_size",
+                &self.active_mem_table().read().size(),
+            )
+            .field("immut_memtable_size", &self.immut_mem_table().read().size())
+            .field("sst_manager", &self.sst_manager.read())
+            .field("tx_log_store", &self.tx_log_store)
+            .finish()
+    }
+}
+
 impl LsmLevel {
-    const LEVEL0_RATIO: u16 = 4; // 4
+    const LEVEL0_RATIO: u16 = 4;
     const LEVELI_RATIO: u16 = 10;
 
     const LEVEL_BUCKETS: [(LsmLevel, &str); 6] = [

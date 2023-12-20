@@ -92,6 +92,7 @@ use crate::util::LazyDelete;
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Weak;
+use core::fmt::{self, Debug};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
 
@@ -107,10 +108,6 @@ pub struct RawLogStore<D> {
 }
 
 impl<D: BlockSet> RawLogStore<D> {
-    pub fn debug_state(&self) {
-        println!("{:?}\n", self.state.lock().persistent);
-    }
-
     /// Creates a new store of raw logs given a chunk allocator and an untrusted disk.
     pub fn new(disk: D, tx_provider: Arc<TxProvider>, chunk_alloc: ChunkAlloc) -> Arc<Self> {
         Self::from_parts(RawLogStoreState::new(), disk, chunk_alloc, tx_provider)
@@ -315,6 +312,24 @@ impl<D: BlockSet> RawLogStore<D> {
     }
 }
 
+impl<D> Debug for RawLogStore<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.state.lock();
+        f.debug_struct("RawLogStore")
+            .field("persistent_log_table", &state.persistent.log_table)
+            .field(
+                "persistent_next_free_log_id",
+                &state.persistent.next_free_log_id,
+            )
+            .field("write_set", &state.write_set)
+            .field("chunk_alloc", &self.chunk_alloc)
+            .finish()
+    }
+}
+
+unsafe impl<D> Send for RawLogStore<D> {}
+unsafe impl<D> Sync for RawLogStore<D> {}
+
 /// A raw(untrusted) log.
 pub struct RawLog<D> {
     log_id: RawLogId,
@@ -435,6 +450,17 @@ impl<D> Drop for RawLog<D> {
             let mut state = self.log_store.state.lock();
             state.remove_from_write_set(self.log_id);
         }
+    }
+}
+
+impl<D> Debug for RawLog<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawLog")
+            .field("log_id", &self.log_id)
+            .field("log_entry", &self.log_entry)
+            .field("append_pos", &self.append_pos)
+            .field("can_append", &self.can_append)
+            .finish()
     }
 }
 
@@ -704,9 +730,6 @@ impl<'a> RawLogTailRef<'a> {
     }
 }
 
-unsafe impl<D> Send for RawLogStore<D> {}
-unsafe impl<D> Sync for RawLogStore<D> {}
-
 ////////////////////////////////////////////////////////////////////////////////
 // Persistent State
 ////////////////////////////////////////////////////////////////////////////////
@@ -830,13 +853,13 @@ impl RawLogHead {
 ////////////////////////////////////////////////////////////////////////////////
 
 /// A persistent edit to the state of `RawLogStore`.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RawLogStoreEdit {
     edit_table: BTreeMap<RawLogId, RawLogEdit>,
 }
 
 /// The basic unit of a persistent edit to the state of `RawLogStore`.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) enum RawLogEdit {
     Create(RawLogCreate),
     Append(RawLogAppend),
@@ -844,19 +867,19 @@ pub(super) enum RawLogEdit {
 }
 
 /// An edit that implies a log being created.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct RawLogCreate {
     tail: RawLogTail,
 }
 
 /// An edit that implies an existing log being appended.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct RawLogAppend {
     tail: RawLogTail,
 }
 
 /// A log tail contains chunk metadata of a log's TX-ongoing data.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct RawLogTail {
     // The last chunk of the head. If it is partially filled
     // (head_last_chunk_free_blocks > 0), then the tail should write to the

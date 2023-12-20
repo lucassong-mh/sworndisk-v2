@@ -5,7 +5,7 @@ use self::consts::*;
 use self::disks::{DiskType, FileAsDisk};
 use self::util::{DisplayData, DisplayThroughput};
 
-use libc::{fsync, ftruncate, open, pread, pwrite, unlink, O_CREAT, O_RDWR, O_TRUNC};
+use libc::{fsync, ftruncate, open, pread, pwrite, unlink, O_CREAT, O_DIRECT, O_RDWR, O_TRUNC};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -23,30 +23,30 @@ fn main() {
             .concurrency(1)
             .build()
             .unwrap(),
-        BenchBuilder::new("SwornDisk::write_rnd")
-            .disk_type(DiskType::SwornDisk)
-            .io_type(IoType::Write)
-            .io_pattern(IoPattern::Rnd)
-            .total_bytes(total_bytes)
-            .concurrency(1)
-            .build()
-            .unwrap(),
-        BenchBuilder::new("SwornDisk::read_seq")
-            .disk_type(DiskType::SwornDisk)
-            .io_type(IoType::Read)
-            .io_pattern(IoPattern::Seq)
-            .total_bytes(total_bytes)
-            .concurrency(1)
-            .build()
-            .unwrap(),
-        BenchBuilder::new("SwornDisk::read_rnd")
-            .disk_type(DiskType::SwornDisk)
-            .io_type(IoType::Read)
-            .io_pattern(IoPattern::Rnd)
-            .total_bytes(total_bytes)
-            .concurrency(1)
-            .build()
-            .unwrap(),
+        // BenchBuilder::new("SwornDisk::write_rnd")
+        //     .disk_type(DiskType::SwornDisk)
+        //     .io_type(IoType::Write)
+        //     .io_pattern(IoPattern::Rnd)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
+        // BenchBuilder::new("SwornDisk::read_seq")
+        //     .disk_type(DiskType::SwornDisk)
+        //     .io_type(IoType::Read)
+        //     .io_pattern(IoPattern::Seq)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
+        // BenchBuilder::new("SwornDisk::read_rnd")
+        //     .disk_type(DiskType::SwornDisk)
+        //     .io_type(IoType::Read)
+        //     .io_pattern(IoPattern::Rnd)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
         BenchBuilder::new("EncDisk::write_seq")
             .disk_type(DiskType::EncDisk)
             .io_type(IoType::Write)
@@ -55,30 +55,30 @@ fn main() {
             .concurrency(1)
             .build()
             .unwrap(),
-        BenchBuilder::new("EncDisk::write_rnd")
-            .disk_type(DiskType::EncDisk)
-            .io_type(IoType::Write)
-            .io_pattern(IoPattern::Rnd)
-            .total_bytes(total_bytes)
-            .concurrency(1)
-            .build()
-            .unwrap(),
-        BenchBuilder::new("EncDisk::read_seq")
-            .disk_type(DiskType::EncDisk)
-            .io_type(IoType::Read)
-            .io_pattern(IoPattern::Seq)
-            .total_bytes(total_bytes)
-            .concurrency(1)
-            .build()
-            .unwrap(),
-        BenchBuilder::new("EncDisk::read_rnd")
-            .disk_type(DiskType::EncDisk)
-            .io_type(IoType::Read)
-            .io_pattern(IoPattern::Rnd)
-            .total_bytes(total_bytes)
-            .concurrency(1)
-            .build()
-            .unwrap(),
+        // BenchBuilder::new("EncDisk::write_rnd")
+        //     .disk_type(DiskType::EncDisk)
+        //     .io_type(IoType::Write)
+        //     .io_pattern(IoPattern::Rnd)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
+        // BenchBuilder::new("EncDisk::read_seq")
+        //     .disk_type(DiskType::EncDisk)
+        //     .io_type(IoType::Read)
+        //     .io_pattern(IoPattern::Seq)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
+        // BenchBuilder::new("EncDisk::read_rnd")
+        //     .disk_type(DiskType::EncDisk)
+        //     .io_type(IoType::Read)
+        //     .io_pattern(IoPattern::Rnd)
+        //     .total_bytes(total_bytes)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
     ];
 
     // Run all benchmarks and output the results
