@@ -28,7 +28,7 @@ pub(super) struct SSTable<K, V> {
     // Cache log id, and footer blocks
     id: TxLogId,
     footer: Footer<K>,
-    cache: RwLock<LruCache<K, V>>, // TODO: Refactor this cache
+    cache: RwLock<LruCache<BlockId, Arc<RecordBlock>>>, // TODO: Refactor this cache
     phantom: PhantomData<(K, V)>,
 }
 
@@ -67,13 +67,29 @@ enum RecordFlag {
     SyncedAndUnsynced = 19,
 }
 
+struct RecordBlock {
+    buf: Vec<u8>,
+}
+
+struct RecordBlockIter<'a> {
+    block: &'a RecordBlock,
+    offset: usize,
+}
+
+impl RecordBlock {
+    pub fn from_buf(buf: Vec<u8>) -> Arc<Self> {
+        debug_assert_eq!(buf.len(), BLOCK_SIZE);
+        Arc::new(Self { buf })
+    }
+}
+
 impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
     const K_SIZE: usize = size_of::<K>();
     const V_SIZE: usize = size_of::<V>();
     const MAX_RECORD_SIZE: usize = BID_SIZE + 1 + 2 * Self::V_SIZE;
     const INDEX_ENTRY_SIZE: usize = BID_SIZE + 2 * Self::K_SIZE;
     const BUF_CAP: usize = 4 * BLOCK_SIZE;
-    const CACHE_CAP: usize = 73728;
+    const CACHE_CAP: usize = 1024;
     // TODO: Optimize search&build
 
     pub fn id(&self) -> TxLogId {
@@ -123,7 +139,9 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
 
     /// Search a target record in the SST (from cache).
     pub fn search_in_cache(&self, key: &K) -> Option<V> {
-        self.cache.write().get(key).cloned()
+        // TODO: Opt
+        // self.cache.write().get(key).cloned()
+        None
     }
 
     /// Search a target record in the SST (from log).
@@ -173,7 +191,8 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
             if k != *key {
                 continue;
             }
-            self.cache.write().put(k, target_value.clone());
+            // TODO: Opt
+            // self.cache.write().put(k, target_value.clone());
             return Ok(target_value);
         }
 
@@ -197,14 +216,38 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
         let total_records = records_iter.size_hint().0;
         debug_assert!(total_records > 0);
 
-        let mut index_vec = Vec::new();
-        let mut append_buf = Vec::with_capacity(Self::BUF_CAP);
+        let mut cache = LruCache::new(NonZeroUsize::new(Self::CACHE_CAP).unwrap());
+        let index_vec = Self::build_record_blocks(records_iter, total_records, tx_log, &mut cache)?;
+        let footer = Self::build_footer::<D>(index_vec, total_records, sync_id, tx_log)?;
+
+        Ok(Self {
+            id: tx_log.id(),
+            footer,
+            cache: RwLock::new(cache),
+            phantom: PhantomData,
+        })
+    }
+
+    fn build_record_blocks<'a, D: BlockSet + 'static, I>(
+        records_iter: I,
+        total_records: usize,
+        tx_log: &'a TxLog<D>,
+        cache: &mut LruCache<BlockId, Arc<RecordBlock>>,
+    ) -> Result<Vec<IndexEntry<K>>>
+    where
+        I: Iterator<Item = (&'a K, &'a ValueEx<V>)>,
+        Self: 'a,
+    {
+        let mut index_vec =
+            Vec::with_capacity(total_records / (BLOCK_SIZE / Self::MAX_RECORD_SIZE));
         let mut pos = 0 as BlockId;
         let mut first_k = None;
         let mut inner_offset = 0;
-        let mut cache = LruCache::new(NonZeroUsize::new(Self::CACHE_CAP).unwrap());
+
+        let mut append_buf = Vec::with_capacity(BLOCK_SIZE);
         for (i, record) in records_iter.enumerate() {
             if inner_offset == 0 {
+                debug_assert!(append_buf.is_empty());
                 let _ = first_k.insert(*record.0);
             }
 
@@ -215,67 +258,75 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
                     append_buf.push(RecordFlag::Synced as u8);
                     append_buf.extend_from_slice(v.as_bytes());
                     inner_offset += 1 + Self::V_SIZE;
-                    cache.put(*record.0, v.clone());
                 }
                 ValueEx::Unsynced(v) => {
                     append_buf.push(RecordFlag::Unsynced as u8);
                     append_buf.extend_from_slice(v.as_bytes());
                     inner_offset += 1 + Self::V_SIZE;
-                    cache.put(*record.0, v.clone());
                 }
-                ValueEx::SyncedAndUnsynced(cv, ucv) => {
+                ValueEx::SyncedAndUnsynced(sv, usv) => {
                     append_buf.push(RecordFlag::SyncedAndUnsynced as u8);
-                    append_buf.extend_from_slice(cv.as_bytes());
-                    append_buf.extend_from_slice(ucv.as_bytes());
+                    append_buf.extend_from_slice(sv.as_bytes());
+                    append_buf.extend_from_slice(usv.as_bytes());
                     inner_offset += Self::MAX_RECORD_SIZE;
-                    cache.put(*record.0, ucv.clone());
                 }
             }
 
-            if BLOCK_SIZE - inner_offset < Self::MAX_RECORD_SIZE || i == total_records - 1 {
-                let aligned_len = align_up(append_buf.len(), BLOCK_SIZE);
-                append_buf.resize(aligned_len, 0);
-                index_vec.push(IndexEntry {
-                    pos,
-                    first: first_k.unwrap(),
-                    last: *record.0,
-                });
-                pos += 1;
-                inner_offset = 0;
+            if BLOCK_SIZE - inner_offset >= Self::MAX_RECORD_SIZE && i != total_records - 1 {
+                continue;
             }
 
-            if append_buf.len() >= Self::BUF_CAP || i == total_records - 1 {
-                tx_log.append(BufRef::try_from(&append_buf[..]).unwrap())?;
-                append_buf.clear();
-            }
+            append_buf.resize(BLOCK_SIZE, 0);
+            index_vec.push(IndexEntry {
+                pos,
+                first: first_k.unwrap(),
+                last: *record.0,
+            });
+
+            let record_block = RecordBlock::from_buf(append_buf.clone());
+            tx_log.append(BufRef::try_from(&record_block.buf[..]).unwrap())?;
+            cache.put(pos, record_block);
+
+            pos += 1;
+            inner_offset = 0;
+            append_buf.clear();
         }
 
-        debug_assert!(append_buf.is_empty());
+        Ok(index_vec)
+    }
+
+    fn build_footer<'a, D: BlockSet + 'static>(
+        index_vec: Vec<IndexEntry<K>>,
+        total_records: usize,
+        sync_id: u64,
+        tx_log: &'a TxLog<D>,
+    ) -> Result<Footer<K>>
+    where
+        Self: 'a,
+    {
+        let footer_buf_len = align_up(
+            index_vec.len() * Self::INDEX_ENTRY_SIZE + FOOTER_META_SIZE,
+            BLOCK_SIZE,
+        );
+        let mut append_buf = Vec::with_capacity(footer_buf_len);
         for entry in &index_vec {
             append_buf.extend_from_slice(&entry.pos.to_le_bytes());
             append_buf.extend_from_slice(entry.first.as_bytes());
             append_buf.extend_from_slice(entry.last.as_bytes());
         }
-        let index_nblocks = align_up(append_buf.len() + FOOTER_META_SIZE, BLOCK_SIZE) / BLOCK_SIZE;
-        append_buf.resize(index_nblocks * BLOCK_SIZE, 0);
+        append_buf.resize(footer_buf_len, 0);
         let meta = FooterMeta {
-            index_nblocks: index_nblocks as _,
+            index_nblocks: (footer_buf_len / BLOCK_SIZE) as _,
             num_index: index_vec.len() as _,
             total_records: total_records as _,
             sync_id,
         };
-        append_buf[index_nblocks * BLOCK_SIZE - FOOTER_META_SIZE..]
-            .copy_from_slice(meta.as_bytes());
+        append_buf[footer_buf_len - FOOTER_META_SIZE..].copy_from_slice(meta.as_bytes());
         tx_log.append(BufRef::try_from(&append_buf[..]).unwrap())?;
 
-        Ok(Self {
-            id: tx_log.id(),
-            footer: Footer {
-                meta,
-                index: index_vec,
-            },
-            cache: RwLock::new(cache),
-            phantom: PhantomData,
+        Ok(Footer {
+            meta,
+            index: index_vec,
         })
     }
 
@@ -330,9 +381,13 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
         let mut dropped_records = Vec::new();
         let mut rbuf = Buf::alloc(1)?;
         for entry in self.footer.index.iter() {
-            // TODO: Opt
-            tx_log.read(entry.pos, rbuf.as_mut())?;
-            let rbuf_slice = rbuf.as_slice();
+            let record_block_opt = self.cache.write().get(&entry.pos).cloned();
+            let rbuf_slice = if let Some(record_block) = record_block_opt.as_ref() {
+                &record_block.buf[..]
+            } else {
+                tx_log.read(entry.pos, rbuf.as_mut())?;
+                rbuf.as_slice()
+            };
 
             let mut offset = 0;
             loop {
@@ -368,19 +423,18 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
                             }
                         }
                         RecordFlag::SyncedAndUnsynced => {
-                            // TODO: Rename
-                            let cv = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
+                            let sv = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
                             offset += Self::V_SIZE;
-                            let ucv = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
+                            let usv = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
                             offset += Self::V_SIZE;
                             if all_synced {
-                                dropped_records.push((k, cv));
-                                ValueEx::Synced(ucv)
+                                dropped_records.push((k, sv));
+                                ValueEx::Synced(usv)
                             } else if discard_unsynced {
-                                dropped_records.push((k, ucv));
-                                ValueEx::Synced(cv)
+                                dropped_records.push((k, usv));
+                                ValueEx::Synced(sv)
                             } else {
-                                ValueEx::SyncedAndUnsynced(cv, ucv)
+                                ValueEx::SyncedAndUnsynced(sv, usv)
                             }
                         }
                         _ => unreachable!(),

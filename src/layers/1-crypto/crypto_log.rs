@@ -427,7 +427,8 @@ impl<L: BlockLog> Mht<L> {
     pub fn flush(&mut self) -> Result<()> {
         let data_node_entries = self.data_buf.flush()?;
         self.do_build(data_node_entries)?;
-        self.storage.flush()?;
+        // FIXME: Should we sync the storage here?
+        // self.storage.flush()?;
         Ok(())
     }
 
