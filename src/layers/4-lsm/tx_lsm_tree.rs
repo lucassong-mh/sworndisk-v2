@@ -191,7 +191,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
             let mut tx = tx_log_store.new_tx();
             let res: Result<_> = tx.context(|| {
                 for (level, bucket) in LsmLevel::iter() {
-                    let log_ids = tx_log_store.list_logs(bucket);
+                    let log_ids = tx_log_store.list_logs_in(bucket);
                     if let Err(e) = &log_ids && e.errno() == NotFound {
                         continue;
                     }
@@ -465,6 +465,8 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
         let tx_log_store = self.tx_log_store.clone();
         let listener = event_listener.clone();
         let res: Result<_> = tx.context(move || {
+            let (mut created_ssts, mut deleted_ssts) = (vec![], vec![]);
+
             // Collect overlapped SSTs
             let sst_manager = self.sst_manager.read();
             let (upper_sst_id, upper_sst) = sst_manager
@@ -483,6 +485,14 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
                 })
                 .collect();
             drop(sst_manager);
+
+            if lower_ssts.is_empty() {
+                tx_log_store.move_log(upper_sst_id, from_level.bucket(), to_level.bucket())?;
+                self.sst_manager
+                    .write()
+                    .move_sst(upper_sst_id, from_level, to_level);
+                return Ok((created_ssts, deleted_ssts));
+            }
 
             let upper_records = {
                 let tx_log = tx_log_store.open_log(upper_sst_id, false)?;
@@ -521,7 +531,6 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
             };
             debug_assert!(compacted_records.is_sorted_by_key(|(k, _)| k));
 
-            let (mut created_ssts, mut deleted_ssts) = (vec![], vec![]);
             // Create new SSTs
             for records in compacted_records.chunks(Self::SSTABLE_CAPACITY) {
                 let new_log = tx_log_store.create_log(to_level.bucket())?;
@@ -760,6 +769,11 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SstManager<K, V> {
         let level_ssts = &mut self.level_ssts[level as usize];
         let removed = level_ssts.remove(&id);
         debug_assert!(removed.is_some());
+    }
+
+    pub fn move_sst(&mut self, id: TxLogId, from: LsmLevel, to: LsmLevel) {
+        let moved = self.level_ssts[from as usize].remove(&id).unwrap();
+        self.level_ssts[to as usize].insert(id, moved);
     }
 
     pub fn require_major_compaction(&self, from_level: LsmLevel) -> bool {

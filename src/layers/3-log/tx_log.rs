@@ -377,9 +377,9 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     /// # Panics
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
-    pub fn list_logs(&self, bucket_name: &str) -> Result<Vec<TxLogId>> {
+    pub fn list_logs_in(&self, bucket_name: &str) -> Result<Vec<TxLogId>> {
         let state = self.state.lock();
-        let mut log_id_set = state.persistent.list_logs(bucket_name)?;
+        let mut log_id_set = state.persistent.list_logs_in(bucket_name)?;
         let current_tx = self.tx_provider.current();
         current_tx.data_with(|store_edit: &TxLogStoreEdit| {
             for (&log_id, log_edit) in &store_edit.edit_table {
@@ -389,7 +389,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
                             log_id_set.insert(log_id);
                         }
                     }
-                    TxLogEdit::Append(_) => {}
+                    TxLogEdit::Append(_) | TxLogEdit::Move(_) => {}
                     TxLogEdit::Delete => {
                         if log_id_set.contains(&log_id) {
                             log_id_set.remove(&log_id);
@@ -545,7 +545,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
     pub fn open_log_in(&self, bucket: &str, can_append: bool) -> Result<Arc<TxLog<D>>> {
-        let log_ids = self.list_logs(bucket)?;
+        let log_ids = self.list_logs_in(bucket)?;
         let max_log_id = log_ids
             .iter()
             .max()
@@ -600,7 +600,23 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
             store_edit.delete_log(log_id);
         });
 
-        // Do lazy delete in precommit phase
+        // Do lazy delete in commit phase
+        Ok(())
+    }
+
+    pub fn move_log(&self, log_id: TxLogId, from_bucket: &str, to_bucket: &str) -> Result<()> {
+        let mut current_tx = self.tx_provider.current();
+
+        current_tx.data_mut_with(|open_log_table: &mut OpenLogTable<D>| {
+            open_log_table.open_table.get(&log_id).map(|log| {
+                debug_assert!(log.bucket == from_bucket && !log.is_dirty.load(Ordering::Relaxed))
+            });
+        });
+
+        current_tx.data_mut_with(|store_edit: &mut TxLogStoreEdit| {
+            store_edit.move_log(log_id, from_bucket, to_bucket);
+        });
+
         Ok(())
     }
 
@@ -722,7 +738,7 @@ impl<D: BlockSet + 'static> TxLog<D> {
 
     /// Returns whether the log is opened in the appendable mode.
     pub fn can_append(&self) -> bool {
-        return self.can_append;
+        self.can_append
     }
 
     /// Reads one or multiple data blocks at a specified position.
@@ -932,28 +948,6 @@ impl TxLogStoreState {
         entry.root_mht = root_mht;
     }
 
-    pub fn list_logs(&self, bucket_name: &str) -> Result<BTreeSet<TxLogId>> {
-        let bucket = self
-            .bucket_table
-            .get(bucket_name)
-            .ok_or(Error::with_msg(NotFound, "bucket not found"))?;
-        Ok(bucket.log_ids.clone())
-    }
-
-    pub fn list_all_logs(&self) -> impl Iterator<Item = TxLogId> + '_ {
-        self.log_table.iter().map(|(id, _)| *id)
-    }
-
-    pub fn find_log(&self, log_id: TxLogId) -> Result<&TxLogEntry> {
-        self.log_table
-            .get(&log_id)
-            .ok_or(Error::with_msg(NotFound, "log entry not found"))
-    }
-
-    pub fn contains_log(&self, log_id: TxLogId) -> bool {
-        self.log_table.contains_key(&log_id)
-    }
-
     pub fn delete_log(&mut self, log_id: TxLogId) {
         // Do not check the result because concurrent TXs
         // may decide to delete the same logs
@@ -963,6 +957,41 @@ impl TxLogStoreState {
                 .get_mut(&entry.bucket)
                 .map(|bucket| bucket.log_ids.remove(&log_id));
         });
+    }
+
+    pub fn move_log(&mut self, log_id: TxLogId, from_bucket: &str, to_bucket: &str) {
+        let entry = self.log_table.get_mut(&log_id).unwrap();
+        debug_assert_eq!(entry.bucket, from_bucket);
+        entry.bucket = to_bucket.to_string();
+
+        self.bucket_table
+            .get_mut(from_bucket)
+            .map(|bucket| bucket.log_ids.remove(&log_id));
+        self.bucket_table
+            .get_mut(to_bucket)
+            .map(|bucket| bucket.log_ids.insert(log_id));
+    }
+
+    pub fn find_log(&self, log_id: TxLogId) -> Result<&TxLogEntry> {
+        self.log_table
+            .get(&log_id)
+            .ok_or(Error::with_msg(NotFound, "log entry not found"))
+    }
+
+    pub fn list_logs_in(&self, bucket: &str) -> Result<BTreeSet<TxLogId>> {
+        let bucket = self
+            .bucket_table
+            .get(bucket)
+            .ok_or(Error::with_msg(NotFound, "bucket not found"))?;
+        Ok(bucket.log_ids.clone())
+    }
+
+    pub fn list_all_logs(&self) -> impl Iterator<Item = TxLogId> + '_ {
+        self.log_table.iter().map(|(id, _)| *id)
+    }
+
+    pub fn contains_log(&self, log_id: TxLogId) -> bool {
+        self.log_table.contains_key(&log_id)
     }
 }
 
@@ -992,6 +1021,7 @@ pub(super) enum TxLogEdit {
     Create(TxLogCreate),
     Append(TxLogAppend),
     Delete,
+    Move(TxLogMove),
 }
 // TODO: Add a `TxLogEdit::Move` for moving a log from one bucket to another.
 
@@ -1009,85 +1039,17 @@ pub(super) struct TxLogAppend {
     root_mht: RootMhtMeta,
 }
 
+/// An edit that implies a log being moved from one bucket to another.
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct TxLogMove {
+    from: BucketName,
+    to: BucketName,
+}
+
 impl TxLogStoreEdit {
     pub fn new() -> Self {
         Self {
             edit_table: BTreeMap::new(),
-        }
-    }
-
-    pub fn is_log_deleted(&self, log_id: TxLogId) -> bool {
-        match self.edit_table.get(&log_id) {
-            Some(TxLogEdit::Delete) => true,
-            _ => false,
-        }
-    }
-
-    pub fn is_log_created(&self, log_id: TxLogId) -> bool {
-        match self.edit_table.get(&log_id) {
-            Some(TxLogEdit::Create(_)) | Some(TxLogEdit::Append(_)) => true,
-            None | Some(TxLogEdit::Delete) => false,
-        }
-    }
-
-    pub fn delete_log(&mut self, log_id: TxLogId) {
-        match self.edit_table.get_mut(&log_id) {
-            None => {
-                let _ = self.edit_table.insert(log_id, TxLogEdit::Delete);
-            }
-            Some(TxLogEdit::Create(_)) => {
-                let _ = self.edit_table.insert(log_id, TxLogEdit::Delete);
-            }
-            Some(TxLogEdit::Append(_)) => {
-                panic!(
-                    "append edit is added at very late stage, after which logs won't get deleted"
-                );
-            }
-            Some(TxLogEdit::Delete) => {
-                panic!("can't delete a deleted log");
-            }
-        }
-    }
-
-    pub fn iter_deleted_logs(&self) -> impl Iterator<Item = &TxLogId> {
-        self.edit_table
-            .iter()
-            .filter(|(_, edit)| {
-                if let TxLogEdit::Delete = edit {
-                    true
-                } else {
-                    false
-                }
-            })
-            .map(|(id, _)| id)
-    }
-
-    pub fn iter_created_logs(&self) -> impl Iterator<Item = &TxLogId> {
-        self.edit_table
-            .iter()
-            .filter(|(_, edit)| {
-                if let TxLogEdit::Create(_) = edit {
-                    true
-                } else {
-                    false
-                }
-            })
-            .map(|(id, _)| id)
-    }
-
-    pub fn update_log_meta(&mut self, meta: (TxLogId, RootMhtMeta)) {
-        // For newly-created logs and existing logs
-        // that are appended, update `RootMhtMeta`
-        match self.edit_table.get_mut(&meta.0) {
-            None | Some(TxLogEdit::Delete) => {
-                unreachable!();
-            }
-            Some(TxLogEdit::Create(create)) => {
-                let _ = create.root_mht.insert(meta.1);
-            }
-            Some(TxLogEdit::Append(append)) => {
-                append.root_mht = meta.1;
-            }
         }
     }
 
@@ -1108,6 +1070,92 @@ impl TxLogStoreEdit {
             .edit_table
             .insert(log_id, TxLogEdit::Append(TxLogAppend { root_mht }));
         debug_assert!(already_existed.is_none());
+    }
+
+    pub fn delete_log(&mut self, log_id: TxLogId) {
+        match self.edit_table.get_mut(&log_id) {
+            None => {
+                let _ = self.edit_table.insert(log_id, TxLogEdit::Delete);
+            }
+            Some(TxLogEdit::Create(_)) | Some(TxLogEdit::Move(_)) => {
+                let _ = self.edit_table.insert(log_id, TxLogEdit::Delete);
+            }
+            Some(TxLogEdit::Append(_)) => {
+                panic!(
+                    "append edit is added at very late stage, after which logs won't get deleted"
+                );
+            }
+            Some(TxLogEdit::Delete) => {
+                panic!("can't delete a deleted log");
+            }
+        }
+    }
+
+    pub fn move_log(&mut self, log_id: TxLogId, from_bucket: &str, to_bucket: &str) {
+        let move_edit = TxLogEdit::Move(TxLogMove {
+            from: from_bucket.to_string(),
+            to: to_bucket.to_string(),
+        });
+        let edit_existed = self.edit_table.insert(log_id, move_edit);
+        debug_assert!(edit_existed.is_none());
+    }
+
+    pub fn is_log_created(&self, log_id: TxLogId) -> bool {
+        match self.edit_table.get(&log_id) {
+            Some(TxLogEdit::Create(_)) | Some(TxLogEdit::Append(_)) | Some(TxLogEdit::Move(_)) => {
+                true
+            }
+            None | Some(TxLogEdit::Delete) => false,
+        }
+    }
+
+    pub fn is_log_deleted(&self, log_id: TxLogId) -> bool {
+        match self.edit_table.get(&log_id) {
+            Some(TxLogEdit::Delete) => true,
+            _ => false,
+        }
+    }
+
+    pub fn iter_created_logs(&self) -> impl Iterator<Item = &TxLogId> {
+        self.edit_table
+            .iter()
+            .filter(|(_, edit)| {
+                if let TxLogEdit::Create(_) = edit {
+                    true
+                } else {
+                    false
+                }
+            })
+            .map(|(id, _)| id)
+    }
+
+    pub fn iter_deleted_logs(&self) -> impl Iterator<Item = &TxLogId> {
+        self.edit_table
+            .iter()
+            .filter(|(_, edit)| {
+                if let TxLogEdit::Delete = edit {
+                    true
+                } else {
+                    false
+                }
+            })
+            .map(|(id, _)| id)
+    }
+
+    pub fn update_log_meta(&mut self, meta: (TxLogId, RootMhtMeta)) {
+        // For newly-created logs and existing logs
+        // that are appended, update `RootMhtMeta`
+        match self.edit_table.get_mut(&meta.0) {
+            None | Some(TxLogEdit::Delete) | Some(TxLogEdit::Move(_)) => {
+                unreachable!();
+            }
+            Some(TxLogEdit::Create(create)) => {
+                let _ = create.root_mht.insert(meta.1);
+            }
+            Some(TxLogEdit::Append(append)) => {
+                append.root_mht = meta.1;
+            }
+        }
     }
 }
 
@@ -1130,6 +1178,9 @@ impl Edit<TxLogStoreState> for TxLogStoreEdit {
                 }
                 TxLogEdit::Delete => {
                     state.delete_log(log_id);
+                }
+                TxLogEdit::Move(move_edit) => {
+                    state.move_log(log_id, &move_edit.from, &move_edit.to)
                 }
             }
         }
@@ -1267,7 +1318,7 @@ mod tests {
         // TX 2: open the log then read (committed)
         let mut tx = tx_log_store.new_tx();
         let res: Result<_> = tx.context(|| {
-            let log_list = tx_log_store.list_logs(bucket)?;
+            let log_list = tx_log_store.list_logs_in(bucket)?;
             assert_eq!(log_list, vec![log_id]);
             assert_eq!(tx_log_store.contains_log(log_id), true);
             assert_eq!(tx_log_store.contains_log(1), false);
@@ -1300,7 +1351,7 @@ mod tests {
             let mut tx = tx_log_store.new_tx();
             let res: Result<_> = tx.context(|| {
                 let new_log = tx_log_store.create_log(bucket)?;
-                assert_eq!(tx_log_store.list_logs(bucket)?.len(), 2);
+                assert_eq!(tx_log_store.list_logs_in(bucket)?.len(), 2);
                 Ok(new_log.id())
             });
             tx.abort();
