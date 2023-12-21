@@ -4,6 +4,7 @@ use crate::prelude::*;
 
 use alloc::collections::BTreeMap;
 use core::fmt::Debug;
+use pod::Pod;
 
 /// MemTable for LSM-Tree.
 pub(super) struct MemTable<K, V> {
@@ -25,7 +26,7 @@ pub(super) enum ValueEx<V> {
     SyncedAndUnsynced(V, V),
 }
 
-impl<K: Copy + Ord + Debug, V: Copy> MemTable<K, V> {
+impl<K: Copy + Ord + Debug, V: Pod> MemTable<K, V> {
     pub fn new(
         cap: usize,
         sync_id: u64,
@@ -48,11 +49,11 @@ impl<K: Copy + Ord + Debug, V: Copy> MemTable<K, V> {
 
     pub fn put(&mut self, key: K, value: V) -> Option<V> {
         if let Some(value_ex) = self.table.get_mut(&key) {
-            if let Some(replaced) = value_ex.put(value) {
+            if let Some(dropped) = value_ex.put(value) {
                 self.on_drop_record
                     .as_ref()
-                    .map(|on_drop_record| on_drop_record(&(key, replaced)));
-                return Some(replaced);
+                    .map(|on_drop_record| on_drop_record(&(key, dropped)));
+                return Some(dropped);
             } else {
                 self.size += 1;
                 return None;
@@ -66,10 +67,10 @@ impl<K: Copy + Ord + Debug, V: Copy> MemTable<K, V> {
 
     pub fn sync(&mut self, sync_id: u64) -> Result<()> {
         for (k, v_ex) in &mut self.table {
-            if let Some(replaced) = v_ex.sync() {
+            if let Some(dropped) = v_ex.sync() {
                 self.on_drop_record
                     .as_ref()
-                    .map(|on_drop_record| on_drop_record(&(*k, replaced)));
+                    .map(|on_drop_record| on_drop_record(&(*k, dropped)));
                 self.size -= 1;
             }
         }
@@ -96,40 +97,60 @@ impl<K: Copy + Ord + Debug, V: Copy> MemTable<K, V> {
     }
 }
 
-impl<V: Copy> ValueEx<V> {
+impl<V: Pod> ValueEx<V> {
     fn new(value: V) -> Self {
         Self::Unsynced(value)
     }
 
     fn get(&self) -> &V {
         match self {
-            ValueEx::Synced(v) => v,
-            ValueEx::Unsynced(v) => v,
-            ValueEx::SyncedAndUnsynced(_, v) => v,
+            Self::Synced(v) => v,
+            Self::Unsynced(v) => v,
+            Self::SyncedAndUnsynced(_, v) => v,
         }
     }
 
     fn put(&mut self, value: V) -> Option<V> {
-        // TODO: Optimize this by using `mem::take`
-        let (updated, replaced) = match self {
-            ValueEx::Synced(v) => (Self::SyncedAndUnsynced(*v, value), None),
-            ValueEx::Unsynced(v) => (Self::Unsynced(value), Some(*v)),
-            ValueEx::SyncedAndUnsynced(cv, _ucv) => {
-                (Self::SyncedAndUnsynced(*cv, value), Some(*cv))
+        let existed = core::mem::take(self);
+
+        let dropped = match existed {
+            ValueEx::Synced(v) => {
+                *self = Self::SyncedAndUnsynced(v, value);
+                None
             }
+            ValueEx::Unsynced(v) => {
+                *self = Self::Unsynced(value);
+                Some(v)
+            }
+            ValueEx::SyncedAndUnsynced(sv, usv) => {
+                *self = Self::SyncedAndUnsynced(sv, value);
+                Some(usv)
+            }
+            _ => None,
         };
-        *self = updated;
-        replaced
+        dropped
     }
 
     fn sync(&mut self) -> Option<V> {
-        // TODO: Optimize this by using `mem::take`
-        let (updated, replaced) = match self {
-            ValueEx::Synced(_v) => (None, None),
-            ValueEx::Unsynced(v) => (Some(Self::Synced(*v)), None),
-            ValueEx::SyncedAndUnsynced(cv, ucv) => (Some(Self::Synced(*cv)), Some(*ucv)),
+        let existed = core::mem::take(self);
+
+        let dropped = match existed {
+            ValueEx::Synced(_v) => None,
+            ValueEx::Unsynced(v) => {
+                *self = Self::Synced(v);
+                None
+            }
+            ValueEx::SyncedAndUnsynced(sv, usv) => {
+                *self = Self::Synced(sv);
+                Some(usv)
+            }
         };
-        updated.map(|updated| *self = updated);
-        replaced
+        dropped
+    }
+}
+
+impl<V: Pod> Default for ValueEx<V> {
+    fn default() -> Self {
+        Self::Unsynced(V::new_uninit())
     }
 }

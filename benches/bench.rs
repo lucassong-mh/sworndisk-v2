@@ -5,7 +5,7 @@ use self::consts::*;
 use self::disks::{DiskType, FileAsDisk};
 use self::util::{DisplayData, DisplayThroughput};
 
-use libc::{fsync, ftruncate, open, pread, pwrite, unlink, O_CREAT, O_DIRECT, O_RDWR, O_TRUNC};
+use libc::{fdatasync, ftruncate, open, pread, pwrite, unlink, O_CREAT, O_DIRECT, O_RDWR, O_TRUNC};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -487,7 +487,7 @@ mod disks {
 
         fn flush(&self) -> Result<()> {
             unsafe {
-                let res = fsync(self.fd);
+                let res = fdatasync(self.fd);
                 if res == -1 {
                     return_errno_with_msg!(Errno::IoFailed, "file sync failed");
                 }
