@@ -1,5 +1,4 @@
 //! Block allocation.
-
 use super::sworndisk::Hba;
 use crate::layers::bio::{BlockSet, Buf, BufRef, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogStore};
@@ -68,13 +67,7 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
     pub fn prepare_diff_log(&self) -> Result<()> {
-        // let diff_log_res = self.store.open_log_in(BUCKET_BLOCK_ALLOC_LOG, true);
-        // if let Err(e) = &diff_log_res && e.errno() == NotFound {
-        //     let diff_log = self.store.create_log(BUCKET_BLOCK_ALLOC_LOG)?;
-        //     let _ = self.diff_log.lock().insert(diff_log.clone());
-        //     return Ok(());
-        // }
-        // diff_log_res
+        // Do nothing for now
         Ok(())
     }
 
@@ -124,26 +117,8 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
         drop(bitmap);
     }
 
-    // /// Checkpoint to seal a bitmap log snapshot, diff logs before
-    // /// checkpoint can be deleted.
-    // ///
-    // /// # Panics
-    // ///
-    // /// This method must be called within a TX. Otherwise, this method panics.
-    // // TODO: Use snapshot diff log instead bitmap log
-    // fn checkpoint(&self, diff_log: Arc<TxLog>, bitmap_log: Arc<TxLog<D>>) -> Result<()> {
-    //     let inner = self.inner.lock();
-    //     bitmap_log.append(inner.validity_bitmap.to_bytes())?;
-    //     diff_log.append(AllocDiffRecord::Checkpoint)
-    // }
-
-    fn recover(store: Arc<TxLogStore<D>>) -> Result<Self> {
-        // Open the latest bitmap log, apply each `AllocDiffRecord::Diff` after the newest `AllocDiffRecord::Checkpoint` to the bitmap
-        todo!()
-    }
-
     fn do_compaction(&self) {
-        // Open the diff log, Migrate `AllocDiffRecord::Diff`s after newest `AllocDiffRecord::Checkpoint` to a new log, delete the old one
+        // Seal the bitmap log snapshot to log `BVT`, discard all diff logs (`BAL``)
         todo!()
     }
 }
@@ -156,6 +131,8 @@ impl AllocBitmap {
         }
     }
 
+    // Open and recover the latest `BVT` log, apply `AllocDiff`s in `BAL` logs to the bitmap.
+    // TODO: Refine the recovery process
     pub fn recover<D: BlockSet + 'static>(&self, store: &Arc<TxLogStore<D>>) -> Result<()> {
         let mut tx = store.new_tx();
         let res: Result<_> = tx.context(|| {

@@ -1,6 +1,6 @@
 //! SwornDisk as a block device.
 //!
-//! API: read(), write(), flush(), flush_blocks(), discard(), total_blocks(), open(), create()
+//! API: read(), write(), sync(), create(), open()
 //!
 //! Responsible for managing a `TxLsmTree`, an untrusted disk
 //! storing user data, a `BlockAlloc` for managing data block
@@ -26,17 +26,19 @@ pub type Hba = BlockId;
 
 /// SwornDisk.
 pub struct SwornDisk<D: BlockSet> {
-    tx_lsm_tree: TxLsmTree<RecordKey, RecordValue, D>,
+    logical_block_table: TxLsmTree<RecordKey, RecordValue, D>,
     user_data_disk: D,
     block_validity_bitmap: Arc<AllocBitmap>,
     data_buf: DataBuf,
     root_key: Key,
 }
 
+// TODO: Support queue-based API
 impl<D: BlockSet + 'static> SwornDisk<D> {
     const BUF_CAP: usize = 1024;
 
     /// Read a specified number of block contents at a logical block address on the device.
+    // TODO: Support range query
     pub fn read(&self, mut lba: Lba, mut buf: BufMut) -> Result<usize> {
         let mut iter_mut = buf.iter_mut();
         while let Some(block_buf) = iter_mut.next() {
@@ -54,7 +56,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
         let timer = LatencyMetrics::start_timer(ReqType::Read, "lsmtree", "");
 
-        let record = self.tx_lsm_tree.get(&RecordKey { lba })?;
+        let record = self.logical_block_table.get(&RecordKey { lba })?;
 
         LatencyMetrics::stop_timer(timer);
 
@@ -110,7 +112,8 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
             let timer = LatencyMetrics::start_timer(ReqType::Write, "lsmtree", "");
 
-            self.tx_lsm_tree.put(lba, RecordValue { hba, key, mac })?;
+            self.logical_block_table
+                .put(lba, RecordValue { hba, key, mac })?;
 
             LatencyMetrics::stop_timer(timer);
         }
@@ -123,7 +126,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     pub fn sync(&self) -> Result<()> {
         let timer = LatencyMetrics::start_timer(ReqType::Sync, "lsmtree", "");
 
-        self.tx_lsm_tree.sync()?;
+        self.logical_block_table.sync()?;
 
         LatencyMetrics::stop_timer(timer);
 
@@ -149,7 +152,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     /// Create the device on a disk, given the root cryption key.
     pub fn create(disk: D, root_key: Key) -> Result<Self> {
         let data_disk = Self::subdisk_for_data(&disk)?;
-        let lsm_tree_disk = Self::subdisk_for_tx_lsm_tree(&disk)?;
+        let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
         let tx_log_store = Arc::new(TxLogStore::format(lsm_tree_disk)?);
         let block_validity_bitmap = Arc::new(AllocBitmap::new(data_disk.nblocks()));
@@ -163,14 +166,14 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             // Dealloc block
             bitmap.set_deallocated(record.value().hba);
         };
-        let tx_lsm_tree = TxLsmTree::format(
+        let logical_block_table = TxLsmTree::format(
             tx_log_store,
             listener_factory,
             Some(Arc::new(on_drop_record_in_memtable)),
         )?;
 
         Ok(Self {
-            tx_lsm_tree,
+            logical_block_table,
             user_data_disk: data_disk,
             block_validity_bitmap,
             data_buf: DataBuf::new(),
@@ -181,7 +184,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     /// Open the device on a disk, given the root cryption key.
     pub fn open(disk: D, root_key: Key) -> Result<Self> {
         let data_disk = Self::subdisk_for_data(&disk)?;
-        let index_disk = Self::subdisk_for_tx_lsm_tree(&disk)?;
+        let index_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
         let tx_log_store = Arc::new(TxLogStore::recover(index_disk, root_key)?);
         let block_validity_bitmap = Arc::new(AllocBitmap::new(data_disk.nblocks()));
@@ -196,14 +199,14 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             // Dealloc block
             bitmap.set_deallocated(record.value().hba);
         };
-        let tx_lsm_tree = TxLsmTree::recover(
+        let logical_block_table = TxLsmTree::recover(
             tx_log_store,
             listener_factory,
             Some(Arc::new(on_drop_record_in_memtable)),
         )?;
 
         Ok(Self {
-            tx_lsm_tree,
+            logical_block_table,
             user_data_disk: data_disk,
             block_validity_bitmap,
             data_buf: DataBuf::new(),
@@ -215,7 +218,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         disk.subset(0..disk.nblocks() / 10 * 5) // TBD
     }
 
-    fn subdisk_for_tx_lsm_tree(disk: &D) -> Result<D> {
+    fn subdisk_for_logical_block_table(disk: &D) -> Result<D> {
         disk.subset(disk.nblocks() / 10 * 5..disk.nblocks()) // TBD
     }
 }
@@ -424,6 +427,7 @@ mod tests {
             assert_eq!(rw_buf.as_slice()[0], i as u8);
         }
 
+        // TODO: Test `open()`
         Ok(())
     }
 }

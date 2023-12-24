@@ -1,28 +1,53 @@
-//! System metrics.
+//! System metrics. (Only available in `std`)
+//!
+//! Measures breakdown latencies and amplifications of the system.
+//!
+//! # Usage Example
+//!
+//! Measure latency of a function.
+//!
+//! ```
+//! fn write_something() {
+//!     /* omitted */
+//! }
+//!
+//! int main() {
+//!     let timer = LatencyMetrics::start_timer(ReqType::Write, "write_something", "write_anything");
+//!     write_something();
+//!     LatencyMetrics::stop_timer(timer);
+//!
+//!     Metrics::display();
+//! }
+//! ```
+use crate::os::RwLock;
 use hashbrown::HashMap;
 use lazy_static::lazy_static;
-use spin::RwLock;
 use std::time::{Duration, Instant};
 
 lazy_static! {
     static ref METRICS: RwLock<Metrics> = RwLock::new(Metrics::new(true));
 }
 
+/// System metrics.
+/// It measures latency and amplification information.
 pub struct Metrics {
     enable: bool,
     pub latency: LatencyMetrics,
     pub amplification: AmplificationMetrics,
 }
 
+/// Maintains latency information for each request type.
 pub struct LatencyMetrics {
     table: HashMap<ReqType, ReqLatency>,
 }
 
+/// Maintains all latency information (in a parent-child manner).
 pub struct ReqLatency {
     table: HashMap<String, Latency>,
     total: Duration,
 }
 
+/// Latency information of one category.
 pub struct Latency {
     category: String,
     parent_category: String,
@@ -30,6 +55,7 @@ pub struct Latency {
     level: u8,
 }
 
+/// Three request types for measuring latency.
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum ReqType {
     Write,
@@ -37,10 +63,12 @@ pub enum ReqType {
     Sync,
 }
 
+/// Maintains amplification information for each type.
 pub struct AmplificationMetrics {
     table: HashMap<AmpType, Amplification>,
 }
 
+/// One specific amplification.
 #[derive(Default, Debug)]
 pub struct Amplification {
     pub data: usize,
@@ -49,6 +77,7 @@ pub struct Amplification {
     pub total: usize,
 }
 
+/// Three amplification types.
 #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum AmpType {
     Write,
@@ -56,6 +85,7 @@ pub enum AmpType {
     Space,
 }
 
+/// A tik-tok timer for measuring latency once.
 pub struct Timer {
     start: Instant,
     req_type: ReqType,

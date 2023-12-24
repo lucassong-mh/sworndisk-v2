@@ -1,3 +1,9 @@
+//! Benchmarks of the system.
+//!
+//! Supports sequential/random write/read workloads.
+//! Write/read amount, concurrency and I/O buffer size are configurable.
+//! Provides a baseline named `EncDisk`, which simply protects data using authenticated encryption.
+//! Results are displayed as throughput in MiB/sec.
 use sworndisk_v2::*;
 
 use self::benches::{Bench, BenchBuilder, IoPattern, IoType};

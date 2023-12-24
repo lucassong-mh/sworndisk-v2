@@ -1,6 +1,6 @@
 //! Transactional LSM-Tree.
 //!
-//! API: format(), recover(), get(), put(), get_range(), put_range(), sync(), discard()
+//! API: `format()`, `recover()`, `get()`, `put()`, `get_range()`, `sync()`
 //!
 //! Responsible for managing two `MemTable`s, a `TxLogStore` to
 //! manage TX logs (WAL and SSTs). Operations are executed based
@@ -30,6 +30,9 @@ static MASTER_SYNC_ID: AtomicU64 = AtomicU64::new(0);
 const ENABLE_DEBUG: bool = false;
 
 /// A LSM-Tree built upon `TxLogStore`.
+///
+/// It supports inseting and querying key-value records within transactions.
+/// It supports user-defined callback in MemTable, during compaction and recovery.
 pub struct TxLsmTree<K, V, D>(Arc<TxLsmTreeInner<K, V, D>>)
 where
     D: BlockSet;
@@ -67,7 +70,6 @@ pub enum LsmLevel {
 
 /// SST manager of the `TxLsmTree`,
 /// cache SST's index blocks of every level in memory.
-// FIXME: Should changes support abort?
 #[derive(Debug)]
 struct SstManager<K, V> {
     level_ssts: Vec<BTreeMap<TxLogId, Arc<SSTable<K, V>>>>,
@@ -212,6 +214,7 @@ impl<K: Ord + Pod + Hash + Debug + 'static, V: Pod + Debug + 'static, D: BlockSe
         });
 
         handle.join().unwrap()?;
+        // FIXME: Fix data race in asynchronous compaction
         // self.0.compactor.handle.lock().insert(handle);
         Ok(())
     }
@@ -321,6 +324,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
         Ok(recov_self)
     }
 
+    /// Gets a target value given a key.
     pub fn get(&self, key: &K) -> Result<V> {
         // 1. Search from MemTables
         if let Some(value) = self.memtable_manager.get(key) {
@@ -336,44 +340,10 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
         Ok(value)
     }
 
+    // TODO: Support range query
     pub fn get_range(&self, range: &Range<K>) -> Vec<V> {
         todo!()
     }
-
-    // pub fn put(&self, key: K, value: V) -> Result<()> {
-    //     let record = (key, value);
-    //     let timer = LatencyMetrics::start_timer(ReqType::Write, "wal", "lsmtree");
-
-    //     // 1. Write WAL
-    //     self.wal_append_tx.append(&record)?;
-
-    //     // 2. Put into MemTable
-    //     let at_capacity = self.memtable_manager.put(key, value);
-    //     if !at_capacity {
-    //         LatencyMetrics::stop_timer(timer);
-    //         return Ok(());
-    //     }
-
-    //     // TODO: Think of combining WAL's TX with minor compaction TX?
-    //     self.wal_append_tx.commit()?;
-
-    //     self.compactor.wait_compaction()?;
-
-    //     LatencyMetrics::stop_timer(timer);
-
-    //     // 3. Trigger compaction when MemTable is at capacity
-    //     self.memtable_manager.switch();
-
-    //     self.do_compaction_tx()?;
-
-    //     // Discard current WAL
-    //     self.wal_append_tx.discard()?;
-
-    //     Ok(())
-    // }
-
-    // FIXME: Do we actually need this API?
-    // pub fn put_range(&self, range: &Range<K>) -> Result<()> {}
 
     /// Persist all in-memory data of `TxLsmTree`.
     pub fn sync(&self) -> Result<()> {
@@ -582,34 +552,6 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
                 records_vec
             };
 
-            // // Collect and sort records during compaction
-            // let compacted_records = {
-            //     if !lower_records_vec.is_empty() {
-            //         let (compacted_records, dropped_records) = Compactor::compact_records(
-            //             upper_records.into_iter(),
-            //             lower_records_vec
-            //                 .into_iter()
-            //                 .flat_map(|records| records.into_iter()),
-            //         );
-            //         Compactor::on_drop_records(&listener, dropped_records.into_iter())?;
-            //         compacted_records
-            //     } else {
-            //         upper_records
-            //     }
-            // };
-            // debug_assert!(compacted_records.is_sorted_by_key(|(k, _)| k));
-
-            // // Create new SSTs
-            // for records in compacted_records.chunks(Self::SSTABLE_CAPACITY) {
-            //     let new_log = tx_log_store.create_log(to_level.bucket())?;
-            //     let new_sst = SSTable::build(
-            //         records.iter().map(|(k, v)| (k, v)),
-            //         master_sync_id,
-            //         &new_log,
-            //     )?;
-            //     created_ssts.push((new_sst, to_level));
-            // }
-
             let new_ssts = Self::compact_records_and_build_ssts(
                 upper_records.into_iter(),
                 lower_records_vec
@@ -673,6 +615,8 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
         Ok(())
     }
 
+    // Core function for compacting records and building SSTs. (Need continuously optimization)
+    // TODO: Refactor this using `itertools::kmerge()`
     fn compact_records_and_build_ssts(
         upper_records: impl Iterator<Item = (K, ValueEx<V>)>,
         lower_records: impl Iterator<Item = (K, ValueEx<V>)>,
@@ -891,6 +835,7 @@ impl From<u8> for LsmLevel {
     }
 }
 
+// FIXME: Should changes support abort?
 impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SstManager<K, V> {
     const MAX_NUM_LEVELS: usize = 6;
 
@@ -1004,6 +949,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> Debug for MemTableManager<K, V
     }
 }
 
+/// A `Compactor`` is used for asynchronous compaction of `TxLsmTree`.
 struct Compactor {
     handle: Mutex<Option<JoinHandle<Result<()>>>>,
 }
@@ -1044,6 +990,7 @@ impl<K, V> AsKv<K, V> for (&K, &V) {
     }
 }
 
+// Safety.
 unsafe impl<K, V, D: BlockSet> Send for TxLsmTreeInner<K, V, D> {}
 unsafe impl<K, V, D: BlockSet> Sync for TxLsmTreeInner<K, V, D> {}
 
@@ -1092,6 +1039,7 @@ mod tests {
         let tx_lsm_tree: TxLsmTree<BlockId, RecordValue, MemDisk> =
             TxLsmTree::format(tx_log_store.clone(), Arc::new(Factory), None)?;
 
+        // Put sufficient records which can trigger compaction before a sync command
         let cap = TxLsmTreeInner::<BlockId, RecordValue, MemDisk>::MEMTABLE_CAPACITY;
         let start = 0;
         for i in start..start + cap {
@@ -1113,6 +1061,7 @@ mod tests {
         let target_value = tx_lsm_tree.get(&1000).unwrap();
         assert_eq!(target_value.hba, 1000);
 
+        // Put sufficient records which can trigger compaction after a sync command
         let start = 500;
         for i in start..start + cap {
             let (k, v) = (
@@ -1149,6 +1098,7 @@ mod tests {
         let target_value = tx_lsm_tree.get(&25).unwrap();
         assert_eq!(target_value.hba, 25);
 
+        // Recover the `TxLsmTree`, all unsynced records should be discarded
         drop(tx_lsm_tree);
         let tx_lsm_tree: TxLsmTree<BlockId, RecordValue, MemDisk> =
             TxLsmTree::recover(tx_log_store.clone(), Arc::new(Factory), None)?;

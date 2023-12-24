@@ -1023,7 +1023,6 @@ pub(super) enum TxLogEdit {
     Delete,
     Move(TxLogMove),
 }
-// TODO: Add a `TxLogEdit::Move` for moving a log from one bucket to another.
 
 /// An edit that implies a log being created.
 #[derive(Clone, Serialize, Deserialize)]

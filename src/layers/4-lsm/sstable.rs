@@ -1,9 +1,9 @@
 //! Sorted String Table.
 use super::mem_table::ValueEx;
-use crate::layers::bio::{BlockSet, Buf, BufMut, BID_SIZE};
+use crate::layers::bio::{BlockSet, Buf, BufMut, BufRef, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogId, TxLogStore};
 use crate::os::RwLock;
-use crate::{prelude::*, BufRef};
+use crate::prelude::*;
 
 use core::fmt::{self, Debug};
 use core::hash::Hash;
@@ -16,19 +16,13 @@ use pod::Pod;
 
 /// Sorted String Table (SST) for LSM-Tree
 ///
-/// format:
-/// ```text
-/// |   [record]    |   [record]    |...|         Footer            |
-/// |K|flag|V(V)|...|   [record]    |...| [IndexEntry] | FooterMeta |
-/// |  BLOCK_SIZE   |  BLOCK_SIZE   |...|                           |
-/// ```
-///
-// TODO: Use Iterator for range search and support variable records block size.
+/// It's responsible for storing, managing key-value records on a `TxLog` (L3).
+/// Records are serialized, sorted, organized on `TxLog`.
+/// API: `build()`, `search()`, `range_search()`
 pub(super) struct SSTable<K, V> {
-    // Cache log id, and footer blocks
     id: TxLogId,
     footer: Footer<K>,
-    cache: RwLock<LruCache<BlockId, Arc<RecordBlock>>>, // TODO: Refactor this cache
+    cache: RwLock<LruCache<BlockId, Arc<RecordBlock>>>,
     phantom: PhantomData<(K, V)>,
 }
 
@@ -77,13 +71,20 @@ struct RecordBlockIter<'a, K, V> {
     phantom: PhantomData<(K, V)>,
 }
 
+/// Format in `TxLog`:
+/// ```text
+/// |   [record]    |   [record]    |...|         Footer            |
+/// |K|flag|V(V)|...|   [record]    |...| [IndexEntry] | FooterMeta |
+/// |  BLOCK_SIZE   |  BLOCK_SIZE   |...|                           |
+/// ```
+// TODO: Continuously optimize `search()` & `build()`
+// TODO: Support range query
 impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
     const K_SIZE: usize = size_of::<K>();
     const V_SIZE: usize = size_of::<V>();
     const MAX_RECORD_SIZE: usize = BID_SIZE + 1 + 2 * Self::V_SIZE;
     const INDEX_ENTRY_SIZE: usize = BID_SIZE + 2 * Self::K_SIZE;
     const CACHE_CAP: usize = 1024;
-    // TODO: Optimize search&build
 
     pub fn id(&self) -> TxLogId {
         self.id

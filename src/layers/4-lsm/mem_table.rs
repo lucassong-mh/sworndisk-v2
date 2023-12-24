@@ -7,6 +7,10 @@ use core::fmt::Debug;
 use pod::Pod;
 
 /// MemTable for LSM-Tree.
+///
+/// It manages a bunch of key-value records in memory, given a capacity.
+/// Both synced and unsynced records can co-exist.
+/// It supports user-defined callback when a record is dropped.
 pub(super) struct MemTable<K, V> {
     // Use `ValueEx<V>` instead `V` to maintain multiple
     // values tagged with sync id for each key

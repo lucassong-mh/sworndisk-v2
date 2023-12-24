@@ -1,10 +1,10 @@
 //! Write Ahead Log.
 use super::AsKv;
-use crate::layers::bio::{BlockId, BlockSet, Buf};
+use crate::layers::bio::{BlockId, BlockSet, Buf, BufRef};
 use crate::layers::log::{TxLog, TxLogId, TxLogStore};
 use crate::os::Mutex;
+use crate::prelude::*;
 use crate::tx::Tx;
-use crate::{prelude::*, BufRef};
 
 use core::cell::{RefCell, RefMut};
 use core::fmt::Debug;
@@ -14,6 +14,10 @@ use pod::Pod;
 pub(super) const BUCKET_WAL: &str = "WAL";
 
 /// WAL append TX in `TxLsmTree`.
+///
+/// A `WalAppendTx` is used to append, sync and discard WALs.
+/// A WAL is storing, managing key-value records which are puted in `MemTable`,
+/// and its backed by `TxLog` (L3).
 #[derive(Clone)]
 pub(super) struct WalAppendTx<D>
 where
