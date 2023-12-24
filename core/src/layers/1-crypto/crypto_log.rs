@@ -100,7 +100,7 @@ struct MhtStorage<L> {
 }
 
 /// The metadata of the root MHT node of a `CryptoLog`.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RootMhtMeta {
     pub pos: Pbid,
     pub mac: Mac,
@@ -427,7 +427,9 @@ impl<L: BlockLog> Mht<L> {
     pub fn flush(&mut self) -> Result<()> {
         let data_node_entries = self.data_buf.flush()?;
         self.do_build(data_node_entries)?;
-        self.storage.flush()
+        // FIXME: Should we sync the storage here?
+        // self.storage.flush()?;
+        Ok(())
     }
 
     fn do_build(&mut self, data_node_entries: Vec<MhtNodeEntry>) -> Result<()> {
@@ -505,6 +507,10 @@ impl<L: BlockLog> MhtStorage<L> {
     fn append_data_nodes(&self, nodes: &[Arc<DataNode>]) -> Result<Vec<MhtNodeEntry>> {
         let num_append = nodes.len();
         let mut node_entries = Vec::with_capacity(num_append);
+        if num_append == 0 {
+            return Ok(node_entries);
+        }
+
         let mut cipher_buf = Buf::alloc(num_append)?;
         let mut pos = self.block_log.nblocks() as BlockId;
         let start_pos = pos;
@@ -735,7 +741,7 @@ impl LevelBuilder {
     }
 
     // Building last MHT node of the level can be complicated, since
-    // the last node may be incompelte
+    // the last node may be incomplete
     fn build_last_node(&self, entries: &[&MhtNodeEntry]) -> Arc<MhtNode> {
         let num_data_nodes = {
             let max_data_nodes = MhtNode::max_num_data_nodes(self.height);
@@ -990,6 +996,7 @@ impl<L: BlockLog> Debug for Mht<L> {
             .field("root_meta", &self.root_meta())
             .field("root_node", &self.root_node())
             .field("root_key", &self.root_key)
+            .field("total_data_nodes", &self.total_data_nodes())
             .field("buffered_data_nodes", &self.data_buf.num_append())
             .finish()
     }

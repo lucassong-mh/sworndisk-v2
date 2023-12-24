@@ -148,6 +148,13 @@ impl BitMap {
             .map(|index| first_u64_index * 64 + (index as usize))
             .find(|&index| index >= from && index < self.len())
     }
+
+    /// Find the index of the last zero bit (inclusively).
+    ///
+    /// Return `None` if no zero bit is found.
+    pub fn last_zero(&self) -> Option<usize> {
+        self.bits.iter_zeros().last().map(|index| index as usize)
+    }
 }
 
 impl Index<usize> for BitMap {

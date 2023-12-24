@@ -90,6 +90,7 @@ use crate::prelude::*;
 use crate::tx::{CurrentTx, Tx, TxData, TxProvider};
 use crate::util::LazyDelete;
 
+use core::fmt::{self, Debug};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
 
@@ -147,27 +148,18 @@ impl<D: BlockSet> RawLogStore<D> {
             let chunk_alloc = new_self.chunk_alloc.clone();
 
             move |current: CurrentTx<'_>| {
-                Self::do_lazy_deletion(&state, &current);
-
                 current.data_with(|edit: &RawLogStoreEdit| {
+                    if edit.edit_table.is_empty() {
+                        return;
+                    }
+
                     let mut state = state.lock();
                     state.apply(&edit);
 
-                    // Add lazy delete for newly created logs
-                    for log_id in edit.iter_created_logs() {
-                        let log_entry_opt = state.persistent.find_log(log_id);
-                        if log_entry_opt.is_none() || state.lazy_deletes.contains_key(&log_id) {
-                            continue;
-                        }
-
-                        Self::add_lazy_delete(
-                            log_id,
-                            log_entry_opt.as_ref().unwrap(),
-                            &chunk_alloc,
-                            &mut state.lazy_deletes,
-                        );
-                    }
+                    Self::add_lazy_deletes_for_created_logs(&mut state, edit, &chunk_alloc);
                 });
+                let mut state = state.lock();
+                Self::do_lazy_deletion(&mut state, &current);
             }
         });
 
@@ -190,12 +182,32 @@ impl<D: BlockSet> RawLogStore<D> {
         );
     }
 
-    fn do_lazy_deletion(state: &Arc<Mutex<State>>, current_tx: &CurrentTx) {
+    fn add_lazy_deletes_for_created_logs(
+        state: &mut State,
+        edit: &RawLogStoreEdit,
+        chunk_alloc: &ChunkAlloc,
+    ) {
+        for log_id in edit.iter_created_logs() {
+            let log_entry_opt = state.persistent.find_log(log_id);
+            if log_entry_opt.is_none() || state.lazy_deletes.contains_key(&log_id) {
+                continue;
+            }
+
+            Self::add_lazy_delete(
+                log_id,
+                log_entry_opt.as_ref().unwrap(),
+                chunk_alloc,
+                &mut state.lazy_deletes,
+            )
+        }
+    }
+
+    fn do_lazy_deletion(state: &mut State, current_tx: &CurrentTx) {
         let deleted_logs = current_tx
             .data_with(|edit: &RawLogStoreEdit| edit.iter_deleted_logs().collect::<Vec<_>>());
 
         for log_id in deleted_logs {
-            let Some(lazy_delete) = state.lock().lazy_deletes.remove(&log_id) else {
+            let Some(lazy_delete) = state.lazy_deletes.remove(&log_id) else {
                 // Other concurrent TXs have deleted the same log
                 continue;
             };
@@ -205,6 +217,10 @@ impl<D: BlockSet> RawLogStore<D> {
 
     pub fn new_tx(&self) -> Tx {
         self.tx_provider.new_tx()
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        self.disk.flush()
     }
 
     /// Creates a new raw log with a new log id.
@@ -251,10 +267,9 @@ impl<D: BlockSet> RawLogStore<D> {
 
         let log_entry_opt = state.persistent.find_log(log_id);
         // The log is already created by other TX
-        if log_entry_opt.is_some() {
-            let log_entry = log_entry_opt.as_ref().unwrap();
+        if let Some(log_entry) = log_entry_opt.as_ref() {
             if can_append {
-                // Prevent other TX from opening this log in the append mode.
+                // Prevent other TX from opening this log in the append mode
                 state.add_to_write_set(log_id)?;
 
                 // If the log is open in the append mode, edit must be prepared
@@ -305,6 +320,24 @@ impl<D: BlockSet> RawLogStore<D> {
         Ok(())
     }
 }
+
+impl<D> Debug for RawLogStore<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.state.lock();
+        f.debug_struct("RawLogStore")
+            .field("persistent_log_table", &state.persistent.log_table)
+            .field(
+                "persistent_next_free_log_id",
+                &state.persistent.next_free_log_id,
+            )
+            .field("write_set", &state.write_set)
+            .field("chunk_alloc", &self.chunk_alloc)
+            .finish()
+    }
+}
+
+unsafe impl<D> Send for RawLogStore<D> {}
+unsafe impl<D> Sync for RawLogStore<D> {}
 
 /// A raw(untrusted) log.
 pub struct RawLog<D> {
@@ -358,7 +391,9 @@ impl<D: BlockSet> BlockLog for RawLog<D> {
     }
 
     fn flush(&self) -> Result<()> {
-        self.log_store.disk.flush()
+        // FIXME: Should we sync the disk here?
+        self.log_store.disk.flush()?;
+        Ok(())
     }
 
     /// # Panics
@@ -425,6 +460,17 @@ impl<D> Drop for RawLog<D> {
     }
 }
 
+impl<D> Debug for RawLog<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawLog")
+            .field("log_id", &self.log_id)
+            .field("log_entry", &self.log_entry)
+            .field("append_pos", &self.append_pos)
+            .field("can_append", &self.can_append)
+            .finish()
+    }
+}
+
 impl<'a, D: BlockSet> RawLogRef<'a, D> {
     pub fn read(&self, mut pos: BlockId, mut buf: BufMut) -> Result<()> {
         let mut nblocks = buf.nblocks();
@@ -441,7 +487,9 @@ impl<'a, D: BlockSet> RawLogRef<'a, D> {
         let disk = &self.log_store.disk;
         // Read from the head if possible and necessary
         let head_opt = &self.log_head;
-        if let Some(head) = head_opt && pos < head_len {
+        if let Some(head) = head_opt
+            && pos < head_len
+        {
             let num_read = nblocks.min(head_len - pos);
 
             let read_buf = BufMut::try_from(&mut buf_slice[..num_read * BLOCK_SIZE])?;
@@ -454,7 +502,9 @@ impl<'a, D: BlockSet> RawLogRef<'a, D> {
 
         // Read from the tail if possible and necessary
         let tail_opt = &self.log_tail;
-        if let Some(tail) = tail_opt && pos >= head_len {
+        if let Some(tail) = tail_opt
+            && pos >= head_len
+        {
             let num_read = nblocks.min(total_len - pos);
             let read_buf = BufMut::try_from(&mut buf_slice[..num_read * BLOCK_SIZE])?;
 
@@ -691,9 +741,6 @@ impl<'a> RawLogTailRef<'a> {
     }
 }
 
-unsafe impl<D> Send for RawLogStore<D> {}
-unsafe impl<D> Sync for RawLogStore<D> {}
-
 ////////////////////////////////////////////////////////////////////////////////
 // Persistent State
 ////////////////////////////////////////////////////////////////////////////////
@@ -817,13 +864,13 @@ impl RawLogHead {
 ////////////////////////////////////////////////////////////////////////////////
 
 /// A persistent edit to the state of `RawLogStore`.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RawLogStoreEdit {
     edit_table: HashMap<RawLogId, RawLogEdit>,
 }
 
 /// The basic unit of a persistent edit to the state of `RawLogStore`.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) enum RawLogEdit {
     Create(RawLogCreate),
     Append(RawLogAppend),
@@ -831,19 +878,19 @@ pub(super) enum RawLogEdit {
 }
 
 /// An edit that implies a log being created.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct RawLogCreate {
     tail: RawLogTail,
 }
 
 /// An edit that implies an existing log being appended.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct RawLogAppend {
     tail: RawLogTail,
 }
 
 /// A log tail contains chunk metadata of a log's TX-ongoing data.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct RawLogTail {
     // The last chunk of the head. If it is partially filled
     // (head_last_chunk_free_blocks > 0), then the tail should write to the
@@ -944,6 +991,10 @@ impl RawLogStoreEdit {
                 }
             })
             .map(|(id, _)| *id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.edit_table.is_empty()
     }
 }
 
