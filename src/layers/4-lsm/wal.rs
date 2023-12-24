@@ -14,11 +14,12 @@ use pod::Pod;
 pub(super) const BUCKET_WAL: &str = "WAL";
 
 /// WAL append TX in `TxLsmTree`.
+#[derive(Clone)]
 pub(super) struct WalAppendTx<D>
 where
     D: BlockSet,
 {
-    inner: Mutex<WalAppendTxInner<D>>,
+    inner: Arc<Mutex<WalAppendTxInner<D>>>,
 }
 
 struct WalAppendTxInner<D> {
@@ -39,12 +40,12 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
 
     pub fn new(store: &Arc<TxLogStore<D>>) -> Self {
         Self {
-            inner: Mutex::new(WalAppendTxInner {
+            inner: Arc::new(Mutex::new(WalAppendTxInner {
                 wal_tx_and_log: None,
                 log_id: None,
                 record_buf: Vec::with_capacity(Self::BUF_CAP),
                 tx_log_store: store.clone(),
-            }),
+            })),
         }
     }
 

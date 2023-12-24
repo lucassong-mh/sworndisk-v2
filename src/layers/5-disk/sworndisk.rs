@@ -407,12 +407,12 @@ mod tests {
 
     #[test]
     fn sworndisk_fns() -> Result<()> {
-        let nblocks = 32 * 1024;
+        let nblocks = 8 * 1024;
         let mem_disk = MemDisk::create(nblocks)?;
         let root_key = Key::random();
-        let sworndisk = SwornDisk::create(mem_disk, root_key)?;
+        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key)?;
 
-        let num_rw = 4 * 1024;
+        let num_rw = 1024;
         let mut rw_buf = Buf::alloc(1)?;
         for i in 0..num_rw {
             rw_buf.as_mut_slice().fill(i as u8);

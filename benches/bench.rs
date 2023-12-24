@@ -12,7 +12,7 @@ use std::time::Instant;
 pub(crate) type Result<T> = core::result::Result<T, Error>;
 
 fn main() {
-    let total_bytes = 10 * GiB;
+    let total_bytes = 4 * GiB;
     // Specify all benchmarks
     let benches = vec![
         BenchBuilder::new("SwornDisk::write_seq")
@@ -31,22 +31,22 @@ fn main() {
             .concurrency(1)
             .build()
             .unwrap(),
-        // BenchBuilder::new("SwornDisk::read_seq")
-        //     .disk_type(DiskType::SwornDisk)
-        //     .io_type(IoType::Read)
-        //     .io_pattern(IoPattern::Seq)
-        //     .total_bytes(total_bytes)
-        //     .concurrency(1)
-        //     .build()
-        //     .unwrap(),
-        // BenchBuilder::new("SwornDisk::read_rnd")
-        //     .disk_type(DiskType::SwornDisk)
-        //     .io_type(IoType::Read)
-        //     .io_pattern(IoPattern::Rnd)
-        //     .total_bytes(total_bytes)
-        //     .concurrency(1)
-        //     .build()
-        //     .unwrap(),
+        BenchBuilder::new("SwornDisk::read_seq")
+            .disk_type(DiskType::SwornDisk)
+            .io_type(IoType::Read)
+            .io_pattern(IoPattern::Seq)
+            .total_bytes(total_bytes)
+            .concurrency(1)
+            .build()
+            .unwrap(),
+        BenchBuilder::new("SwornDisk::read_rnd")
+            .disk_type(DiskType::SwornDisk)
+            .io_type(IoType::Read)
+            .io_pattern(IoPattern::Rnd)
+            .total_bytes(total_bytes)
+            .concurrency(1)
+            .build()
+            .unwrap(),
         BenchBuilder::new("EncDisk::write_seq")
             .disk_type(DiskType::EncDisk)
             .io_type(IoType::Write)
@@ -63,22 +63,22 @@ fn main() {
             .concurrency(1)
             .build()
             .unwrap(),
-        // BenchBuilder::new("EncDisk::read_seq")
-        //     .disk_type(DiskType::EncDisk)
-        //     .io_type(IoType::Read)
-        //     .io_pattern(IoPattern::Seq)
-        //     .total_bytes(total_bytes)
-        //     .concurrency(1)
-        //     .build()
-        //     .unwrap(),
-        // BenchBuilder::new("EncDisk::read_rnd")
-        //     .disk_type(DiskType::EncDisk)
-        //     .io_type(IoType::Read)
-        //     .io_pattern(IoPattern::Rnd)
-        //     .total_bytes(total_bytes)
-        //     .concurrency(1)
-        //     .build()
-        //     .unwrap(),
+        BenchBuilder::new("EncDisk::read_seq")
+            .disk_type(DiskType::EncDisk)
+            .io_type(IoType::Read)
+            .io_pattern(IoPattern::Seq)
+            .total_bytes(total_bytes)
+            .concurrency(1)
+            .build()
+            .unwrap(),
+        BenchBuilder::new("EncDisk::read_rnd")
+            .disk_type(DiskType::EncDisk)
+            .io_type(IoType::Read)
+            .io_pattern(IoPattern::Rnd)
+            .total_bytes(total_bytes)
+            .concurrency(1)
+            .build()
+            .unwrap(),
     ];
 
     // Run all benchmarks and output the results
@@ -406,8 +406,8 @@ mod disks {
     impl FileAsDisk {
         pub fn create(nblocks: usize, path: &str) -> Self {
             unsafe {
-                let oflag = O_RDWR | O_CREAT | O_TRUNC;
-                // let oflag = O_RDWR | O_CREAT | O_TRUNC | O_DIRECT;
+                // let oflag = O_RDWR | O_CREAT | O_TRUNC;
+                let oflag = O_RDWR | O_CREAT | O_TRUNC | O_DIRECT;
                 let fd = open(CString::new(path).unwrap().as_ptr() as _, oflag, 0o666);
                 if fd == -1 {
                     println!("open error: {}", std::io::Error::last_os_error());

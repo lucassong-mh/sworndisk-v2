@@ -1,7 +1,7 @@
 //! Sorted String Table.
 use super::mem_table::ValueEx;
-use crate::layers::bio::{BlockSet, Buf, BID_SIZE};
-use crate::layers::log::{TxLog, TxLogId};
+use crate::layers::bio::{BlockSet, Buf, BufMut, BID_SIZE};
+use crate::layers::log::{TxLog, TxLogId, TxLogStore};
 use crate::os::RwLock;
 use crate::{prelude::*, BufRef};
 
@@ -71,16 +71,10 @@ struct RecordBlock {
     buf: Vec<u8>,
 }
 
-struct RecordBlockIter<'a> {
+struct RecordBlockIter<'a, K, V> {
     block: &'a RecordBlock,
     offset: usize,
-}
-
-impl RecordBlock {
-    pub fn from_buf(buf: Vec<u8>) -> Arc<Self> {
-        debug_assert_eq!(buf.len(), BLOCK_SIZE);
-        Arc::new(Self { buf })
-    }
+    phantom: PhantomData<(K, V)>,
 }
 
 impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
@@ -88,7 +82,6 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
     const V_SIZE: usize = size_of::<V>();
     const MAX_RECORD_SIZE: usize = BID_SIZE + 1 + 2 * Self::V_SIZE;
     const INDEX_ENTRY_SIZE: usize = BID_SIZE + 2 * Self::K_SIZE;
-    const BUF_CAP: usize = 4 * BLOCK_SIZE;
     const CACHE_CAP: usize = 1024;
     // TODO: Optimize search&build
 
@@ -116,12 +109,12 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
         !(lhs_range.end() < rhs_range.start() || lhs_range.start() > rhs_range.end())
     }
 
-    pub fn search<D: BlockSet + 'static>(&self, key: &K, tx_log: &Arc<TxLog<D>>) -> Result<V> {
+    pub fn search<D: BlockSet + 'static>(
+        &self,
+        key: &K,
+        tx_log_store: &Arc<TxLogStore<D>>,
+    ) -> Result<V> {
         debug_assert!(self.range().contains(key));
-        if let Some(value) = self.search_in_cache(key) {
-            return Ok(value);
-        }
-
         let target_pos = self
             .footer
             .index
@@ -133,15 +126,23 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
                     None
                 }
             })
-            .ok_or(Error::with_msg(NotFound, "target value not found"))?;
-        self.search_in_log(key, target_pos, tx_log)
+            .unwrap();
+
+        // Search from cache first
+        if let Some(target_value) = self.search_from_cache(key, target_pos) {
+            return Ok(target_value);
+        }
+
+        // Search from log if cache misses
+        let tx_log = tx_log_store.open_log(self.id, false)?;
+        self.search_from_log(key, target_pos, &tx_log)
     }
 
     /// Search a target record in the SST (from cache).
-    pub fn search_in_cache(&self, key: &K) -> Option<V> {
-        // TODO: Opt
-        // self.cache.write().get(key).cloned()
-        None
+    pub fn search_from_cache(&self, key: &K, pos: BlockId) -> Option<V> {
+        let record_block = self.cache.write().get(&pos).cloned()?;
+        let mut iter = RecordBlockIter::<'_, K, V>::from_block(&record_block);
+        iter.find_map(|(k, v)| if k == *key { Some(v) } else { None })
     }
 
     /// Search a target record in the SST (from log).
@@ -149,54 +150,20 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
     /// # Panics
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
-    fn search_in_log<D: BlockSet + 'static>(
+    fn search_from_log<D: BlockSet + 'static>(
         &self,
         key: &K,
-        target_pos: BlockId,
+        pos: BlockId,
         tx_log: &Arc<TxLog<D>>,
     ) -> Result<V> {
         debug_assert!(tx_log.id() == self.id());
-        let mut rbuf = Buf::alloc(1)?;
-        tx_log.read(target_pos, rbuf.as_mut())?;
-        // Search in the records block
-        let rbuf_slice = rbuf.as_slice();
-        let mut offset = 0;
-        loop {
-            if offset + Self::MAX_RECORD_SIZE > BLOCK_SIZE {
-                break;
-            }
-            let k = K::from_bytes(&rbuf_slice[offset..offset + Self::K_SIZE]);
-            offset += Self::K_SIZE;
-            let flag = RecordFlag::from(rbuf_slice[offset]);
-            offset += 1;
-            if flag == RecordFlag::Invalid {
-                break;
-            }
-            let target_value = match flag {
-                RecordFlag::Synced | RecordFlag::Unsynced => {
-                    let v = V::from_bytes(&rbuf_slice[offset..offset + Self::V_SIZE]);
-                    offset += Self::V_SIZE;
-                    v
-                }
-                RecordFlag::SyncedAndUnsynced => {
-                    let v = V::from_bytes(
-                        &rbuf_slice[offset + Self::V_SIZE..offset + 2 * Self::V_SIZE],
-                    );
-                    offset += 2 * Self::V_SIZE;
-                    v
-                }
-                _ => unreachable!(),
-            };
 
-            if k != *key {
-                continue;
-            }
-            // TODO: Opt
-            // self.cache.write().put(k, target_value.clone());
-            return Ok(target_value);
-        }
+        let mut record_block = RecordBlock::from_buf(vec![0; BLOCK_SIZE]);
+        tx_log.read(pos, BufMut::try_from(&mut record_block.buf[..]).unwrap())?;
 
-        return_errno_with_msg!(NotFound, "record not existed in the tx log");
+        let mut iter = RecordBlockIter::<'_, K, V>::from_block(&record_block);
+        iter.find_map(|(k, v)| if k == *key { Some(v) } else { None })
+            .ok_or(Error::with_msg(NotFound, "record not existed in the SST"))
     }
 
     /// Build a SST given a bunch of records, after build, the SST sealed.
@@ -207,7 +174,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
     pub fn build<'a, D: BlockSet + 'static, I>(
         records_iter: I,
         sync_id: u64,
-        tx_log: &'a TxLog<D>,
+        tx_log: &'a Arc<TxLog<D>>,
     ) -> Result<Self>
     where
         I: Iterator<Item = (&'a K, &'a ValueEx<V>)>,
@@ -285,7 +252,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
 
             let record_block = RecordBlock::from_buf(append_buf.clone());
             tx_log.append(BufRef::try_from(&record_block.buf[..]).unwrap())?;
-            cache.put(pos, record_block);
+            cache.put(pos, Arc::new(record_block));
 
             pos += 1;
             inner_offset = 0;
@@ -447,6 +414,63 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SSTable<K, V> {
 
         debug_assert!(records.is_sorted_by_key(|(k, _)| k));
         Ok((records, dropped_records))
+    }
+}
+
+impl RecordBlock {
+    pub fn from_buf(buf: Vec<u8>) -> Self {
+        debug_assert_eq!(buf.len(), BLOCK_SIZE);
+        Self { buf }
+    }
+}
+
+impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> Iterator for RecordBlockIter<'_, K, V> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut offset = self.offset;
+        let buf_slice = &self.block.buf;
+        let (k_size, v_size) = (SSTable::<K, V>::K_SIZE, SSTable::<K, V>::V_SIZE);
+
+        if offset + SSTable::<K, V>::MAX_RECORD_SIZE > BLOCK_SIZE {
+            return None;
+        }
+
+        let key = K::from_bytes(&buf_slice[offset..offset + k_size]);
+        offset += k_size;
+
+        let flag = RecordFlag::from(buf_slice[offset]);
+        offset += 1;
+        if flag == RecordFlag::Invalid {
+            return None;
+        }
+
+        let value = match flag {
+            RecordFlag::Synced | RecordFlag::Unsynced => {
+                let v = V::from_bytes(&buf_slice[offset..offset + v_size]);
+                offset += v_size;
+                v
+            }
+            RecordFlag::SyncedAndUnsynced => {
+                let v = V::from_bytes(&buf_slice[offset + v_size..offset + 2 * v_size]);
+                offset += 2 * v_size;
+                v
+            }
+            _ => unreachable!(),
+        };
+
+        self.offset = offset;
+        Some((key, value))
+    }
+}
+
+impl<'a, K, V> RecordBlockIter<'a, K, V> {
+    pub fn from_block(block: &'a RecordBlock) -> Self {
+        Self {
+            block,
+            offset: 0,
+            phantom: PhantomData,
+        }
     }
 }
 

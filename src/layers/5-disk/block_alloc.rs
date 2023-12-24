@@ -1,7 +1,7 @@
 //! Block allocation.
 
 use super::sworndisk::Hba;
-use crate::layers::bio::{BlockSet, Buf, BufRef};
+use crate::layers::bio::{BlockSet, Buf, BufRef, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogStore};
 use crate::os::Mutex;
 use crate::prelude::*;
@@ -116,6 +116,7 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
                     min_avail = min_avail.min(*block_id);
                     true
                 }
+                AllocDiff::Invalid => unreachable!(),
             };
             bitmap.set(*block_id, validity);
         }
@@ -164,23 +165,24 @@ impl AllocBitmap {
             let buf_slice = buf.as_slice();
             let mut offset = 0;
             while offset <= buf.nblocks() * BLOCK_SIZE {
-                let diff = AllocDiff::try_from(buf_slice[offset]);
+                let diff = AllocDiff::from(buf_slice[offset]);
                 offset += 1;
-                if diff.is_err() {
-                    continue;
+                if diff == AllocDiff::Invalid {
+                    break;
                 }
-                let bid = BlockId::from_bytes(&buf_slice[offset..offset + 8]);
-                offset += 8;
-                match diff? {
+                let bid = BlockId::from_bytes(&buf_slice[offset..offset + BID_SIZE]);
+                offset += BID_SIZE;
+                match diff {
                     AllocDiff::Alloc => self.set_allocated(bid),
                     AllocDiff::Dealloc => self.set_deallocated(bid),
+                    _ => unreachable!(),
                 }
             }
             Ok(())
         });
         if res.is_err() {
             tx.abort();
-            return_errno_with_msg!(TxAborted, "recover block validity bitmap TX aborted");
+            return_errno_with_msg!(TxAborted, "recover block validity table TX aborted");
         }
         tx.commit()
     }
@@ -201,6 +203,23 @@ impl AllocBitmap {
     pub fn set_deallocated(&self, nth: usize) {
         self.bitmap.lock().set(nth, true);
     }
+
+    pub fn sync<D: BlockSet + 'static>(&self, store: &Arc<TxLogStore<D>>) -> Result<()> {
+        let bitmap = self.bitmap.lock();
+        let mut buf = postcard::to_vec::<BitMap, BLOCK_SIZE>(bitmap.as_ref())
+            .map_err(|_| Error::with_msg(InvalidArgs, "serialize block validity table failed"))?;
+        buf.resize(align_up(buf.len(), BLOCK_SIZE), 0);
+        let mut tx = store.new_tx();
+        let res: Result<_> = tx.context(|| {
+            let log = store.create_log(BUCKET_BLOCK_VALIDITY_TABLE)?;
+            log.append(BufRef::try_from(&buf[..]).unwrap())
+        });
+        if res.is_err() {
+            tx.abort();
+            return_errno_with_msg!(TxAborted, "persist block validity table TX aborted");
+        }
+        tx.commit()
+    }
 }
 
 /// Incremental changes of block validity bitmap.
@@ -208,15 +227,15 @@ impl AllocBitmap {
 enum AllocDiff {
     Alloc = 3,
     Dealloc = 7,
+    Invalid,
 }
 
-impl TryFrom<u8> for AllocDiff {
-    type Error = Error;
-    fn try_from(value: u8) -> Result<Self> {
+impl From<u8> for AllocDiff {
+    fn from(value: u8) -> Self {
         match value {
-            3 => Ok(AllocDiff::Alloc),
-            7 => Ok(AllocDiff::Dealloc),
-            _ => Err(Error::new(InvalidArgs)),
+            3 => AllocDiff::Alloc,
+            7 => AllocDiff::Dealloc,
+            _ => AllocDiff::Invalid,
         }
     }
 }

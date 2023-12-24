@@ -5,13 +5,12 @@
 //! Responsible for managing two `MemTable`s, a `TxLogStore` to
 //! manage TX logs (WAL and SSTs). Operations are executed based
 //! on internal transactions.
-use super::mem_table::{MemTable, ValueEx};
+use super::mem_table::{self, MemTable, ValueEx};
 use super::sstable::SSTable;
 use super::wal::{WalAppendTx, BUCKET_WAL};
 use crate::layers::bio::BlockSet;
 use crate::layers::log::{TxLogId, TxLogStore};
-use crate::layers::lsm::compaction::Compactor;
-use crate::os::RwLock;
+use crate::os::{Mutex, RwLock};
 use crate::prelude::*;
 use crate::tx::Tx;
 
@@ -20,22 +19,31 @@ use core::fmt::{self, Debug};
 use core::hash::Hash;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use itertools::Itertools;
 use pod::Pod;
+
+// TODO: Use `Thread` in os module
+use std::thread::{self, JoinHandle};
 
 static MASTER_SYNC_ID: AtomicU64 = AtomicU64::new(0);
 
 const ENABLE_DEBUG: bool = false;
 
 /// A LSM-Tree built upon `TxLogStore`.
-pub struct TxLsmTree<K, V, D>
+pub struct TxLsmTree<K, V, D>(Arc<TxLsmTreeInner<K, V, D>>)
+where
+    D: BlockSet;
+
+#[derive(Clone)]
+pub struct TxLsmTreeInner<K, V, D>
 where
     D: BlockSet,
 {
-    mem_tables: [Arc<RwLock<MemTable<K, V>>>; 2],
-    immut_idx: AtomicU8,
-    tx_log_store: Arc<TxLogStore<D>>,
+    memtable_manager: Arc<MemTableManager<K, V>>,
+    sst_manager: Arc<RwLock<SstManager<K, V>>>,
     wal_append_tx: WalAppendTx<D>,
-    sst_manager: RwLock<SstManager<K, V>>,
+    compactor: Arc<Compactor>,
+    tx_log_store: Arc<TxLogStore<D>>,
     listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
 }
 
@@ -63,6 +71,12 @@ pub enum LsmLevel {
 #[derive(Debug)]
 struct SstManager<K, V> {
     level_ssts: Vec<BTreeMap<TxLogId, Arc<SSTable<K, V>>>>,
+}
+
+/// MemTable manager.
+struct MemTableManager<K, V> {
+    mem_tables: [Arc<RwLock<MemTable<K, V>>>; 2],
+    immut_idx: AtomicU8,
 }
 
 /// A factory of per-transaction event listeners.
@@ -105,8 +119,106 @@ pub enum TxType {
     Migration,
 }
 
-impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTree<K, V, D> {
-    pub(super) const MEMTABLE_CAPACITY: usize = 81920;
+impl<K: Ord + Pod + Hash + Debug + 'static, V: Pod + Debug + 'static, D: BlockSet + 'static>
+    TxLsmTree<K, V, D>
+{
+    pub fn format(
+        tx_log_store: Arc<TxLogStore<D>>,
+        listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
+    ) -> Result<Self> {
+        let inner =
+            TxLsmTreeInner::format(tx_log_store, listener_factory, on_drop_record_in_memtable)?;
+        Ok(Self(Arc::new(inner)))
+    }
+
+    pub fn recover(
+        tx_log_store: Arc<TxLogStore<D>>,
+        listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
+    ) -> Result<Self> {
+        let inner =
+            TxLsmTreeInner::recover(tx_log_store, listener_factory, on_drop_record_in_memtable)?;
+        Ok(Self(Arc::new(inner)))
+    }
+
+    pub fn get(&self, key: &K) -> Result<V> {
+        self.0.get(key)
+    }
+
+    pub fn put(&self, key: K, value: V) -> Result<()> {
+        let record = (key, value);
+        let timer = LatencyMetrics::start_timer(ReqType::Write, "wal", "lsmtree");
+
+        // 1. Write WAL
+        self.0.wal_append_tx.append(&record)?;
+
+        // 2. Put into MemTable
+        let at_capacity = self.0.memtable_manager.put(key, value);
+        if !at_capacity {
+            LatencyMetrics::stop_timer(timer);
+            return Ok(());
+        }
+
+        // TODO: Think of combining WAL's TX with minor compaction TX?
+        self.0.wal_append_tx.commit()?;
+
+        self.0.compactor.wait_compaction()?;
+
+        LatencyMetrics::stop_timer(timer);
+
+        // 3. Trigger compaction when MemTable is at capacity
+        self.0.memtable_manager.switch();
+
+        self.do_compaction_tx()?;
+
+        // Discard current WAL
+        self.0.wal_append_tx.discard()?;
+
+        Ok(())
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        self.0.sync()
+    }
+
+    /// Compaction TX
+    fn do_compaction_tx(&self) -> Result<()> {
+        let inner = self.0.clone();
+
+        let handle = thread::spawn(move || -> Result<()> {
+            // Do major compaction first if needed
+            if inner
+                .sst_manager
+                .read()
+                .require_major_compaction(LsmLevel::L0)
+            {
+                let timer =
+                    LatencyMetrics::start_timer(ReqType::Write, "major_compaction", "lsmtree");
+
+                inner.do_compaction_tx(LsmLevel::L1)?;
+
+                LatencyMetrics::stop_timer(timer);
+            }
+
+            let timer = LatencyMetrics::start_timer(ReqType::Write, "minor_compaction", "lsmtree");
+
+            // Do minor compaction
+            inner.do_compaction_tx(LsmLevel::L0)?;
+
+            LatencyMetrics::stop_timer(timer);
+
+            Ok(())
+        });
+
+        handle.join().unwrap()?;
+        // self.0.compactor.handle.lock().insert(handle);
+        Ok(())
+    }
+}
+
+impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTreeInner<K, V, D> {
+    pub(super) const MEMTABLE_CAPACITY: usize = 81920; // TBD
     pub(super) const SSTABLE_CAPACITY: usize = Self::MEMTABLE_CAPACITY;
 
     /// Format a `TxLsmTree` from a given `TxLogStore`.
@@ -115,27 +227,15 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
         listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
     ) -> Result<Self> {
-        let mem_tables = {
-            let sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
-            let mem_table = Arc::new(RwLock::new(MemTable::new(
-                Self::MEMTABLE_CAPACITY,
-                sync_id,
-                on_drop_record_in_memtable.clone(),
-            )));
-            let immut_mem_table = Arc::new(RwLock::new(MemTable::new(
-                Self::MEMTABLE_CAPACITY,
-                sync_id,
-                on_drop_record_in_memtable,
-            )));
-            [mem_table, immut_mem_table]
-        };
-
         Ok(Self {
-            mem_tables,
-            immut_idx: AtomicU8::new(1),
+            memtable_manager: Arc::new(MemTableManager::new(
+                Self::MEMTABLE_CAPACITY,
+                on_drop_record_in_memtable,
+            )),
+            sst_manager: Arc::new(RwLock::new(SstManager::new())),
             wal_append_tx: WalAppendTx::new(&tx_log_store),
+            compactor: Arc::new(Compactor::new()),
             tx_log_store,
-            sst_manager: RwLock::new(SstManager::new()),
             listener_factory,
         })
     }
@@ -166,24 +266,14 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
             }
             res.unwrap()
         };
-        let mem_tables = {
-            let sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
-            let mut mem_table = MemTable::new(
-                Self::MEMTABLE_CAPACITY,
-                sync_id,
-                on_drop_record_in_memtable.clone(),
-            );
-            for (k, v) in synced_records {
-                mem_table.put(k, v);
-            }
 
-            let immut_mem_table = Arc::new(RwLock::new(MemTable::new(
-                Self::MEMTABLE_CAPACITY,
-                sync_id,
-                on_drop_record_in_memtable,
-            )));
-            [Arc::new(RwLock::new(mem_table)), immut_mem_table]
-        };
+        let memtable_manager = Arc::new(MemTableManager::new(
+            Self::MEMTABLE_CAPACITY,
+            on_drop_record_in_memtable,
+        ));
+        synced_records.into_iter().for_each(|(k, v)| {
+            let _ = memtable_manager.put(k, v);
+        });
 
         // Prepare SST manager (load index block to cache)
         let sst_manager = {
@@ -208,13 +298,13 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
                 tx.abort();
                 return_errno_with_msg!(TxAborted, "recover TxLsmTree failed");
             }
-            RwLock::new(manager)
+            Arc::new(RwLock::new(manager))
         };
 
         let recov_self = Self {
-            mem_tables,
-            immut_idx: AtomicU8::new(1),
+            memtable_manager,
             wal_append_tx: WalAppendTx::new(&tx_log_store),
+            compactor: Arc::new(Compactor::new()),
             tx_log_store,
             sst_manager,
             listener_factory,
@@ -233,67 +323,54 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
 
     pub fn get(&self, key: &K) -> Result<V> {
         // 1. Search from MemTables
-        if let Some(value) = self.active_mem_table().read().get(key) {
-            return Ok(value.clone());
-        }
-        if let Some(value) = self.immut_mem_table().read().get(key) {
-            return Ok(value.clone());
+        if let Some(value) = self.memtable_manager.get(key) {
+            return Ok(value);
         }
 
-        // let timer = LatencyMetrics::start_timer(ReqType::Read, "read_tx", "lsmtree");
+        let timer = LatencyMetrics::start_timer(ReqType::Read, "read_tx", "lsmtree");
 
         // 2. Search from SSTs (do Read TX)
-        self.do_read_tx(key)
-        // LatencyMetrics::stop_timer(timer);
+        let value = self.do_read_tx(key)?;
+
+        LatencyMetrics::stop_timer(timer);
+        Ok(value)
     }
 
     pub fn get_range(&self, range: &Range<K>) -> Vec<V> {
         todo!()
     }
 
-    pub fn put(&self, key: K, value: V) -> Result<()> {
-        let record = (key, value);
-        let timer = LatencyMetrics::start_timer(ReqType::Write, "wal", "lsmtree");
+    // pub fn put(&self, key: K, value: V) -> Result<()> {
+    //     let record = (key, value);
+    //     let timer = LatencyMetrics::start_timer(ReqType::Write, "wal", "lsmtree");
 
-        // 1. Write WAL
-        self.wal_append_tx.append(&record)?;
+    //     // 1. Write WAL
+    //     self.wal_append_tx.append(&record)?;
 
-        // 2. Put into MemTable
-        let _ = self.active_mem_table().write().put(key, value);
-        if !self.active_mem_table().read().at_capacity() {
-            LatencyMetrics::stop_timer(timer);
-            return Ok(());
-        }
+    //     // 2. Put into MemTable
+    //     let at_capacity = self.memtable_manager.put(key, value);
+    //     if !at_capacity {
+    //         LatencyMetrics::stop_timer(timer);
+    //         return Ok(());
+    //     }
 
-        // TODO: Think of combining WAL's TX with minor compaction TX?
-        self.wal_append_tx.commit()?;
+    //     // TODO: Think of combining WAL's TX with minor compaction TX?
+    //     self.wal_append_tx.commit()?;
 
-        LatencyMetrics::stop_timer(timer);
+    //     self.compactor.wait_compaction()?;
 
-        // 3. Trigger compaction if needed
-        self.immut_idx.fetch_xor(1, Ordering::Release);
-        // Do major compaction first if needed
-        if self
-            .sst_manager
-            .read()
-            .require_major_compaction(LsmLevel::L0)
-        {
-            let timer = LatencyMetrics::start_timer(ReqType::Write, "major_compaction", "lsmtree");
+    //     LatencyMetrics::stop_timer(timer);
 
-            self.do_compaction_tx(LsmLevel::L1)?;
+    //     // 3. Trigger compaction when MemTable is at capacity
+    //     self.memtable_manager.switch();
 
-            LatencyMetrics::stop_timer(timer);
-        }
+    //     self.do_compaction_tx()?;
 
-        let timer = LatencyMetrics::start_timer(ReqType::Write, "minor_compaction", "lsmtree");
+    //     // Discard current WAL
+    //     self.wal_append_tx.discard()?;
 
-        // Do minor compaction
-        self.do_compaction_tx(LsmLevel::L0)?;
-
-        LatencyMetrics::stop_timer(timer);
-
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     // FIXME: Do we actually need this API?
     // pub fn put_range(&self, range: &Range<K>) -> Result<()> {}
@@ -311,7 +388,10 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
 
         let timer = LatencyMetrics::start_timer(ReqType::Sync, "memtable", "lsmtree");
 
-        self.active_mem_table().write().sync(master_sync_id)?;
+        self.memtable_manager
+            .active_mem_table()
+            .write()
+            .sync(master_sync_id)?;
 
         LatencyMetrics::stop_timer(timer);
 
@@ -329,32 +409,20 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
         let read_res: Result<_> = tx.context(|| {
             // Search each level from top to bottom (newer to older)
             let sst_manager = self.sst_manager.read();
+
+            let timer = LatencyMetrics::start_timer(ReqType::Read, "sst", "read_tx");
             for (level, bucket) in LsmLevel::iter() {
                 for (id, sst) in sst_manager.list_level(level) {
                     if !sst.is_within_range(key) {
                         continue;
                     }
-                    if let Some(value) = sst.search_in_cache(key) {
-                        return Ok(value);
-                    }
 
-                    // let timer = LatencyMetrics::start_timer(ReqType::Read, "open_log", "read_tx");
-                    let tx_log = self.tx_log_store.open_log(*id, false)?;
-                    // LatencyMetrics::stop_timer(timer);
-
-                    debug_assert!(tx_log.bucket() == bucket);
-
-                    // let timer = LatencyMetrics::start_timer(ReqType::Read, "sst", "read_tx");
-
-                    if let Ok(target_value) = sst.search(key, &tx_log) {
-                        // LatencyMetrics::stop_timer(timer);
-
+                    if let Ok(target_value) = sst.search(key, &self.tx_log_store) {
                         return Ok(target_value);
                     }
-
-                    // LatencyMetrics::stop_timer(timer);
                 }
             }
+            LatencyMetrics::stop_timer(timer);
 
             return_errno_with_msg!(NotFound, "target sst not found");
         });
@@ -370,7 +438,6 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
         read_res
     }
 
-    /// Compaction TX
     fn do_compaction_tx(&self, to_level: LsmLevel) -> Result<()> {
         match to_level {
             LsmLevel::L0 => self.do_minor_compaction(),
@@ -398,7 +465,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
         let res: Result<_> = tx.context(|| {
             let tx_log = self.tx_log_store.create_log(LsmLevel::L0.bucket())?;
 
-            let immut_mem_table = self.immut_mem_table().read();
+            let immut_mem_table = self.memtable_manager.immut_mem_table().read();
             let records_iter = immut_mem_table.iter().map(|(k, v_ex)| {
                 match v_ex {
                     ValueEx::Synced(v) | ValueEx::Unsynced(v) => {
@@ -432,10 +499,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
 
         tx.commit()?;
         event_listener.on_tx_commit();
-        self.immut_mem_table().write().clear();
-
-        // Discard current WAL
-        self.wal_append_tx.discard()?;
+        self.memtable_manager.immut_mem_table().write().clear();
 
         if ENABLE_DEBUG {
             println!("===== TxLsmTree Minor Compaction =====",);
@@ -498,7 +562,9 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
                 let tx_log = tx_log_store.open_log(upper_sst_id, false)?;
                 let (records, dropped_records) =
                     upper_sst.collect_all_records(&tx_log, master_sync_id, false)?;
-                Compactor::on_drop_records(&listener, dropped_records.into_iter())?;
+                for record in dropped_records {
+                    listener.on_drop_record(&record)?;
+                }
                 records
             };
 
@@ -508,37 +574,53 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
                     let tx_log = tx_log_store.open_log(*id, false)?;
                     let (records, dropped_records) =
                         sst.collect_all_records(&tx_log, master_sync_id, false)?;
-                    Compactor::on_drop_records(&listener, dropped_records.into_iter())?;
+                    for record in dropped_records {
+                        listener.on_drop_record(&record)?;
+                    }
                     records_vec.push(records);
                 }
                 records_vec
             };
 
-            // Collect and sort records during compaction
-            let compacted_records = {
-                if !lower_records_vec.is_empty() {
-                    let (compacted_records, dropped_records) = Compactor::compact_records(
-                        upper_records.into_iter(),
-                        lower_records_vec
-                            .into_iter()
-                            .flat_map(|records| records.into_iter()),
-                    );
-                    Compactor::on_drop_records(&listener, dropped_records.into_iter())?;
-                    compacted_records
-                } else {
-                    upper_records
-                }
-            };
-            debug_assert!(compacted_records.is_sorted_by_key(|(k, _)| k));
+            // // Collect and sort records during compaction
+            // let compacted_records = {
+            //     if !lower_records_vec.is_empty() {
+            //         let (compacted_records, dropped_records) = Compactor::compact_records(
+            //             upper_records.into_iter(),
+            //             lower_records_vec
+            //                 .into_iter()
+            //                 .flat_map(|records| records.into_iter()),
+            //         );
+            //         Compactor::on_drop_records(&listener, dropped_records.into_iter())?;
+            //         compacted_records
+            //     } else {
+            //         upper_records
+            //     }
+            // };
+            // debug_assert!(compacted_records.is_sorted_by_key(|(k, _)| k));
 
-            // Create new SSTs
-            for records in compacted_records.chunks(Self::SSTABLE_CAPACITY) {
-                let new_log = tx_log_store.create_log(to_level.bucket())?;
-                let new_sst = SSTable::build(
-                    records.iter().map(|(k, v)| (k, v)),
-                    master_sync_id,
-                    &new_log,
-                )?;
+            // // Create new SSTs
+            // for records in compacted_records.chunks(Self::SSTABLE_CAPACITY) {
+            //     let new_log = tx_log_store.create_log(to_level.bucket())?;
+            //     let new_sst = SSTable::build(
+            //         records.iter().map(|(k, v)| (k, v)),
+            //         master_sync_id,
+            //         &new_log,
+            //     )?;
+            //     created_ssts.push((new_sst, to_level));
+            // }
+
+            let new_ssts = Self::compact_records_and_build_ssts(
+                upper_records.into_iter(),
+                lower_records_vec
+                    .into_iter()
+                    .flat_map(|records| records.into_iter()),
+                &tx_log_store,
+                &listener,
+                to_level,
+                master_sync_id,
+            )?;
+            for new_sst in new_ssts {
                 created_ssts.push((new_sst, to_level));
             }
 
@@ -589,6 +671,78 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
             println!("===== TxLsmTree Major Compaction =====",);
         }
         Ok(())
+    }
+
+    fn compact_records_and_build_ssts(
+        upper_records: impl Iterator<Item = (K, ValueEx<V>)>,
+        lower_records: impl Iterator<Item = (K, ValueEx<V>)>,
+        tx_log_store: &Arc<TxLogStore<D>>,
+        event_listener: &Arc<dyn TxEventListener<K, V>>,
+        to_level: LsmLevel,
+        sync_id: u64,
+    ) -> Result<Vec<SSTable<K, V>>> {
+        let mut merged_map: BTreeMap<K, ValueEx<V>> = lower_records.collect();
+        let mut created_ssts = Vec::new();
+        let mut dropped_records = Vec::new();
+        for (k, new_v_ex) in upper_records {
+            // if k > *merged_map.last_key_value().unwrap().0 {
+            //     merged_map.extend(upper_records);
+            //     break;
+            // }
+
+            if let Some(old_v_ex) = merged_map.get_mut(&k) {
+                let replaced_opt = match (new_v_ex, &old_v_ex) {
+                    (ValueEx::Synced(new_v), ValueEx::Synced(old_v)) => {
+                        dropped_records.push((k, *old_v));
+                        Some(ValueEx::Synced(new_v))
+                    }
+                    (ValueEx::Unsynced(new_v), ValueEx::Synced(old_v)) => {
+                        Some(ValueEx::SyncedAndUnsynced(*old_v, new_v))
+                    }
+                    (ValueEx::Unsynced(new_v), ValueEx::Unsynced(old_v)) => {
+                        dropped_records.push((k, *old_v));
+                        Some(ValueEx::Unsynced(new_v))
+                    }
+                    (ValueEx::Unsynced(new_v), ValueEx::SyncedAndUnsynced(old_sv, old_usv)) => {
+                        dropped_records.push((k, *old_usv));
+                        Some(ValueEx::SyncedAndUnsynced(*old_sv, new_v))
+                    }
+                    (ValueEx::SyncedAndUnsynced(new_sv, new_usv), ValueEx::Synced(old_sv)) => {
+                        dropped_records.push((k, *old_sv));
+                        Some(ValueEx::SyncedAndUnsynced(new_sv, new_usv))
+                    }
+                    _ => {
+                        unreachable!()
+                    }
+                };
+                if let Some(replaced) = replaced_opt {
+                    *old_v_ex = replaced;
+                }
+            } else {
+                let _ = merged_map.insert(k, new_v_ex);
+            }
+        }
+
+        let new_logs = {
+            let size = align_up(merged_map.len(), Self::SSTABLE_CAPACITY) / Self::SSTABLE_CAPACITY;
+            let mut new_logs = Vec::with_capacity(size);
+            for _ in 0..size {
+                new_logs.push(tx_log_store.create_log(to_level.bucket())?);
+            }
+            new_logs
+        };
+        let mut nth = 0;
+        for records_iter in &merged_map.iter().chunks(Self::SSTABLE_CAPACITY) {
+            let new_sst = SSTable::build(records_iter, sync_id, &new_logs[nth])?;
+            created_ssts.push(new_sst);
+            nth += 1;
+        }
+
+        for record in dropped_records {
+            event_listener.on_drop_record(&record)?;
+        }
+
+        Ok(created_ssts)
     }
 
     /// Migration TX.
@@ -663,29 +817,24 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
             .for_each(|(id, level)| sst_manager.remove(id, level));
         Ok(())
     }
-
-    fn active_mem_table(&self) -> &Arc<RwLock<MemTable<K, V>>> {
-        &self.mem_tables[(self.immut_idx.load(Ordering::Relaxed) as usize) ^ 1]
-    }
-
-    fn immut_mem_table(&self) -> &Arc<RwLock<MemTable<K, V>>> {
-        &self.mem_tables[self.immut_idx.load(Ordering::Relaxed) as usize]
-    }
 }
 
 impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> Debug
-    for TxLsmTree<K, V, D>
+    for TxLsmTreeInner<K, V, D>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TxLsmTree")
-            .field(
-                "active_memtable_size",
-                &self.active_mem_table().read().size(),
-            )
-            .field("immut_memtable_size", &self.immut_mem_table().read().size())
+            .field("memtable_manager", &self.memtable_manager)
             .field("sst_manager", &self.sst_manager.read())
             .field("tx_log_store", &self.tx_log_store)
             .finish()
+    }
+}
+
+impl<K, V, D: BlockSet> Drop for TxLsmTreeInner<K, V, D> {
+    fn drop(&mut self) {
+        println!("drop wait_compaction");
+        self.compactor.wait_compaction();
     }
 }
 
@@ -786,6 +935,95 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> SstManager<K, V> {
     }
 }
 
+impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> MemTableManager<K, V> {
+    pub fn new(
+        capacity: usize,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
+    ) -> Self {
+        let mem_tables = {
+            let sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
+            let mem_table = Arc::new(RwLock::new(MemTable::new(
+                capacity,
+                sync_id,
+                on_drop_record_in_memtable.clone(),
+            )));
+            let immut_mem_table = Arc::new(RwLock::new(MemTable::new(
+                capacity,
+                sync_id,
+                on_drop_record_in_memtable,
+            )));
+            [mem_table, immut_mem_table]
+        };
+
+        Self {
+            mem_tables,
+            immut_idx: AtomicU8::new(1),
+        }
+    }
+
+    pub fn get(&self, key: &K) -> Option<V> {
+        if let Some(value) = self.active_mem_table().read().get(key) {
+            return Some(value.clone());
+        }
+
+        if let Some(value) = self.immut_mem_table().read().get(key) {
+            return Some(value.clone());
+        }
+
+        None
+    }
+
+    pub fn put(&self, key: K, value: V) -> bool {
+        let mut mem_table = self.active_mem_table().write();
+        let _ = mem_table.put(key, value);
+        mem_table.at_capacity()
+    }
+
+    pub fn switch(&self) {
+        self.immut_idx.fetch_xor(1, Ordering::Release);
+    }
+
+    pub fn active_mem_table(&self) -> &Arc<RwLock<MemTable<K, V>>> {
+        &self.mem_tables[(self.immut_idx.load(Ordering::Relaxed) as usize) ^ 1]
+    }
+
+    pub fn immut_mem_table(&self) -> &Arc<RwLock<MemTable<K, V>>> {
+        &self.mem_tables[self.immut_idx.load(Ordering::Relaxed) as usize]
+    }
+}
+
+impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug> Debug for MemTableManager<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemTableManager")
+            .field(
+                "active_memtable_size",
+                &self.active_mem_table().read().size(),
+            )
+            .field("immut_memtable_size", &self.immut_mem_table().read().size())
+            .finish()
+    }
+}
+
+struct Compactor {
+    handle: Mutex<Option<JoinHandle<Result<()>>>>,
+}
+
+impl Compactor {
+    pub fn new() -> Self {
+        Self {
+            handle: Mutex::new(None),
+        }
+    }
+
+    pub fn wait_compaction(&self) -> Result<()> {
+        if let Some(handle) = self.handle.lock().take() {
+            handle.join().unwrap()
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl<K, V> AsKv<K, V> for (K, V) {
     fn key(&self) -> &K {
         &self.0
@@ -805,6 +1043,9 @@ impl<K, V> AsKv<K, V> for (&K, &V) {
         self.1
     }
 }
+
+unsafe impl<K, V, D: BlockSet> Send for TxLsmTreeInner<K, V, D> {}
+unsafe impl<K, V, D: BlockSet> Sync for TxLsmTreeInner<K, V, D> {}
 
 #[cfg(test)]
 mod tests {
@@ -851,7 +1092,7 @@ mod tests {
         let tx_lsm_tree: TxLsmTree<BlockId, RecordValue, MemDisk> =
             TxLsmTree::format(tx_log_store.clone(), Arc::new(Factory), None)?;
 
-        let cap = TxLsmTree::<BlockId, RecordValue, MemDisk>::MEMTABLE_CAPACITY;
+        let cap = TxLsmTreeInner::<BlockId, RecordValue, MemDisk>::MEMTABLE_CAPACITY;
         let start = 0;
         for i in start..start + cap {
             let (k, v) = (
