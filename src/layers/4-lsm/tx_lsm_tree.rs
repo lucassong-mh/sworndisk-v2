@@ -27,8 +27,6 @@ use std::thread::{self, JoinHandle};
 
 static MASTER_SYNC_ID: AtomicU64 = AtomicU64::new(0);
 
-const ENABLE_DEBUG: bool = false;
-
 /// A LSM-Tree built upon `TxLogStore`.
 ///
 /// It supports inseting and querying key-value records within transactions.
@@ -38,7 +36,7 @@ where
     D: BlockSet;
 
 #[derive(Clone)]
-pub struct TxLsmTreeInner<K, V, D>
+pub(super) struct TxLsmTreeInner<K, V, D>
 where
     D: BlockSet,
 {
@@ -315,12 +313,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
 
         recov_self.do_migration_tx()?;
 
-        if ENABLE_DEBUG {
-            println!("===== TxLsmTree Recovery =====");
-            println!("{:?}", recov_self);
-            println!("===== TxLsmTree Recovery =====");
-        }
-
+        debug!("[TxLsmTree Recovery] {recov_self:?}");
         Ok(recov_self)
     }
 
@@ -331,12 +324,9 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
             return Ok(value);
         }
 
-        let timer = LatencyMetrics::start_timer(ReqType::Read, "read_tx", "lsmtree");
-
         // 2. Search from SSTs (do Read TX)
         let value = self.do_read_tx(key)?;
 
-        LatencyMetrics::stop_timer(timer);
         Ok(value)
     }
 
@@ -356,16 +346,16 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
 
         LatencyMetrics::stop_timer(timer);
 
-        let timer = LatencyMetrics::start_timer(ReqType::Sync, "memtable", "lsmtree");
-
         self.memtable_manager
             .active_mem_table()
             .write()
             .sync(master_sync_id)?;
 
-        LatencyMetrics::stop_timer(timer);
+        let timer = LatencyMetrics::start_timer(ReqType::Sync, "tx_log_store", "lsmtree");
 
         self.tx_log_store.sync()?;
+
+        LatencyMetrics::stop_timer(timer);
 
         Ok(())
     }
@@ -401,9 +391,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
             return_errno_with_msg!(TxAborted, "read TX failed")
         }
 
-        // let timer = LatencyMetrics::start_timer(ReqType::Read, "tx_commit", "read_tx");
         tx.commit()?;
-        // LatencyMetrics::stop_timer(timer);
 
         read_res
     }
@@ -471,11 +459,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
         event_listener.on_tx_commit();
         self.memtable_manager.immut_mem_table().write().clear();
 
-        if ENABLE_DEBUG {
-            println!("===== TxLsmTree Minor Compaction =====",);
-            println!("{:?}", self);
-            println!("===== TxLsmTree Minor Compaction =====",);
-        }
+        debug!("[TxLsmTree Minor Compaction] {self:?}");
         Ok(())
     }
 
@@ -607,11 +591,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
             self.do_major_compaction(to_level.lower_level())?;
         }
 
-        if ENABLE_DEBUG {
-            println!("===== TxLsmTree Major Compaction =====",);
-            println!("{:?}", self);
-            println!("===== TxLsmTree Major Compaction =====",);
-        }
+        debug!("[TxLsmTree Major Compaction] {self:?}");
         Ok(())
     }
 
@@ -777,8 +757,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> Debug
 
 impl<K, V, D: BlockSet> Drop for TxLsmTreeInner<K, V, D> {
     fn drop(&mut self) {
-        println!("drop wait_compaction");
-        self.compactor.wait_compaction();
+        let _ = self.compactor.wait_compaction();
     }
 }
 
@@ -1033,9 +1012,11 @@ mod tests {
 
     #[test]
     fn tx_lsm_tree_fns() -> Result<()> {
+        env_logger::init();
+
         let nblocks = 16 * 1024;
         let mem_disk = MemDisk::create(nblocks)?;
-        let tx_log_store = Arc::new(TxLogStore::format(mem_disk)?);
+        let tx_log_store = Arc::new(TxLogStore::format(mem_disk, Key::random())?);
         let tx_lsm_tree: TxLsmTree<BlockId, RecordValue, MemDisk> =
             TxLsmTree::format(tx_log_store.clone(), Arc::new(Factory), None)?;
 

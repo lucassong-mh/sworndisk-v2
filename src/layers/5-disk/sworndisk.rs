@@ -154,7 +154,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
-        let tx_log_store = Arc::new(TxLogStore::format(lsm_tree_disk)?);
+        let tx_log_store = Arc::new(TxLogStore::format(lsm_tree_disk, root_key.clone())?);
         let block_validity_bitmap = Arc::new(AllocBitmap::new(data_disk.nblocks()));
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
@@ -408,6 +408,8 @@ mod tests {
     use super::*;
     use crate::layers::bio::MemDisk;
 
+    use std::thread::{self, JoinHandle};
+
     #[test]
     fn sworndisk_fns() -> Result<()> {
         let nblocks = 8 * 1024;
@@ -427,7 +429,14 @@ mod tests {
             assert_eq!(rw_buf.as_slice()[0], i as u8);
         }
 
-        // TODO: Test `open()`
-        Ok(())
+        drop(sworndisk);
+        thread::spawn(move || -> Result<()> {
+            let opened_sworndisk = SwornDisk::open(mem_disk, root_key)?;
+            opened_sworndisk.read(5 as Lba, rw_buf.as_mut())?;
+            assert_eq!(rw_buf.as_slice()[0], 5u8);
+            Ok(())
+        })
+        .join()
+        .unwrap()
     }
 }

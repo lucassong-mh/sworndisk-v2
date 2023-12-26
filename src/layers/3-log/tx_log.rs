@@ -92,7 +92,7 @@ type BucketName = String;
 #[derive(Clone)]
 pub struct TxLogStore<D> {
     state: Arc<Mutex<State>>,
-    key: Key,
+    root_key: Key,
     raw_log_store: Arc<RawLogStore<D>>,
     journal: Arc<Mutex<Journal<D>>>,
     tx_provider: Arc<TxProvider>,
@@ -111,7 +111,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     ///
     /// Each instance will be assigned a unique, automatically-generated root
     /// key.
-    pub fn format(disk: D) -> Result<Self> {
+    pub fn format(disk: D, root_key: Key) -> Result<Self> {
         let total_nblocks = disk.nblocks();
         let (log_store_nblocks, journal_nblocks) =
             Self::calc_store_and_journal_nblocks(total_nblocks);
@@ -144,12 +144,11 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
             journal_area_meta: journal.lock().meta(),
             chunk_area_nblocks: log_store_nblocks,
         };
-        let key = Key::random();
-        superblock.persist(&disk, &key)?;
+        superblock.persist(&disk, &root_key)?;
 
         Ok(Self::from_parts(
             tx_log_store_state,
-            key,
+            root_key,
             raw_log_store,
             journal,
             tx_provider,
@@ -167,8 +166,8 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     }
 
     /// Recovers an existing `TxLogStore` from a disk using the given key.
-    pub fn recover(disk: D, key: Key) -> Result<Self> {
-        let superblock = Superblock::open(&disk.subset(0..1)?, &key)?;
+    pub fn recover(disk: D, root_key: Key) -> Result<Self> {
+        let superblock = Superblock::open(&disk.subset(0..1)?, &root_key)?;
         if disk.nblocks() < superblock.total_nblocks() {
             return_errno_with_msg!(OutOfDisk, "given disk lacks space for recovering");
         }
@@ -196,7 +195,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         );
         let tx_log_store = TxLogStore::from_parts(
             all_state.tx_log_store.clone(),
-            key,
+            root_key,
             raw_log_store,
             Arc::new(Mutex::new(journal)),
             tx_provider,
@@ -207,7 +206,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
 
     fn from_parts(
         state: TxLogStoreState,
-        key: Key,
+        root_key: Key,
         raw_log_store: Arc<RawLogStore<D>>,
         journal: Arc<Mutex<Journal<D>>>,
         tx_provider: Arc<TxProvider>,
@@ -225,7 +224,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
 
             Self {
                 state: Arc::new(Mutex::new(State::new(state, lazy_deletes, log_caches))),
-                key,
+                root_key,
                 raw_log_store,
                 journal: journal.clone(),
                 tx_provider: tx_provider.clone(),
@@ -418,7 +417,8 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
             .lock()
             .log_caches
             .insert(log_id, log_cache.clone());
-        let crypto_log = CryptoLog::new(raw_log, self.key, log_cache);
+        let key = Key::random();
+        let crypto_log = CryptoLog::new(raw_log, key, log_cache);
 
         let mut current_tx = self.tx_provider.current();
         let bucket = bucket.to_string();
@@ -432,7 +432,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         });
 
         current_tx.data_mut_with(|store_edit: &mut TxLogStoreEdit| {
-            store_edit.create_log(log_id, bucket, self.key);
+            store_edit.create_log(log_id, bucket, key);
         });
 
         current_tx.data_mut_with(|open_log_table: &mut OpenLogTable<D>| {
@@ -621,8 +621,8 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     }
 
     /// Returns the root key.
-    pub fn key(&self) -> &Key {
-        &self.key
+    pub fn root_key(&self) -> &Key {
+        &self.root_key
     }
 
     /// Creates a new transaction.
@@ -649,7 +649,7 @@ impl<D: BlockSet + 'static> Debug for TxLogStore<D> {
             .field("persistent_log_table", &state.persistent.log_table)
             .field("persistent_bucket_table", &state.persistent.bucket_table)
             .field("raw_log_store", &self.raw_log_store)
-            .field("key", &self.key)
+            .field("root_key", &self.root_key)
             .finish()
     }
 }
@@ -683,7 +683,7 @@ impl Superblock {
         let mut cipher = Buf::alloc(1)?;
         Skcipher::new().encrypt(
             plain.as_slice(),
-            &Self::derive_skcipher_key(&root_key),
+            &Self::derive_skcipher_key(root_key),
             &SkcipherIv::new_zeroed(),
             cipher.as_mut_slice(),
         )?;
@@ -1291,7 +1291,8 @@ mod tests {
         let nblocks = 4 * CHUNK_NBLOCKS;
         let mem_disk = MemDisk::create(nblocks)?;
         let disk = mem_disk.clone();
-        let tx_log_store = TxLogStore::format(mem_disk)?;
+        let root_key = Key::random();
+        let tx_log_store = TxLogStore::format(mem_disk, root_key.clone())?;
         let bucket = "TEST";
         let content = 5_u8;
 
@@ -1339,10 +1340,9 @@ mod tests {
         tx.commit()?;
 
         // Recover the tx log store
-        let key = tx_log_store.key().clone();
         let _ = tx_log_store.journal.lock().flush();
         drop(tx_log_store);
-        let recovered_store = TxLogStore::recover(disk, key)?;
+        let recovered_store = TxLogStore::recover(disk, root_key)?;
 
         // TX 3: create a new log from recovered_store (aborted)
         let tx_log_store = recovered_store.clone();
@@ -1370,7 +1370,7 @@ mod tests {
 
     #[test]
     fn tx_log_deletion() -> Result<()> {
-        let tx_log_store = TxLogStore::format(MemDisk::create(4 * CHUNK_NBLOCKS)?)?;
+        let tx_log_store = TxLogStore::format(MemDisk::create(4 * CHUNK_NBLOCKS)?, Key::random())?;
 
         let mut tx = tx_log_store.new_tx();
         let content = 5_u8;

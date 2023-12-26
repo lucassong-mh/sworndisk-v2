@@ -136,7 +136,12 @@ impl AllocBitmap {
     pub fn recover<D: BlockSet + 'static>(&self, store: &Arc<TxLogStore<D>>) -> Result<()> {
         let mut tx = store.new_tx();
         let res: Result<_> = tx.context(|| {
-            let diff_log = store.open_log_in(BUCKET_BLOCK_ALLOC_LOG, false)?;
+            let diff_log_res = store.open_log_in(BUCKET_BLOCK_ALLOC_LOG, false);
+            if let Err(e) = &diff_log_res && e.errno() == NotFound {
+                return Ok(());
+            }
+            let diff_log = diff_log_res?;
+
             let mut buf = Buf::alloc(diff_log.nblocks())?;
             diff_log.read(0, buf.as_mut())?;
             let buf_slice = buf.as_slice();

@@ -12,6 +12,7 @@ pod = {git = "https://github.com/jinzhao-dev/pod", rev = "7fa2ed2"}
 anymap = {version = "1.0.0-beta.2", default-features = false, features = ["hashbrown"]}
 array-init = "2.1.0"
 bitvec = {version = "1.0.1", default-features = false, features = ["atomic", "alloc", "serde"]}
+env_logger = "0.10.1"
 hashbrown = "0.12.3"
 itertools = "0.12.0"
 lazy_static = {version = "1.4.0", features = ["spin_no_std"]}
