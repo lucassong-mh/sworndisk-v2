@@ -90,11 +90,11 @@ use crate::prelude::*;
 use crate::tx::{CurrentTx, Tx, TxData, TxProvider};
 use crate::util::LazyDelete;
 
-use alloc::collections::{BTreeMap, BTreeSet}; // `HashMap` and `HashSet` are sufficient
 use alloc::sync::Weak;
 use core::fmt::{self, Debug};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 pub type RawLogId = u64;
 
@@ -123,7 +123,7 @@ impl<D: BlockSet> RawLogStore<D> {
         let new_self = {
             // Prepare lazy deletes first from persistent state
             let lazy_deletes = {
-                let mut delete_table = BTreeMap::new();
+                let mut delete_table = HashMap::new();
                 for (&log_id, log_entry) in state.log_table.iter() {
                     Self::add_lazy_delete(log_id, log_entry, &chunk_alloc, &mut delete_table)
                 }
@@ -172,7 +172,7 @@ impl<D: BlockSet> RawLogStore<D> {
         log_id: RawLogId,
         log_entry: &RawLogEntry,
         chunk_alloc: &ChunkAlloc,
-        delete_table: &mut BTreeMap<u64, Arc<LazyDelete<RawLogEntry>>>,
+        delete_table: &mut HashMap<u64, Arc<LazyDelete<RawLogEntry>>>,
     ) {
         let log_entry = log_entry.clone();
         let chunk_alloc = chunk_alloc.clone();
@@ -750,14 +750,14 @@ impl<'a> RawLogTailRef<'a> {
 /// The volatile and persistent state of a `RawLogStore`.
 struct State {
     persistent: RawLogStoreState,
-    write_set: BTreeSet<RawLogId>,
-    lazy_deletes: BTreeMap<RawLogId, Arc<LazyDelete<RawLogEntry>>>,
+    write_set: HashSet<RawLogId>,
+    lazy_deletes: HashMap<RawLogId, Arc<LazyDelete<RawLogEntry>>>,
 }
 
 /// The persistent state of a `RawLogStore`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RawLogStoreState {
-    log_table: BTreeMap<RawLogId, RawLogEntry>,
+    log_table: HashMap<RawLogId, RawLogEntry>,
     next_free_log_id: u64,
 }
 
@@ -777,11 +777,11 @@ pub(super) struct RawLogHead {
 impl State {
     pub fn new(
         persistent: RawLogStoreState,
-        lazy_deletes: BTreeMap<RawLogId, Arc<LazyDelete<RawLogEntry>>>,
+        lazy_deletes: HashMap<RawLogId, Arc<LazyDelete<RawLogEntry>>>,
     ) -> Self {
         Self {
             persistent: persistent.clone(),
-            write_set: BTreeSet::new(),
+            write_set: HashSet::new(),
             lazy_deletes,
         }
     }
@@ -808,7 +808,7 @@ impl State {
 impl RawLogStoreState {
     pub fn new() -> Self {
         Self {
-            log_table: BTreeMap::new(),
+            log_table: HashMap::new(),
             next_free_log_id: 0,
         }
     }
@@ -868,7 +868,7 @@ impl RawLogHead {
 /// A persistent edit to the state of `RawLogStore`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RawLogStoreEdit {
-    edit_table: BTreeMap<RawLogId, RawLogEdit>,
+    edit_table: HashMap<RawLogId, RawLogEdit>,
 }
 
 /// The basic unit of a persistent edit to the state of `RawLogStore`.
@@ -910,7 +910,7 @@ impl RawLogStoreEdit {
     /// Creates a new empty edit table.
     pub fn new() -> Self {
         Self {
-            edit_table: BTreeMap::new(),
+            edit_table: HashMap::new(),
         }
     }
 

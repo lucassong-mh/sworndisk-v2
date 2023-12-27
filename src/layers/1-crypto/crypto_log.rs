@@ -100,7 +100,7 @@ struct MhtStorage<L> {
 }
 
 /// The metadata of the root MHT node of a `CryptoLog`.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RootMhtMeta {
     pub pos: Pbid,
     pub mac: Mac,

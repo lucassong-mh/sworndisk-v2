@@ -41,9 +41,9 @@ use crate::os::Mutex;
 use crate::prelude::*;
 use crate::tx::{CurrentTx, Tx, TxData, TxProvider};
 
-use alloc::collections::BTreeMap; // TODO: HashMap is sufficient
 use core::fmt::{self, Debug};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// The ID of a chunk.
 pub type ChunkId = usize;
@@ -284,7 +284,7 @@ impl ChunkAllocState {
 /// A persistent edit to the state of a chunk allocator.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ChunkAllocEdit {
-    edit_table: BTreeMap<ChunkId, ChunkEdit>,
+    edit_table: HashMap<ChunkId, ChunkEdit>,
 }
 
 /// The smallest unit of a persistent edit to the
@@ -300,7 +300,7 @@ impl ChunkAllocEdit {
     /// Creates a new empty edit table.
     pub fn new() -> Self {
         Self {
-            edit_table: BTreeMap::new(),
+            edit_table: HashMap::new(),
         }
     }
 
