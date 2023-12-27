@@ -211,9 +211,8 @@ impl<K: Ord + Pod + Hash + Debug + 'static, V: Pod + Debug + 'static, D: BlockSe
             Ok(())
         });
 
-        handle.join().unwrap()?;
-        // FIXME: Fix data race in asynchronous compaction
-        // self.0.compactor.handle.lock().insert(handle);
+        // handle.join().unwrap()?; // synchronous
+        self.0.compactor.handle.lock().insert(handle);
         Ok(())
     }
 }
@@ -341,8 +340,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
 
     /// Persist all in-memory data of `TxLsmTree`.
     pub fn sync(&self) -> Result<()> {
-        // TODO: Store master sync id to trusted storage
-        let master_sync_id = MASTER_SYNC_ID.fetch_add(1, Ordering::Release) + 1;
+        let master_sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed) + 1;
 
         let timer = LatencyMetrics::start_timer(ReqType::Sync, "wal", "lsmtree");
 
@@ -357,10 +355,13 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
 
         let timer = LatencyMetrics::start_timer(ReqType::Sync, "tx_log_store", "lsmtree");
 
+        self.compactor.wait_compaction()?;
         self.tx_log_store.sync()?;
 
         LatencyMetrics::stop_timer(timer);
 
+        // TODO: Store master sync id to trusted storage
+        MASTER_SYNC_ID.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -763,7 +764,7 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> Debug
 
 impl<K, V, D: BlockSet> Drop for TxLsmTreeInner<K, V, D> {
     fn drop(&mut self) {
-        let _ = self.compactor.wait_compaction();
+        // let _ = self.compactor.wait_compaction();
     }
 }
 

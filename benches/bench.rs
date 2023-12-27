@@ -37,22 +37,22 @@ fn main() {
             .concurrency(1)
             .build()
             .unwrap(),
-        // BenchBuilder::new("SwornDisk::read_seq")
-        //     .disk_type(DiskType::SwornDisk)
-        //     .io_type(IoType::Read)
-        //     .io_pattern(IoPattern::Seq)
-        //     .total_bytes(total_bytes)
-        //     .concurrency(1)
-        //     .build()
-        //     .unwrap(),
-        // BenchBuilder::new("SwornDisk::read_rnd")
-        //     .disk_type(DiskType::SwornDisk)
-        //     .io_type(IoType::Read)
-        //     .io_pattern(IoPattern::Rnd)
-        //     .total_bytes(total_bytes)
-        //     .concurrency(1)
-        //     .build()
-        //     .unwrap(),
+        BenchBuilder::new("SwornDisk::read_seq")
+            .disk_type(DiskType::SwornDisk)
+            .io_type(IoType::Read)
+            .io_pattern(IoPattern::Seq)
+            .total_bytes(total_bytes)
+            .concurrency(1)
+            .build()
+            .unwrap(),
+        BenchBuilder::new("SwornDisk::read_rnd")
+            .disk_type(DiskType::SwornDisk)
+            .io_type(IoType::Read)
+            .io_pattern(IoPattern::Rnd)
+            .total_bytes(total_bytes)
+            .concurrency(1)
+            .build()
+            .unwrap(),
         BenchBuilder::new("EncDisk::write_seq")
             .disk_type(DiskType::EncDisk)
             .io_type(IoType::Write)
@@ -69,22 +69,22 @@ fn main() {
             .concurrency(1)
             .build()
             .unwrap(),
-        // BenchBuilder::new("EncDisk::read_seq")
-        //     .disk_type(DiskType::EncDisk)
-        //     .io_type(IoType::Read)
-        //     .io_pattern(IoPattern::Seq)
-        //     .total_bytes(total_bytes)
-        //     .concurrency(1)
-        //     .build()
-        //     .unwrap(),
-        // BenchBuilder::new("EncDisk::read_rnd")
-        //     .disk_type(DiskType::EncDisk)
-        //     .io_type(IoType::Read)
-        //     .io_pattern(IoPattern::Rnd)
-        //     .total_bytes(total_bytes)
-        //     .concurrency(1)
-        //     .build()
-        //     .unwrap(),
+        BenchBuilder::new("EncDisk::read_seq")
+            .disk_type(DiskType::EncDisk)
+            .io_type(IoType::Read)
+            .io_pattern(IoPattern::Seq)
+            .total_bytes(total_bytes)
+            .concurrency(1)
+            .build()
+            .unwrap(),
+        BenchBuilder::new("EncDisk::read_rnd")
+            .disk_type(DiskType::EncDisk)
+            .io_type(IoType::Read)
+            .io_pattern(IoPattern::Rnd)
+            .total_bytes(total_bytes)
+            .concurrency(1)
+            .build()
+            .unwrap(),
     ];
 
     // Run all benchmarks and output the results
@@ -299,7 +299,7 @@ mod benches {
         fn run(&self) -> Result<()> {
             let io_type = self.io_type;
             let io_pattern = self.io_pattern;
-            let buf_size = self.buf_size / BLOCK_SIZE;
+            let buf_nblocks = self.buf_size / BLOCK_SIZE;
             let total_nblock = self.total_bytes / BLOCK_SIZE;
             let concurrency = self.concurrency;
 
@@ -310,17 +310,17 @@ mod benches {
                     let local_pos = (i as BlockId) * local_nblocks;
                     thread::spawn(move || match (io_type, io_pattern) {
                         (IoType::Read, IoPattern::Seq) => {
-                            disk.read_seq(local_pos, total_nblock, buf_size)
+                            disk.read_seq(local_pos, local_nblocks, buf_nblocks)
                         }
                         (IoType::Write, IoPattern::Seq) => {
-                            disk.write_seq(local_pos, total_nblock, buf_size)
+                            disk.write_seq(local_pos, local_nblocks, buf_nblocks)
                         }
 
                         (IoType::Read, IoPattern::Rnd) => {
-                            disk.read_rnd(local_pos, total_nblock, buf_size)
+                            disk.read_rnd(local_pos, local_nblocks, buf_nblocks)
                         }
                         (IoType::Write, IoPattern::Rnd) => {
-                            disk.write_rnd(local_pos, total_nblock, buf_size)
+                            disk.write_rnd(local_pos, local_nblocks, buf_nblocks)
                         }
                     })
                 })
@@ -415,8 +415,8 @@ mod disks {
     impl FileAsDisk {
         pub fn create(nblocks: usize, path: &str) -> Self {
             unsafe {
-                let oflag = O_RDWR | O_CREAT | O_TRUNC;
-                // let oflag = O_RDWR | O_CREAT | O_TRUNC | O_DIRECT;
+                // let oflag = O_RDWR | O_CREAT | O_TRUNC;
+                let oflag = O_RDWR | O_CREAT | O_TRUNC | O_DIRECT;
                 let fd = open(CString::new(path).unwrap().as_ptr() as _, oflag, 0o666);
                 if fd == -1 {
                     println!("open error: {}", std::io::Error::last_os_error());
@@ -535,32 +535,29 @@ mod disks {
                 self.write(pos + i * buf_nblocks, buf.as_ref())?;
             }
 
-            self.sync()?;
-            Ok(())
+            self.sync()
         }
 
         fn read_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()> {
             let mut buf = Buf::alloc(buf_nblocks)?;
-            let mut read_cnt = 0;
-            while read_cnt <= total_nblocks / buf_nblocks {
+
+            for _ in 0..total_nblocks / buf_nblocks {
                 let rnd_pos = gen_rnd_pos(total_nblocks);
                 self.read(pos + rnd_pos, buf.as_mut())?;
-                read_cnt += 1;
             }
+
             Ok(())
         }
 
         fn write_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()> {
             let buf = Buf::alloc(buf_nblocks)?;
-            let mut write_cnt = 0;
-            while write_cnt <= total_nblocks / buf_nblocks {
+
+            for _ in 0..total_nblocks / buf_nblocks {
                 let rnd_pos = gen_rnd_pos(total_nblocks);
                 self.write(pos + rnd_pos, buf.as_ref())?;
-                write_cnt += 1;
             }
 
-            self.sync()?;
-            Ok(())
+            self.sync()
         }
 
         fn display_ext(&self) {
@@ -632,40 +629,42 @@ mod disks {
 
         fn write_seq(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()> {
             let buf = Buf::alloc(buf_nblocks)?;
+
             for i in 0..total_nblocks / buf_nblocks {
                 for _ in 0..buf_nblocks {
                     Self::dummy_encrypt().unwrap();
                 }
                 self.file_disk.write(pos + i * buf_nblocks, buf.as_ref())?;
             }
+
             self.file_disk.flush()
         }
 
         fn read_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()> {
             let mut buf = Buf::alloc(buf_nblocks)?;
-            let mut read_cnt = 0;
-            while read_cnt <= total_nblocks / buf_nblocks {
+
+            for _ in 0..total_nblocks / buf_nblocks {
                 for _ in 0..buf_nblocks {
                     Self::dummy_decrypt().unwrap();
                 }
                 let rnd_pos = gen_rnd_pos(total_nblocks);
                 self.file_disk.read(pos + rnd_pos, buf.as_mut())?;
-                read_cnt += 1;
             }
+
             Ok(())
         }
 
         fn write_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()> {
             let buf = Buf::alloc(buf_nblocks)?;
-            let mut write_cnt = 0;
-            while write_cnt <= total_nblocks / buf_nblocks {
+
+            for _ in 0..total_nblocks / buf_nblocks {
                 for _ in 0..buf_nblocks {
                     Self::dummy_encrypt().unwrap();
                 }
                 let rnd_pos = gen_rnd_pos(total_nblocks);
                 self.file_disk.write(pos + rnd_pos, buf.as_ref())?;
-                write_cnt += 1;
             }
+
             self.file_disk.flush()
         }
     }

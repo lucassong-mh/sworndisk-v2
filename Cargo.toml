@@ -6,8 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-inherit-methods-macro = {git = "https://github.com/jinzhao-dev/inherit-methods-macro", rev = "98f7e3e"}
-pod = {git = "https://github.com/jinzhao-dev/pod", rev = "7fa2ed2"}
+inherit-methods-macro = {git = "https://github.com/asterinas/inherit-methods-macro", rev = "98f7e3e"}
+pod = {git = "https://github.com/asterinas/pod", rev = "7fa2ed2"}
 
 anymap = {version = "1.0.0-beta.2", default-features = false, features = ["hashbrown"]}
 array-init = "2.1.0"

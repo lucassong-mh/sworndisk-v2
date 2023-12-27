@@ -28,6 +28,8 @@ lazy_static! {
     static ref METRICS: RwLock<Metrics> = RwLock::new(Metrics::new(true));
 }
 
+const ENABLE_METRICS: bool = false;
+
 /// System metrics.
 /// It measures latency and amplification information.
 pub struct Metrics {
@@ -102,6 +104,9 @@ impl Metrics {
     }
 
     pub fn display() {
+        if !ENABLE_METRICS {
+            return;
+        }
         println!("========= SwornDisk Metrics =========");
         LatencyMetrics::display();
         AmplificationMetrics::display();
@@ -109,6 +114,9 @@ impl Metrics {
     }
 
     pub fn reset() {
+        if !ENABLE_METRICS {
+            return;
+        }
         LatencyMetrics::reset();
         AmplificationMetrics::reset();
     }
@@ -127,6 +135,9 @@ impl LatencyMetrics {
     }
 
     pub fn start_timer(req_type: ReqType, category: &str, parent_category: &str) -> Timer {
+        if !ENABLE_METRICS {
+            return Timer::default();
+        }
         let mut metrics = METRICS.write();
         let table = &mut metrics.latency.table.get_mut(&req_type).unwrap().table;
         let level = if !parent_category.is_empty() && table.contains_key(parent_category) {
@@ -158,6 +169,9 @@ impl LatencyMetrics {
     }
 
     pub fn stop_timer(timer: Timer) {
+        if !ENABLE_METRICS {
+            return;
+        }
         let elapsed = timer.start.elapsed();
         let mut metrics = METRICS.write();
         let req_latency = metrics.latency.table.get_mut(&timer.req_type).unwrap();
@@ -180,7 +194,7 @@ impl LatencyMetrics {
         println!("===== Latency Metrics =====");
         let metrics = METRICS.read();
         for (req_type, req_latency) in metrics.latency.table.iter() {
-            println!("{:?}", req_type);
+            println!("{:?}:", req_type);
             let mut level = 0u8;
             loop {
                 let mut lats: Vec<_> = req_latency
@@ -201,7 +215,7 @@ impl LatencyMetrics {
                         req_latency.table.get(parent_cat).unwrap().value
                     };
                     println!(
-                        "{indent}{parent_cat}-{cat}: {:?} ({:.2}%)",
+                        "{indent}{parent_cat}-{cat}: {:.3?} ({:.2}%)",
                         lat.value,
                         (lat.value.as_secs_f64() / total_lat.as_secs_f64()) * 100.0
                     );
@@ -222,6 +236,16 @@ impl ReqLatency {
     }
 }
 
+impl Default for Timer {
+    fn default() -> Self {
+        Self {
+            start: Instant::now(),
+            req_type: ReqType::Read,
+            category: String::new(),
+        }
+    }
+}
+
 impl AmplificationMetrics {
     pub fn new() -> Self {
         let table = [
@@ -235,18 +259,27 @@ impl AmplificationMetrics {
     }
 
     pub fn acc_data_amount(amp_type: AmpType, amount: usize) {
+        if !ENABLE_METRICS {
+            return;
+        }
         let mut metrics = METRICS.write();
         let amp = metrics.amplification.table.get_mut(&amp_type).unwrap();
         amp.data += amount;
     }
 
     pub fn acc_index_amount(amp_type: AmpType, amount: usize) {
+        if !ENABLE_METRICS {
+            return;
+        }
         let mut metrics = METRICS.write();
         let amp = metrics.amplification.table.get_mut(&amp_type).unwrap();
         amp.index += amount;
     }
 
     pub fn acc_journal_amount(amp_type: AmpType, amount: usize) {
+        if !ENABLE_METRICS {
+            return;
+        }
         let mut metrics = METRICS.write();
         let amp = metrics.amplification.table.get_mut(&amp_type).unwrap();
         amp.journal += amount;
@@ -266,7 +299,11 @@ impl AmplificationMetrics {
         println!("===== Amplification Metrics =====");
         let metrics = METRICS.read();
         for (amp_type, amp) in metrics.amplification.table.iter() {
-            let factor = (amp.data + amp.index + amp.journal) as f64 / amp.data as f64;
+            let factor = if amp.data != 0 {
+                (amp.data + amp.index + amp.journal) as f64 / amp.data as f64
+            } else {
+                f64::NAN
+            };
             println!("{:?} Amplification Factor: {:.3}", amp_type, factor);
         }
         println!("===== Amplification Metrics =====");
