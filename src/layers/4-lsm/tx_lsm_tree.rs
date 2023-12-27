@@ -324,8 +324,12 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
             return Ok(value);
         }
 
+        let timer = LatencyMetrics::start_timer(ReqType::Read, "read_tx", "lsmtree");
+
         // 2. Search from SSTs (do Read TX)
         let value = self.do_read_tx(key)?;
+
+        LatencyMetrics::stop_timer(timer);
 
         Ok(value)
     }
@@ -364,13 +368,13 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
 
     /// Read TX
     fn do_read_tx(&self, key: &K) -> Result<V> {
+        let timer = LatencyMetrics::start_timer(ReqType::Read, "sst", "read_tx");
         let mut tx = self.tx_log_store.new_tx();
 
         let read_res: Result<_> = tx.context(|| {
             // Search each level from top to bottom (newer to older)
             let sst_manager = self.sst_manager.read();
 
-            let timer = LatencyMetrics::start_timer(ReqType::Read, "sst", "read_tx");
             for (level, bucket) in LsmLevel::iter() {
                 for (id, sst) in sst_manager.list_level(level) {
                     if !sst.is_within_range(key) {
@@ -382,16 +386,18 @@ impl<K: Ord + Pod + Hash + Debug, V: Pod + Debug, D: BlockSet + 'static> TxLsmTr
                     }
                 }
             }
-            LatencyMetrics::stop_timer(timer);
 
             return_errno_with_msg!(NotFound, "target sst not found");
         });
+        LatencyMetrics::stop_timer(timer);
+        let timer = LatencyMetrics::start_timer(ReqType::Read, "tx_commit", "read_tx");
         if read_res.as_ref().is_err_and(|e| e.errno() != NotFound) {
             tx.abort();
             return_errno_with_msg!(TxAborted, "read TX failed")
         }
 
         tx.commit()?;
+        LatencyMetrics::stop_timer(timer);
 
         read_res
     }

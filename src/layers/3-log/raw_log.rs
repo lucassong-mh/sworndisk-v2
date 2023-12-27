@@ -90,7 +90,7 @@ use crate::prelude::*;
 use crate::tx::{CurrentTx, Tx, TxData, TxProvider};
 use crate::util::LazyDelete;
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet}; // `HashMap` and `HashSet` are sufficient
 use alloc::sync::Weak;
 use core::fmt::{self, Debug};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -150,27 +150,18 @@ impl<D: BlockSet> RawLogStore<D> {
             let chunk_alloc = new_self.chunk_alloc.clone();
 
             move |current: CurrentTx<'_>| {
-                Self::do_lazy_deletion(&state, &current);
-
                 current.data_with(|edit: &RawLogStoreEdit| {
+                    if edit.edit_table.is_empty() {
+                        return;
+                    }
+
                     let mut state = state.lock();
                     state.apply(&edit);
 
-                    // Add lazy delete for newly created logs
-                    for log_id in edit.iter_created_logs() {
-                        let log_entry_opt = state.persistent.find_log(log_id);
-                        if log_entry_opt.is_none() || state.lazy_deletes.contains_key(&log_id) {
-                            continue;
-                        }
-
-                        Self::add_lazy_delete(
-                            log_id,
-                            log_entry_opt.as_ref().unwrap(),
-                            &chunk_alloc,
-                            &mut state.lazy_deletes,
-                        );
-                    }
+                    Self::add_lazy_deletes_for_created_logs(&mut state, edit, &chunk_alloc);
                 });
+                let mut state = state.lock();
+                Self::do_lazy_deletion(&mut state, &current);
             }
         });
 
@@ -193,12 +184,32 @@ impl<D: BlockSet> RawLogStore<D> {
         );
     }
 
-    fn do_lazy_deletion(state: &Arc<Mutex<State>>, current_tx: &CurrentTx) {
+    fn add_lazy_deletes_for_created_logs(
+        state: &mut State,
+        edit: &RawLogStoreEdit,
+        chunk_alloc: &ChunkAlloc,
+    ) {
+        for log_id in edit.iter_created_logs() {
+            let log_entry_opt = state.persistent.find_log(log_id);
+            if log_entry_opt.is_none() || state.lazy_deletes.contains_key(&log_id) {
+                continue;
+            }
+
+            Self::add_lazy_delete(
+                log_id,
+                log_entry_opt.as_ref().unwrap(),
+                chunk_alloc,
+                &mut state.lazy_deletes,
+            )
+        }
+    }
+
+    fn do_lazy_deletion(state: &mut State, current_tx: &CurrentTx) {
         let deleted_logs = current_tx
             .data_with(|edit: &RawLogStoreEdit| edit.iter_deleted_logs().collect::<Vec<_>>());
 
         for log_id in deleted_logs {
-            let Some(lazy_delete) = state.lock().lazy_deletes.remove(&log_id) else {
+            let Some(lazy_delete) = state.lazy_deletes.remove(&log_id) else {
                 // Other concurrent TXs have deleted the same log
                 continue;
             };
@@ -361,6 +372,8 @@ impl<D: BlockSet> BlockLog for RawLog<D> {
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
     fn read(&self, pos: BlockId, buf: BufMut) -> Result<()> {
+        AmplificationMetrics::acc_index_amount(AmpType::Read, buf.nblocks());
+
         let log_ref = self.as_ref();
         log_ref.read(pos, buf)
     }
@@ -980,6 +993,10 @@ impl RawLogStoreEdit {
                 }
             })
             .map(|(id, _)| *id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.edit_table.is_empty()
     }
 }
 

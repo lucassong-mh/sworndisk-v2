@@ -20,4 +20,4 @@ pub use self::error::{Errno, Error};
 pub use self::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef, BLOCK_SIZE};
 pub use self::layers::disk::SwornDisk;
 pub use self::os::{Aead, AeadIv, AeadKey, AeadMac, Rng};
-pub use self::util::{Aead as _, RandomInit, Rng as _};
+pub use self::util::{Aead as _, Metrics, RandomInit, Rng as _};

@@ -130,7 +130,11 @@ impl LatencyMetrics {
         let mut metrics = METRICS.write();
         let table = &mut metrics.latency.table.get_mut(&req_type).unwrap().table;
         let level = if !parent_category.is_empty() && table.contains_key(parent_category) {
-            table.get(parent_category).unwrap().level + 1
+            table
+                .get(parent_category)
+                .expect("parent category must be valid")
+                .level
+                + 1
         } else {
             0
         };

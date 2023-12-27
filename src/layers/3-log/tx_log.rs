@@ -70,7 +70,7 @@ use crate::prelude::*;
 use crate::tx::{CurrentTx, Tx, TxData, TxId, TxProvider};
 use crate::util::{LazyDelete, RandomInit};
 
-use alloc::collections::{BTreeMap, BTreeSet}; // TODO: Find alternatives to adapt 'rust-for-linux'
+use alloc::collections::{BTreeMap, BTreeSet}; // `HashMap` and `HashSet` are sufficient
 use core::any::Any;
 use core::fmt::{self, Debug};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -251,12 +251,21 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
             move |current: CurrentTx<'_>| {
                 let mut journal = journal.lock();
                 current.data_with(|chunk_edit: &ChunkAllocEdit| {
+                    if chunk_edit.is_empty() {
+                        return;
+                    }
                     journal.add(AllEdit::from_chunk_edit(chunk_edit));
                 });
                 current.data_with(|raw_log_edit: &RawLogStoreEdit| {
+                    if raw_log_edit.is_empty() {
+                        return;
+                    }
                     journal.add(AllEdit::from_raw_log_edit(raw_log_edit));
                 });
                 current.data_with(|tx_log_edit: &TxLogStoreEdit| {
+                    if tx_log_edit.is_empty() {
+                        return;
+                    }
                     journal.add(AllEdit::from_tx_log_edit(tx_log_edit));
                 });
                 journal.commit();
@@ -269,22 +278,20 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
             let state = new_self.state.clone();
             let raw_log_store = new_self.raw_log_store.clone();
             move |mut current: CurrentTx<'_>| {
-                Self::do_lazy_deletion(&state, &current);
-
                 current.data_with(|store_edit: &TxLogStoreEdit| {
+                    if store_edit.is_empty() {
+                        return;
+                    }
+
                     let mut state = state.lock();
                     state.apply(&store_edit);
 
-                    // Add lazy delete for newly created logs
-                    for &log_id in store_edit.iter_created_logs() {
-                        if state.lazy_deletes.contains_key(&log_id) {
-                            continue;
-                        }
-                        Self::add_lazy_delete(log_id, &mut state.lazy_deletes, &raw_log_store);
-                    }
+                    Self::add_lazy_deletes_for_created_logs(&mut state, store_edit, &raw_log_store);
                 });
 
-                Self::apply_log_caches(&state, &mut current);
+                let mut state = state.lock();
+                Self::apply_log_caches(&mut state, &mut current);
+                Self::do_lazy_deletion(&mut state, &current);
             }
         });
 
@@ -332,12 +339,25 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         );
     }
 
-    fn do_lazy_deletion(state: &Arc<Mutex<State>>, current_tx: &CurrentTx<'_>) {
+    fn add_lazy_deletes_for_created_logs(
+        state: &mut State,
+        edit: &TxLogStoreEdit,
+        raw_log_store: &Arc<RawLogStore<D>>,
+    ) {
+        for &log_id in edit.iter_created_logs() {
+            if state.lazy_deletes.contains_key(&log_id) {
+                continue;
+            }
+
+            Self::add_lazy_delete(log_id, &mut state.lazy_deletes, &raw_log_store);
+        }
+    }
+
+    fn do_lazy_deletion(state: &mut State, current_tx: &CurrentTx<'_>) {
         let deleted_logs = current_tx.data_with(|edit: &TxLogStoreEdit| {
             edit.iter_deleted_logs().cloned().collect::<Vec<_>>()
         });
 
-        let mut state = state.lock();
         for deleted_log_id in deleted_logs {
             let Some(lazy_delete) = state.lazy_deletes.remove(&deleted_log_id) else {
                 // Other concurrent TXs have deleted the same log
@@ -351,10 +371,13 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     }
 
     // TODO: Need performance improvement
-    fn apply_log_caches(state: &Arc<Mutex<State>>, current_tx: &mut CurrentTx<'_>) {
+    fn apply_log_caches(state: &mut State, current_tx: &mut CurrentTx<'_>) {
         // Apply per-TX log cache
         current_tx.data_mut_with(|open_cache_table: &mut OpenLogCache| {
-            let mut state = state.lock();
+            if open_cache_table.open_table.is_empty() {
+                return;
+            }
+
             let log_caches = &mut state.log_caches;
             for (log_id, open_cache) in open_cache_table.open_table.iter_mut() {
                 let log_cache = log_caches.get_mut(log_id).unwrap();
@@ -1155,6 +1178,10 @@ impl TxLogStoreEdit {
                 append.root_mht = meta.1;
             }
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.edit_table.is_empty()
     }
 }
 

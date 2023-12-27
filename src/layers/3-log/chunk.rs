@@ -41,7 +41,7 @@ use crate::os::Mutex;
 use crate::prelude::*;
 use crate::tx::{CurrentTx, Tx, TxData, TxProvider};
 
-use alloc::collections::BTreeMap;
+use alloc::collections::BTreeMap; // TODO: HashMap is sufficient
 use core::fmt::{self, Debug};
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +86,10 @@ impl ChunkAlloc {
             move |current: CurrentTx<'_>| {
                 let state = state.clone();
                 current.data_with(move |edit: &ChunkAllocEdit| {
+                    if edit.edit_table.is_empty() {
+                        return;
+                    }
+
                     let mut state = state.lock();
                     edit.apply_to(&mut state);
                 });
@@ -342,6 +346,10 @@ impl ChunkAllocEdit {
                 None
             }
         })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.edit_table.is_empty()
     }
 }
 

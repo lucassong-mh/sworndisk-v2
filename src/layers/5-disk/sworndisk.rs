@@ -45,6 +45,8 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             self.read_one_block(lba, block_buf)?;
             lba += 1;
         }
+
+        AmplificationMetrics::acc_data_amount(AmpType::Read, buf.nblocks());
         Ok(buf.nblocks())
     }
 
@@ -137,11 +139,6 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         LatencyMetrics::stop_timer(timer);
 
         Ok(())
-    }
-
-    pub fn display_metrics(&self) {
-        Metrics::display();
-        Metrics::reset();
     }
 
     /// Return the total number of blocks in the device.
