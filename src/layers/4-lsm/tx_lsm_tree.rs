@@ -148,7 +148,7 @@ impl<K: Ord + Pod + Hash + Debug + 'static, V: Pod + Debug + 'static, D: BlockSe
 
     pub fn put(&self, key: K, value: V) -> Result<()> {
         let record = (key, value);
-        let timer = LatencyMetrics::start_timer(ReqType::Write, "wal", "lsmtree");
+        let timer = LatencyMetrics::start_timer(ReqType::Write, "wal_and_memtable", "lsmtree");
 
         // 1. Write WAL
         self.0.wal_append_tx.append(&record)?;
@@ -163,9 +163,9 @@ impl<K: Ord + Pod + Hash + Debug + 'static, V: Pod + Debug + 'static, D: BlockSe
         // TODO: Think of combining WAL's TX with minor compaction TX?
         self.0.wal_append_tx.commit()?;
 
-        self.0.compactor.wait_compaction()?;
-
         LatencyMetrics::stop_timer(timer);
+
+        self.0.compactor.wait_compaction()?;
 
         // 3. Trigger compaction when MemTable is at capacity
         self.0.memtable_manager.switch();
@@ -210,8 +210,8 @@ impl<K: Ord + Pod + Hash + Debug + 'static, V: Pod + Debug + 'static, D: BlockSe
 
             Ok(())
         });
-
         // handle.join().unwrap()?; // synchronous
+
         self.0.compactor.handle.lock().insert(handle);
         Ok(())
     }

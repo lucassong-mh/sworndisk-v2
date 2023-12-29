@@ -81,51 +81,64 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
     /// Write a specified number of block contents at a logical block address on the device.
     pub fn write(&self, mut lba: Lba, buf: BufRef) -> Result<usize> {
+        let nblocks = buf.nblocks();
         for block_buf in buf.iter() {
             self.data_buf.put(RecordKey { lba }, block_buf);
             lba += 1;
         }
+        AmplificationMetrics::acc_data_amount(AmpType::Write, nblocks);
 
         if self.data_buf.len() < Self::BUF_CAP {
-            return Ok(buf.nblocks());
+            return Ok(nblocks);
         }
 
-        let mut cipher = Buf::alloc(1)?;
-        for (lba, data_block) in self.data_buf.all_blocks() {
-            let timer = LatencyMetrics::start_timer(ReqType::Write, "data", "");
-            let hba = self
-                .block_validity_bitmap
-                .alloc()
-                .ok_or(Error::with_msg(OutOfMemory, "block allocation failed"))?;
+        let num_write = self.data_buf.len();
+        let hbas = self
+            .block_validity_bitmap
+            .alloc_batch(num_write)
+            .ok_or(Error::with_msg(OutOfDisk, "block allocation failed"))?;
+        debug_assert_eq!(hbas.len(), num_write);
+        // FIXME: Fix this based on queue-based API
+        assert!(hbas.windows(2).all(|pair| pair[1] - pair[0] == 1));
 
+        let mut cipher = Buf::alloc(num_write)?;
+        for (i, (lba, data_block)) in self.data_buf.all_blocks().into_iter().enumerate() {
+            let timer = LatencyMetrics::start_timer(ReqType::Write, "encrypt", "");
             let key = Key::random();
             let mac = OsAead::new().encrypt(
                 &data_block.0,
                 &key,
                 &Iv::new_zeroed(),
                 &[],
-                cipher.as_mut_slice(),
+                &mut cipher.as_mut_slice()[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE],
             )?;
-            self.user_data_disk.write(hba, cipher.as_ref())?;
-
             LatencyMetrics::stop_timer(timer);
 
-            AmplificationMetrics::acc_data_amount(AmpType::Write, buf.nblocks());
-
             let timer = LatencyMetrics::start_timer(ReqType::Write, "lsmtree", "");
-
-            self.logical_block_table
-                .put(lba, RecordValue { hba, key, mac })?;
-
+            self.logical_block_table.put(
+                lba,
+                RecordValue {
+                    hba: hbas[i],
+                    key,
+                    mac,
+                },
+            )?;
             LatencyMetrics::stop_timer(timer);
         }
 
+        let timer = LatencyMetrics::start_timer(ReqType::Write, "data", "");
+        self.user_data_disk.write(hbas[0], cipher.as_ref())?;
+        LatencyMetrics::stop_timer(timer);
+
         self.data_buf.clear();
-        Ok(buf.nblocks())
+        Ok(nblocks)
     }
 
     /// Sync all cached data in the device to the storage medium for durability.
     pub fn sync(&self) -> Result<()> {
+        // TODO: Flush the buffer first
+        assert!(self.data_buf.len() == 0);
+
         let timer = LatencyMetrics::start_timer(ReqType::Sync, "lsmtree", "");
 
         self.logical_block_table.sync()?;

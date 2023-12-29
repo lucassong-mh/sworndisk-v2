@@ -178,6 +178,21 @@ impl AllocBitmap {
         Some(hba as Hba)
     }
 
+    pub fn alloc_batch(&self, count: usize) -> Option<Vec<Hba>> {
+        let mut bitmap = self.bitmap.lock();
+        let mut hbas = Vec::with_capacity(count);
+        let mut min_avail = self.min_avail.load(Ordering::Relaxed);
+        for _ in 0..count {
+            let hba = bitmap[min_avail..].first_one()? + min_avail;
+            hbas.push(hba);
+
+            bitmap.set(hba, false);
+            min_avail += 1;
+        }
+        self.min_avail.store(min_avail, Ordering::Release);
+        Some(hbas)
+    }
+
     pub fn set_allocated(&self, nth: usize) {
         self.bitmap.lock().set(nth, false);
     }

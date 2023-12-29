@@ -28,7 +28,7 @@ lazy_static! {
     static ref METRICS: RwLock<Metrics> = RwLock::new(Metrics::new(true));
 }
 
-const ENABLE_METRICS: bool = false;
+const ENABLE_METRICS: bool = true;
 
 /// System metrics.
 /// It measures latency and amplification information.
@@ -44,12 +44,14 @@ pub struct LatencyMetrics {
 }
 
 /// Maintains all latency information (in a parent-child manner).
+#[derive(Debug)]
 pub struct ReqLatency {
     table: HashMap<String, Latency>,
     total: Duration,
 }
 
 /// Latency information of one category.
+#[derive(Debug)]
 pub struct Latency {
     category: String,
     parent_category: String,
@@ -66,6 +68,7 @@ pub enum ReqType {
 }
 
 /// Maintains amplification information for each type.
+#[derive(Debug)]
 pub struct AmplificationMetrics {
     table: HashMap<AmpType, Amplification>,
 }
