@@ -1,5 +1,5 @@
 //! MemTable.
-use super::AsKv;
+use super::{AsKv, RangeQueryCtx, RecordKey, RecordValue, SyncID};
 use crate::prelude::*;
 
 use alloc::collections::BTreeMap;
@@ -8,21 +8,20 @@ use pod::Pod;
 
 /// MemTable for LSM-Tree.
 ///
-/// It manages a bunch of key-value records in memory, given a capacity.
+/// Manages organized key-value records in memory with a capacity.
+/// Each `MemTable` is sync-aware (tagged with current sync ID).
 /// Both synced and unsynced records can co-exist.
-/// It supports user-defined callback when a record is dropped.
+/// Also supports user-defined callback when a record is dropped.
 pub(super) struct MemTable<K, V> {
-    // Use `ValueEx<V>` instead `V` to maintain multiple
-    // values tagged with sync id for each key
-    table: BTreeMap<K, ValueEx<V>>,
+    table: BTreeMap<K, ValueEx<V>>, // TODO: Try skiplist
     size: usize,
     cap: usize,
-    sync_id: u64,
+    sync_id: SyncID,
     on_drop_record: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
 }
 
-// Value which is sync-aware
-// At most one unsynced&one synced records can coexist at the same time
+/// An extended value which is sync-aware.
+/// At most one unsynced and one synced records can coexist at the same time.
 #[derive(Clone, Debug)]
 pub(super) enum ValueEx<V> {
     Synced(V),
@@ -30,10 +29,10 @@ pub(super) enum ValueEx<V> {
     SyncedAndUnsynced(V, V),
 }
 
-impl<K: Copy + Ord + Debug, V: Pod> MemTable<K, V> {
+impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
     pub fn new(
         cap: usize,
-        sync_id: u64,
+        sync_id: SyncID,
         on_drop_record: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
     ) -> Self {
         Self {
@@ -47,10 +46,22 @@ impl<K: Copy + Ord + Debug, V: Pod> MemTable<K, V> {
 
     pub fn get(&self, key: &K) -> Option<&V> {
         let value_ex = self.table.get(key)?;
-        // Return value which tagged most latest sync id
         Some(value_ex.get())
     }
 
+    /// Range query, returns whether the request is completed.
+    pub fn get_range(&self, range_query_ctx: &mut RangeQueryCtx<K, V>) -> bool {
+        debug_assert!(!range_query_ctx.is_completed());
+        for (k, v_ex) in self
+            .table
+            .range(range_query_ctx.range_uncompleted().unwrap())
+        {
+            range_query_ctx.complete(*k, *v_ex.get());
+        }
+        range_query_ctx.is_completed()
+    }
+
+    /// Put a new K-V record to the table, drop the old one.
     pub fn put(&mut self, key: K, value: V) -> Option<V> {
         if let Some(value_ex) = self.table.get_mut(&key) {
             if let Some(dropped) = value_ex.put(value) {
@@ -69,7 +80,8 @@ impl<K: Copy + Ord + Debug, V: Pod> MemTable<K, V> {
         None
     }
 
-    pub fn sync(&mut self, sync_id: u64) -> Result<()> {
+    /// Sync the table, update the sync ID, drop the replaced one.
+    pub fn sync(&mut self, sync_id: SyncID) -> Result<()> {
         for (k, v_ex) in &mut self.table {
             if let Some(dropped) = v_ex.sync() {
                 self.on_drop_record
@@ -82,7 +94,10 @@ impl<K: Copy + Ord + Debug, V: Pod> MemTable<K, V> {
         Ok(())
     }
 
-    // Records should be tagged with sync id
+    pub fn sync_id(&self) -> SyncID {
+        self.sync_id
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&K, &ValueEx<V>)> {
         self.table.iter()
     }
@@ -101,11 +116,12 @@ impl<K: Copy + Ord + Debug, V: Pod> MemTable<K, V> {
     }
 }
 
-impl<V: Pod> ValueEx<V> {
+impl<V: RecordValue> ValueEx<V> {
     fn new(value: V) -> Self {
         Self::Unsynced(value)
     }
 
+    /// Gets the most recent value.
     fn get(&self) -> &V {
         match self {
             Self::Synced(v) => v,
@@ -130,7 +146,6 @@ impl<V: Pod> ValueEx<V> {
                 *self = Self::SyncedAndUnsynced(sv, value);
                 Some(usv)
             }
-            _ => None,
         };
         dropped
     }
@@ -145,15 +160,15 @@ impl<V: Pod> ValueEx<V> {
                 None
             }
             ValueEx::SyncedAndUnsynced(sv, usv) => {
-                *self = Self::Synced(sv);
-                Some(usv)
+                *self = Self::Synced(usv);
+                Some(sv)
             }
         };
         dropped
     }
 }
 
-impl<V: Pod> Default for ValueEx<V> {
+impl<V: RecordValue> Default for ValueEx<V> {
     fn default() -> Self {
         Self::Unsynced(V::new_uninit())
     }

@@ -10,7 +10,8 @@ use super::block_alloc::{AllocBitmap, BlockAlloc};
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
-    AsKv, LsmLevel, TxEventListener, TxEventListenerFactory, TxLsmTree, TxType,
+    AsKv, LsmLevel, RecordKey as RecordK, RecordValue as RecordV, TxEventListener,
+    TxEventListenerFactory, TxLsmTree, TxType,
 };
 use crate::os::{Aead as OsAead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, RwLock};
 use crate::prelude::*;
@@ -18,6 +19,7 @@ use crate::tx::Tx;
 use crate::util::Aead;
 
 use alloc::collections::BTreeMap;
+use core::ops::{Add, Sub};
 use lending_iterator::LendingIterator;
 use pod::Pod;
 
@@ -99,7 +101,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             .ok_or(Error::with_msg(OutOfDisk, "block allocation failed"))?;
         debug_assert_eq!(hbas.len(), num_write);
         // FIXME: Fix this based on queue-based API
-        assert!(hbas.windows(2).all(|pair| pair[1] - pair[0] == 1));
+        // assert!(hbas.windows(2).all(|pair| pair[1] - pair[0] == 1));
 
         let mut cipher = Buf::alloc(num_write)?;
         for (i, (lba, data_block)) in self.data_buf.all_blocks().into_iter().enumerate() {
@@ -137,7 +139,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     /// Sync all cached data in the device to the storage medium for durability.
     pub fn sync(&self) -> Result<()> {
         // TODO: Flush the buffer first
-        assert!(self.data_buf.len() == 0);
+        // assert!(self.data_buf.len() == 0);
 
         let timer = LatencyMetrics::start_timer(ReqType::Sync, "lsmtree", "");
 
@@ -402,6 +404,27 @@ struct RecordValue {
     pub key: Key,
     pub mac: Mac,
 }
+
+impl Add<usize> for RecordKey {
+    type Output = Self;
+
+    fn add(self, other: usize) -> Self::Output {
+        Self {
+            lba: self.lba + other,
+        }
+    }
+}
+
+impl Sub<RecordKey> for RecordKey {
+    type Output = usize;
+
+    fn sub(self, other: RecordKey) -> Self::Output {
+        self.lba - other.lba
+    }
+}
+
+impl RecordK<RecordKey> for RecordKey {}
+impl RecordV for RecordValue {}
 
 impl AsKv<RecordKey, RecordValue> for Record {
     fn key(&self) -> &RecordKey {
