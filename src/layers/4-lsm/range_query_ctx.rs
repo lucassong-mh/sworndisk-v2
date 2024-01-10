@@ -57,6 +57,11 @@ impl<K: RecordKey<K>, V: RecordValue> RangeQueryCtx<K, V> {
         self.complete_table.set(nth, true);
     }
 
+    pub fn mark_completed(&mut self, key: K) {
+        let nth = key - self.start;
+        self.complete_table.set(nth, true);
+    }
+
     pub fn as_results(self) -> Vec<(K, V)> {
         debug_assert!(self.is_completed());
         self.res

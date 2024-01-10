@@ -25,7 +25,7 @@ pub(super) struct BlockAlloc<D> {
 }
 type AllocDiffTable = Mutex<BTreeMap<Hba, AllocDiff>>;
 
-/// Block validity bitmap.
+/// Block validity table.
 pub(super) struct AllocBitmap {
     bitmap: Mutex<BitMap>,
     min_avail: AtomicUsize,
@@ -205,7 +205,7 @@ impl AllocBitmap {
         let bitmap = self.bitmap.lock();
         let mut buf = postcard::to_vec::<BitMap, BLOCK_SIZE>(bitmap.as_ref())
             .map_err(|_| Error::with_msg(InvalidArgs, "serialize block validity table failed"))?;
-        buf.resize(align_up(buf.len(), BLOCK_SIZE), 0);
+        buf.resize(align_up(buf.len(), BLOCK_SIZE), 0).unwrap();
         let mut tx = store.new_tx();
         let res: Result<_> = tx.context(|| {
             let log = store.create_log(BUCKET_BLOCK_VALIDITY_TABLE)?;

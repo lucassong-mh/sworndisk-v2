@@ -609,10 +609,10 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
             // Delete the old SSTs
             tx_log_store.delete_log(upper_sst_id)?;
-            deleted_ssts.push(upper_sst_id);
+            deleted_ssts.push((upper_sst_id, from_level));
             for (id, _) in lower_ssts {
                 tx_log_store.delete_log(id)?;
-                deleted_ssts.push(id);
+                deleted_ssts.push((id, to_level));
             }
             Ok((created_ssts, deleted_ssts))
         });
@@ -637,8 +637,8 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         created_ssts.into_iter().for_each(|sst| {
             let _ = sst_manager.insert(sst, to_level);
         });
-        deleted_ssts.into_iter().for_each(|id| {
-            let _ = sst_manager.remove(id, from_level);
+        deleted_ssts.into_iter().for_each(|(id, level)| {
+            let _ = sst_manager.remove(id, level);
         });
         drop(sst_manager);
 
