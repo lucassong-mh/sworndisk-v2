@@ -1,6 +1,7 @@
 //! SwornDisk as a block device.
 //!
-//! API: read(), write(), sync(), create(), open()
+//! API: submit_bio(), submit_bio_sync(), create(), open(),
+//! read(), readv(), write(), writev(), sync().
 //!
 //! Responsible for managing a `TxLsmTree`, whereas the TX logs (WAL and SSTs)
 //! are stored; an untrusted disk storing user data, a `BlockAlloc` for managing data blocks'
@@ -21,6 +22,7 @@ use crate::util::Aead;
 
 use alloc::collections::BTreeMap;
 use core::ops::{Add, RangeInclusive, Sub};
+use core::sync::atomic::{AtomicBool, Ordering};
 use lending_iterator::LendingIterator;
 use pod::Pod;
 
@@ -31,76 +33,66 @@ pub type Hba = BlockId;
 
 /// SwornDisk.
 pub struct SwornDisk<D: BlockSet> {
-    bio_req_queue: BioReqQueue,
-    logical_block_table: TxLsmTree<RecordKey, RecordValue, D>,
-    user_data_disk: D,
-    block_validity_table: Arc<AllocBitmap>,
-    data_buf: DataBuf,
-    root_key: Key,
+    inner: Arc<DiskInner<D>>,
 }
 
-// TODO: Support queue-based API
+/// Inner structures of `SwornDisk`.
+struct DiskInner<D: BlockSet> {
+    /// Block I/O request queue.
+    bio_req_queue: BioReqQueue,
+    /// A `TxLsmTree` to store metadata of the logical blocks.
+    logical_block_table: TxLsmTree<RecordKey, RecordValue, D>,
+    /// The underlying disk where user data is stored.
+    user_data_disk: D,
+    /// Manage space of the data disk.
+    block_validity_table: Arc<AllocBitmap>,
+    /// A buffer to cache data blocks.
+    data_buf: DataBuf,
+    /// Root encryption key.
+    root_key: Key,
+    /// Whether `SwornDisk` is dropped.
+    is_dropped: AtomicBool,
+}
+
 impl<D: BlockSet + 'static> SwornDisk<D> {
-    const DATA_BUF_CAP: usize = 1024;
-
-    pub fn submit_bio(&self, req: BioReq) -> BioResp {
-        self.bio_req_queue.enqueue(req)
+    /// Submit a new block I/O request to the request queue (Asynchronous).
+    pub fn submit_bio(&self, bio_req: BioReq) -> BioResp {
+        self.inner.bio_req_queue.enqueue(bio_req)
     }
 
-    pub fn submit_bio_sync(&self, req: BioReq) -> BioResp {
-        self.bio_req_queue.enqueue(req)?;
-        let req = self.bio_req_queue.dequeue().unwrap();
-
-        let res = match req.type_() {
-            BioType::Read => self.do_read(&req),
-            BioType::Write => self.do_write(&req),
-            BioType::Sync => self.do_sync(&req),
-        };
-
-        req.complete(res.clone());
-        res
+    /// Submit a new block I/O request and wait its completion (Synchronous).
+    pub fn submit_bio_sync(&self, bio_req: BioReq) -> BioResp {
+        bio_req.submit();
+        self.inner.handle_bio_req(&bio_req)
     }
 
-    fn do_read(&self, req: &BioReq) -> BioResp {
-        debug_assert_eq!(req.type_(), BioType::Read);
-
-        let lba = req.addr() as Lba;
-        let mut req_bufs = req.take_bufs();
-        let mut bufs = {
-            let mut bufs = Vec::with_capacity(req.nbufs());
-            for buf in req_bufs.iter_mut() {
-                bufs.push(BufMut::try_from(buf.as_mut_slice())?);
-            }
-            bufs
-        };
-
-        if bufs.len() == 1 {
-            let buf = bufs.remove(0);
-            return self.read(lba, buf);
-        }
-
-        self.readv(lba, &mut bufs)
+    /// Read a specified number of blocks at a logical block address on the device.
+    /// The block contents will be read into a single contiguous buffer.
+    pub fn read(&self, lba: Lba, mut buf: BufMut) -> Result<()> {
+        self.inner.read(lba, buf)
     }
 
-    fn do_write(&self, req: &BioReq) -> BioResp {
-        debug_assert_eq!(req.type_(), BioType::Write);
-
-        let lba = req.addr() as Lba;
-        let req_bufs = req.take_bufs();
-        let bufs = {
-            let mut bufs = Vec::with_capacity(req.nbufs());
-            for buf in req_bufs.iter() {
-                bufs.push(BufRef::try_from(buf.as_slice())?);
-            }
-            bufs
-        };
-
-        self.writev(lba, &bufs)
+    /// Read multiple blocks at a logical block address on the device.
+    /// The block contents will be read into several scattered buffers.
+    pub fn readv<'a>(&self, lba: Lba, bufs: &'a mut [BufMut<'a>]) -> Result<()> {
+        self.inner.readv(lba, bufs)
     }
 
-    fn do_sync(&self, req: &BioReq) -> BioResp {
-        debug_assert_eq!(req.type_(), BioType::Sync);
-        self.sync()
+    /// Write a specified number of blocks at a logical block address on the device.
+    /// The block contents reside in a single contiguous buffer.
+    pub fn write(&self, mut lba: Lba, buf: BufRef) -> Result<usize> {
+        self.inner.write(lba, buf)
+    }
+
+    /// Write multiple blocks at a logical block address on the device.
+    /// The block contents reside in several scattered buffers.
+    pub fn writev(&self, mut lba: Lba, bufs: &[BufRef]) -> Result<()> {
+        self.inner.writev(lba, bufs)
+    }
+
+    /// Sync all cached data in the device to the storage medium for durability.
+    pub fn sync(&self) -> Result<()> {
+        self.inner.sync()
     }
 
     /// Creates a new `SwornDisk` on the given disk, with the root encryption key.
@@ -126,22 +118,29 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             Some(Arc::new(on_drop_record_in_memtable)),
         )?;
 
-        Ok(Self {
-            bio_req_queue: BioReqQueue::new(),
-            logical_block_table,
-            user_data_disk: data_disk,
-            block_validity_table,
-            data_buf: DataBuf::new(),
-            root_key,
-        })
+        let new_self = Self {
+            inner: Arc::new(DiskInner {
+                bio_req_queue: BioReqQueue::new(),
+                logical_block_table,
+                user_data_disk: data_disk,
+                block_validity_table,
+                data_buf: DataBuf::new(),
+                root_key,
+                is_dropped: AtomicBool::new(false),
+            }),
+        };
+
+        new_self.spawn_bio_req_handler();
+
+        Ok(new_self)
     }
 
     /// Opens the `SwornDisk` on the given disk, with the root encryption key.
     pub fn open(disk: D, root_key: Key) -> Result<Self> {
         let data_disk = Self::subdisk_for_data(&disk)?;
-        let index_disk = Self::subdisk_for_logical_block_table(&disk)?;
+        let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
-        let tx_log_store = Arc::new(TxLogStore::recover(index_disk, root_key)?);
+        let tx_log_store = Arc::new(TxLogStore::recover(lsm_tree_disk, root_key)?);
         let block_validity_table = Arc::new(AllocBitmap::new(data_disk.nblocks()));
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
@@ -160,19 +159,34 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             Some(Arc::new(on_drop_record_in_memtable)),
         )?;
 
-        Ok(Self {
-            bio_req_queue: BioReqQueue::new(),
-            logical_block_table,
-            user_data_disk: data_disk,
-            block_validity_table,
-            data_buf: DataBuf::new(),
-            root_key,
-        })
+        let opened_self = Self {
+            inner: Arc::new(DiskInner {
+                bio_req_queue: BioReqQueue::new(),
+                logical_block_table,
+                user_data_disk: data_disk,
+                block_validity_table,
+                data_buf: DataBuf::new(),
+                root_key,
+                is_dropped: AtomicBool::new(false),
+            }),
+        };
+
+        opened_self.spawn_bio_req_handler();
+
+        Ok(opened_self)
     }
 
     /// Returns the total number of blocks in the device.
     pub fn total_blocks(&self) -> usize {
-        self.user_data_disk.nblocks()
+        self.inner.user_data_disk.nblocks()
+    }
+
+    /// Spawn a task to continuously handle any queued block I/O requests.
+    fn spawn_bio_req_handler(&self) {
+        let inner = self.inner.clone();
+        let _ = std::thread::spawn(move || {
+            inner.handle_bio_reqs_looped();
+        });
     }
 
     fn subdisk_for_data(disk: &D) -> Result<D> {
@@ -184,7 +198,85 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     }
 }
 
-impl<D: BlockSet + 'static> SwornDisk<D> {
+impl<D: BlockSet + 'static> DiskInner<D> {
+    /// Capacity of the user data blocks buffer.
+    const DATA_BUF_CAP: usize = 1024;
+
+    /// Continuously loop and handle any pending block I/O requests.
+    pub fn handle_bio_reqs_looped(&self) {
+        loop {
+            if self.bio_req_queue.is_empty() {
+                if self.is_dropped.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                continue;
+            }
+
+            let bio_req = self.bio_req_queue.dequeue().unwrap();
+            // TODO: Handle error
+            self.handle_bio_req(&bio_req).unwrap();
+        }
+    }
+
+    /// Handle one block I/O request. Mark the request completed when finished,
+    /// return any error that occurs.
+    pub fn handle_bio_req(&self, req: &BioReq) -> BioResp {
+        let res = match req.type_() {
+            BioType::Read => self.do_read(&req),
+            BioType::Write => self.do_write(&req),
+            BioType::Sync => self.do_sync(&req),
+        };
+
+        req.complete(res.clone());
+        res
+    }
+
+    /// Handle a read I/O request.
+    fn do_read(&self, req: &BioReq) -> BioResp {
+        debug_assert_eq!(req.type_(), BioType::Read);
+
+        let lba = req.addr() as Lba;
+        let mut req_bufs = req.take_bufs();
+        let mut bufs = {
+            let mut bufs = Vec::with_capacity(req.nbufs());
+            for buf in req_bufs.iter_mut() {
+                bufs.push(BufMut::try_from(buf.as_mut_slice())?);
+            }
+            bufs
+        };
+
+        if bufs.len() == 1 {
+            let buf = bufs.remove(0);
+            return self.read(lba, buf);
+        }
+
+        self.readv(lba, &mut bufs)
+    }
+
+    /// Handle a write I/O request.
+    fn do_write(&self, req: &BioReq) -> BioResp {
+        debug_assert_eq!(req.type_(), BioType::Write);
+
+        let lba = req.addr() as Lba;
+        let req_bufs = req.take_bufs();
+        let bufs = {
+            let mut bufs = Vec::with_capacity(req.nbufs());
+            for buf in req_bufs.iter() {
+                bufs.push(BufRef::try_from(buf.as_slice())?);
+            }
+            bufs
+        };
+
+        self.writev(lba, &bufs)
+    }
+
+    /// Handle a sync I/O request.
+    fn do_sync(&self, req: &BioReq) -> BioResp {
+        debug_assert_eq!(req.type_(), BioType::Sync);
+        self.sync()
+    }
+
     /// Read a specified number of blocks at a logical block address on the device.
     /// The block contents will be read into a single contiguous buffer.
     pub fn read(&self, lba: Lba, mut buf: BufMut) -> Result<()> {
@@ -219,7 +311,6 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let value = self.logical_block_table.get(&RecordKey { lba })?;
 
         LatencyMetrics::stop_timer(timer);
-
         let timer = LatencyMetrics::start_timer(ReqType::Read, "data", "");
 
         // Perform disk read and decryption
@@ -306,8 +397,19 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             return Ok(nblocks);
         }
 
+        let timer = LatencyMetrics::start_timer(ReqType::Write, "data", "");
         // Flush all data blocks in `DataBuf` to disk if it's full
-        self.write_blocks_from_data_buf()?;
+        let records = self.write_blocks_from_data_buf()?;
+        LatencyMetrics::stop_timer(timer);
+
+        let timer = LatencyMetrics::start_timer(ReqType::Write, "lsmtree", "");
+        // Insert new records of data blocks to `TxLsmTree`
+        for (key, value) in records {
+            self.logical_block_table.put(key, value)?;
+        }
+        LatencyMetrics::stop_timer(timer);
+
+        self.data_buf.clear();
         Ok(nblocks)
     }
 
@@ -321,13 +423,14 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         Ok(())
     }
 
-    fn write_blocks_from_data_buf(&self) -> Result<()> {
+    fn write_blocks_from_data_buf(&self) -> Result<Vec<(RecordKey, RecordValue)>> {
         let num_write = self.data_buf.len();
+        let mut records = Vec::with_capacity(num_write);
         if num_write == 0 {
-            return Ok(());
+            return Ok(records);
         }
-        let timer = LatencyMetrics::start_timer(ReqType::Write, "data", "");
 
+        // Allocate slots for data blocks
         let hbas = self
             .block_validity_table
             .alloc_batch(num_write)
@@ -336,8 +439,6 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let hba_batches = hbas.group_by(|hba1, hba2| hba2 - hba1 == 1);
 
         let data_blocks = self.data_buf.all_blocks();
-        let mut records = Vec::with_capacity(num_write);
-
         // Perform encryption and batch disk write
         let mut cipher_buf = Buf::alloc(num_write)?;
         let mut cipher_slice = cipher_buf.as_mut_slice();
@@ -364,30 +465,23 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             )?;
             cipher_slice = &mut cipher_slice[hba_batch.len() * BLOCK_SIZE..];
         }
-        LatencyMetrics::stop_timer(timer);
 
-        let timer = LatencyMetrics::start_timer(ReqType::Write, "lsmtree", "");
-        // Insert new records of data blocks to `TxLsmTree`
-        for (key, value) in records {
-            self.logical_block_table.put(key, value)?;
-        }
-        LatencyMetrics::stop_timer(timer);
-
-        self.data_buf.clear();
-        Ok(())
+        Ok(records)
     }
 
     /// Sync all cached data in the device to the storage medium for durability.
     pub fn sync(&self) -> Result<()> {
+        let timer = LatencyMetrics::start_timer(ReqType::Sync, "data", "");
+
         self.write_blocks_from_data_buf()?;
         debug_assert!(self.data_buf.is_empty());
 
+        LatencyMetrics::stop_timer(timer);
         let timer = LatencyMetrics::start_timer(ReqType::Sync, "lsmtree", "");
 
         self.logical_block_table.sync()?;
 
         LatencyMetrics::stop_timer(timer);
-
         let timer = LatencyMetrics::start_timer(ReqType::Sync, "data", "");
 
         self.user_data_disk.flush()?;
@@ -395,6 +489,12 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         LatencyMetrics::stop_timer(timer);
 
         Ok(())
+    }
+}
+
+impl<D: BlockSet> Drop for SwornDisk<D> {
+    fn drop(&mut self) {
+        self.inner.is_dropped.store(true, Ordering::Release);
     }
 }
 
@@ -435,6 +535,8 @@ impl<'a> BufMutVec<'a> {
 // SAFETY: `SwornDisk` is concurrency-safe.
 unsafe impl<D: BlockSet> Send for SwornDisk<D> {}
 unsafe impl<D: BlockSet> Sync for SwornDisk<D> {}
+unsafe impl<D: BlockSet> Send for DiskInner<D> {}
+unsafe impl<D: BlockSet> Sync for DiskInner<D> {}
 
 /// Listener factory for `TxLsmTree`.
 struct TxLsmTreeListenerFactory<D> {

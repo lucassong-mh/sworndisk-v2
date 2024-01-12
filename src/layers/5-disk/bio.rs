@@ -6,12 +6,14 @@ use alloc::collections::VecDeque;
 use anymap::hashbrown::AnyMap;
 use core::any::Any;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// A queue for managing block I/O requests (`BioReq`).
 /// It provides a concurrency-safe way to store and manage
 /// block I/O requests that need to be processed by a block device.
 pub struct BioReqQueue {
     queue: Mutex<VecDeque<BioReq>>,
+    num_reqs: AtomicUsize,
 }
 
 impl BioReqQueue {
@@ -19,6 +21,7 @@ impl BioReqQueue {
     pub fn new() -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
+            num_reqs: AtomicUsize::new(0),
         }
     }
 
@@ -26,17 +29,25 @@ impl BioReqQueue {
     pub fn enqueue(&self, req: BioReq) -> Result<()> {
         req.submit();
         self.queue.lock().push_back(req);
+        self.num_reqs.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
     /// Dequeue a block I/O request.
     pub fn dequeue(&self) -> Option<BioReq> {
-        self.queue.lock().pop_front()
+        let req_opt = self.queue.lock().pop_front();
+        self.num_reqs.fetch_sub(1, Ordering::Release);
+        req_opt
     }
 
     /// Returns the number of pending requests in this queue.
     pub fn num_reqs(&self) -> usize {
-        self.queue.lock().len()
+        self.num_reqs.load(Ordering::Relaxed)
+    }
+
+    /// Returns whether there are no pending requests in this queue.
+    pub fn is_empty(&self) -> bool {
+        self.num_reqs() == 0
     }
 }
 
@@ -166,7 +177,7 @@ impl BioReq {
     }
 
     /// Mark the request as submitted.
-    fn submit(&self) {
+    pub(super) fn submit(&self) {
         let mut status = self.status.lock();
         match *status {
             BioStatus::Init => *status = BioStatus::Submitted,
