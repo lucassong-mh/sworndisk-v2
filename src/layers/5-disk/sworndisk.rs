@@ -6,6 +6,7 @@
 //! are stored; an untrusted disk storing user data, a `BlockAlloc` for managing data blocks'
 //! allocation metadata. `TxLsmTree` and `BlockAlloc` are manipulated
 //! based on internal transactions.
+use super::bio::{BioReq, BioReqBuilder, BioReqQueue, BioResp, BioType};
 use super::block_alloc::{AllocBitmap, BlockAlloc};
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::log::TxLogStore;
@@ -30,9 +31,10 @@ pub type Hba = BlockId;
 
 /// SwornDisk.
 pub struct SwornDisk<D: BlockSet> {
+    bio_req_queue: BioReqQueue,
     logical_block_table: TxLsmTree<RecordKey, RecordValue, D>,
     user_data_disk: D,
-    block_validity_bitmap: Arc<AllocBitmap>,
+    block_validity_table: Arc<AllocBitmap>,
     data_buf: DataBuf,
     root_key: Key,
 }
@@ -41,19 +43,79 @@ pub struct SwornDisk<D: BlockSet> {
 impl<D: BlockSet + 'static> SwornDisk<D> {
     const DATA_BUF_CAP: usize = 1024;
 
+    pub fn submit_bio(&self, req: BioReq) -> BioResp {
+        self.bio_req_queue.enqueue(req)
+    }
+
+    pub fn submit_bio_sync(&self, req: BioReq) -> BioResp {
+        self.bio_req_queue.enqueue(req)?;
+        let req = self.bio_req_queue.dequeue().unwrap();
+
+        let res = match req.type_() {
+            BioType::Read => self.do_read(&req),
+            BioType::Write => self.do_write(&req),
+            BioType::Sync => self.do_sync(&req),
+        };
+
+        req.complete(res.clone());
+        res
+    }
+
+    fn do_read(&self, req: &BioReq) -> BioResp {
+        debug_assert_eq!(req.type_(), BioType::Read);
+
+        let lba = req.addr() as Lba;
+        let mut req_bufs = req.take_bufs();
+        let mut bufs = {
+            let mut bufs = Vec::with_capacity(req.nbufs());
+            for buf in req_bufs.iter_mut() {
+                bufs.push(BufMut::try_from(buf.as_mut_slice())?);
+            }
+            bufs
+        };
+
+        if bufs.len() == 1 {
+            let buf = bufs.remove(0);
+            return self.read(lba, buf);
+        }
+
+        self.readv(lba, &mut bufs)
+    }
+
+    fn do_write(&self, req: &BioReq) -> BioResp {
+        debug_assert_eq!(req.type_(), BioType::Write);
+
+        let lba = req.addr() as Lba;
+        let req_bufs = req.take_bufs();
+        let bufs = {
+            let mut bufs = Vec::with_capacity(req.nbufs());
+            for buf in req_bufs.iter() {
+                bufs.push(BufRef::try_from(buf.as_slice())?);
+            }
+            bufs
+        };
+
+        self.writev(lba, &bufs)
+    }
+
+    fn do_sync(&self, req: &BioReq) -> BioResp {
+        debug_assert_eq!(req.type_(), BioType::Sync);
+        self.sync()
+    }
+
     /// Creates a new `SwornDisk` on the given disk, with the root encryption key.
     pub fn create(disk: D, root_key: Key) -> Result<Self> {
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
         let tx_log_store = Arc::new(TxLogStore::format(lsm_tree_disk, root_key.clone())?);
-        let block_validity_bitmap = Arc::new(AllocBitmap::new(data_disk.nblocks()));
+        let block_validity_table = Arc::new(AllocBitmap::new(data_disk.nblocks()));
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
-            block_validity_bitmap.clone(),
+            block_validity_table.clone(),
         ));
 
-        let bitmap = block_validity_bitmap.clone();
+        let bitmap = block_validity_table.clone();
         let on_drop_record_in_memtable = move |record: &dyn AsKv<RecordKey, RecordValue>| {
             // Deallocate the host block while the corresponding record is dropped in `MemTable`
             bitmap.set_deallocated(record.value().hba);
@@ -65,9 +127,10 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         )?;
 
         Ok(Self {
+            bio_req_queue: BioReqQueue::new(),
             logical_block_table,
             user_data_disk: data_disk,
-            block_validity_bitmap,
+            block_validity_table,
             data_buf: DataBuf::new(),
             root_key,
         })
@@ -79,14 +142,14 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let index_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
         let tx_log_store = Arc::new(TxLogStore::recover(index_disk, root_key)?);
-        let block_validity_bitmap = Arc::new(AllocBitmap::new(data_disk.nblocks()));
+        let block_validity_table = Arc::new(AllocBitmap::new(data_disk.nblocks()));
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
-            block_validity_bitmap.clone(),
+            block_validity_table.clone(),
         ));
-        block_validity_bitmap.recover(&tx_log_store)?;
+        block_validity_table.recover(&tx_log_store)?;
 
-        let bitmap = block_validity_bitmap.clone();
+        let bitmap = block_validity_table.clone();
         let on_drop_record_in_memtable = move |record: &dyn AsKv<RecordKey, RecordValue>| {
             // Deallocate the host block while the corresponding record is dropped in `MemTable`
             bitmap.set_deallocated(record.value().hba);
@@ -98,26 +161,49 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         )?;
 
         Ok(Self {
+            bio_req_queue: BioReqQueue::new(),
             logical_block_table,
             user_data_disk: data_disk,
-            block_validity_bitmap,
+            block_validity_table,
             data_buf: DataBuf::new(),
             root_key,
         })
     }
 
-    /// Read a specified number of block contents at a logical block address on the device.
-    pub fn read(&self, lba: Lba, mut buf: BufMut) -> Result<usize> {
+    /// Returns the total number of blocks in the device.
+    pub fn total_blocks(&self) -> usize {
+        self.user_data_disk.nblocks()
+    }
+
+    fn subdisk_for_data(disk: &D) -> Result<D> {
+        disk.subset(0..disk.nblocks() / 10 * 5) // TBD
+    }
+
+    fn subdisk_for_logical_block_table(disk: &D) -> Result<D> {
+        disk.subset(disk.nblocks() / 10 * 5..disk.nblocks()) // TBD
+    }
+}
+
+impl<D: BlockSet + 'static> SwornDisk<D> {
+    /// Read a specified number of blocks at a logical block address on the device.
+    /// The block contents will be read into a single contiguous buffer.
+    pub fn read(&self, lba: Lba, mut buf: BufMut) -> Result<()> {
         let nblocks = buf.nblocks();
         AmplificationMetrics::acc_data_amount(AmpType::Read, nblocks);
 
         if nblocks == 1 {
             self.read_one_block(lba, buf)?;
         } else {
-            self.read_multi_blocks(lba, buf)?;
+            self.read_multi_blocks(lba, &mut [buf])?;
         }
 
-        Ok(nblocks)
+        Ok(())
+    }
+
+    /// Read multiple blocks at a logical block address on the device.
+    /// The block contents will be read into several scattered buffers.
+    pub fn readv<'a>(&self, lba: Lba, bufs: &'a mut [BufMut<'a>]) -> Result<()> {
+        self.read_multi_blocks(lba, bufs)
     }
 
     fn read_one_block(&self, lba: Lba, mut buf: BufMut) -> Result<()> {
@@ -152,8 +238,9 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         Ok(())
     }
 
-    fn read_multi_blocks(&self, lba: Lba, mut buf: BufMut) -> Result<()> {
-        let nblocks = buf.nblocks();
+    fn read_multi_blocks<'a>(&self, lba: Lba, bufs: &'a mut [BufMut<'a>]) -> Result<()> {
+        let mut buf_vec = BufMutVec::from_bufs(bufs);
+        let nblocks = buf_vec.nblocks();
         let mut range_query_ctx =
             RangeQueryCtx::<RecordKey, RecordValue>::new(RecordKey { lba }, nblocks);
 
@@ -162,7 +249,8 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             .data_buf
             .get_range(range_query_ctx.range_uncompleted().unwrap())
         {
-            buf.as_mut_slice()[(key.lba - lba) * BLOCK_SIZE..(key.lba - lba + 1) * BLOCK_SIZE]
+            buf_vec
+                .nth_buf_mut_slice(key.lba - lba)
                 .copy_from_slice(data_block.as_slice());
             range_query_ctx.mark_completed(key);
         }
@@ -181,7 +269,6 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         };
 
         // Perform disk read in batches and decryption
-        let mut buf_slice = buf.as_mut_slice();
         let mut cipher_buf = Buf::alloc(nblocks)?;
         let mut cipher_slice = cipher_buf.as_mut_slice();
         for record_batch in record_batches {
@@ -197,14 +284,15 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                     &Iv::new_zeroed(),
                     &[],
                     &value.mac,
-                    &mut buf_slice[(key.lba - lba) * BLOCK_SIZE..(key.lba - lba + 1) * BLOCK_SIZE],
+                    buf_vec.nth_buf_mut_slice(key.lba - lba),
                 )?;
             }
         }
         Ok(())
     }
 
-    /// Write a specified number of block contents at a logical block address on the device.
+    /// Write a specified number of blocks at a logical block address on the device.
+    /// The block contents reside in a single contiguous buffer.
     pub fn write(&self, mut lba: Lba, buf: BufRef) -> Result<usize> {
         let nblocks = buf.nblocks();
         // Write block contents to `DataBuf` directly
@@ -223,6 +311,16 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         Ok(nblocks)
     }
 
+    /// Write multiple blocks at a logical block address on the device.
+    /// The block contents reside in several scattered buffers.
+    pub fn writev(&self, mut lba: Lba, bufs: &[BufRef]) -> Result<()> {
+        for buf in bufs {
+            self.write(lba, *buf)?;
+            lba += buf.nblocks();
+        }
+        Ok(())
+    }
+
     fn write_blocks_from_data_buf(&self) -> Result<()> {
         let num_write = self.data_buf.len();
         if num_write == 0 {
@@ -231,7 +329,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let timer = LatencyMetrics::start_timer(ReqType::Write, "data", "");
 
         let hbas = self
-            .block_validity_bitmap
+            .block_validity_table
             .alloc_batch(num_write)
             .ok_or(Error::with_msg(OutOfDisk, "block allocation failed"))?;
         debug_assert_eq!(hbas.len(), num_write);
@@ -298,22 +396,43 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
         Ok(())
     }
+}
 
-    /// Returns the total number of blocks in the device.
-    pub fn total_blocks(&self) -> usize {
-        self.user_data_disk.nblocks()
+/// A wrapper for `[BufMut]` used in `readv()`.
+struct BufMutVec<'a> {
+    bufs: &'a mut [BufMut<'a>],
+    nblocks: usize,
+}
+
+impl<'a> BufMutVec<'a> {
+    pub fn from_bufs(bufs: &'a mut [BufMut<'a>]) -> Self {
+        debug_assert!(bufs.len() > 0);
+        let nblocks = bufs
+            .iter()
+            .map(|buf| buf.nblocks())
+            .fold(0_usize, |sum, nblocks| sum.saturating_add(nblocks));
+        Self { bufs, nblocks }
     }
 
-    fn subdisk_for_data(disk: &D) -> Result<D> {
-        disk.subset(0..disk.nblocks() / 10 * 5) // TBD
+    pub fn nblocks(&self) -> usize {
+        self.nblocks
     }
 
-    fn subdisk_for_logical_block_table(disk: &D) -> Result<D> {
-        disk.subset(disk.nblocks() / 10 * 5..disk.nblocks()) // TBD
+    pub fn nth_buf_mut_slice(&mut self, mut nth: usize) -> &mut [u8] {
+        debug_assert!(nth < self.nblocks);
+        for buf in self.bufs.iter_mut() {
+            let nblocks = buf.nblocks();
+            if nth >= buf.nblocks() {
+                nth -= nblocks;
+            } else {
+                return &mut buf.as_mut_slice()[nth * BLOCK_SIZE..(nth + 1) * BLOCK_SIZE];
+            }
+        }
+        &mut []
     }
 }
 
-// Safety.
+// SAFETY: `SwornDisk` is concurrency-safe.
 unsafe impl<D: BlockSet> Send for SwornDisk<D> {}
 unsafe impl<D: BlockSet> Sync for SwornDisk<D> {}
 
@@ -543,8 +662,9 @@ impl AsKv<RecordKey, RecordValue> for Record {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layers::bio::MemDisk;
+    use crate::layers::{bio::MemDisk, disk::bio::BlockBuf};
 
+    use core::ptr::NonNull;
     use std::thread::{self, JoinHandle};
 
     #[test]
@@ -554,28 +674,47 @@ mod tests {
         let root_key = Key::random();
         // Create a new `SwornDisk` then do some writes
         let sworndisk = SwornDisk::create(mem_disk.clone(), root_key)?;
-
         let num_rw = 1024;
-        let mut rw_buf = Buf::alloc(1)?;
-        for i in 0..num_rw {
-            rw_buf.as_mut_slice().fill(i as u8);
-            sworndisk.write(i as Lba, rw_buf.as_ref())?;
-        }
+
+        // Submit a write block I/O request
+        let mut wbuf = Buf::alloc(num_rw)?;
+        let bufs = {
+            let mut bufs = Vec::with_capacity(num_rw);
+            for i in 0..num_rw {
+                let buf_slice = &mut wbuf.as_mut_slice()[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
+                buf_slice.fill(i as u8);
+                bufs.push(unsafe {
+                    BlockBuf::from_raw_parts(
+                        NonNull::new(buf_slice.as_mut_ptr()).unwrap(),
+                        BLOCK_SIZE,
+                    )
+                });
+            }
+            bufs
+        };
+        let bio_req = BioReqBuilder::new(BioType::Write)
+            .addr(0 as BlockId)
+            .bufs(bufs)
+            .build();
+        sworndisk.submit_bio_sync(bio_req)?;
+
         // Sync the `SwornDisk` then do some reads
-        sworndisk.sync()?;
+        sworndisk.submit_bio_sync(BioReqBuilder::new(BioType::Sync).build())?;
+
+        let mut rbuf = Buf::alloc(1)?;
         for i in 0..num_rw {
-            sworndisk.read(i as Lba, rw_buf.as_mut())?;
-            assert_eq!(rw_buf.as_slice()[0], i as u8);
+            sworndisk.read(i as Lba, rbuf.as_mut())?;
+            assert_eq!(rbuf.as_slice()[0], i as u8);
         }
 
         // Open the closed `SwornDisk` then test its data's existence
         drop(sworndisk);
         thread::spawn(move || -> Result<()> {
             let opened_sworndisk = SwornDisk::open(mem_disk, root_key)?;
-            let mut rw_buf = Buf::alloc(2)?;
-            opened_sworndisk.read(5 as Lba, rw_buf.as_mut())?;
-            assert_eq!(rw_buf.as_slice()[0], 5u8);
-            assert_eq!(rw_buf.as_slice()[4096], 6u8);
+            let mut rbuf = Buf::alloc(2)?;
+            opened_sworndisk.read(5 as Lba, rbuf.as_mut())?;
+            assert_eq!(rbuf.as_slice()[0], 5u8);
+            assert_eq!(rbuf.as_slice()[4096], 6u8);
             Ok(())
         })
         .join()

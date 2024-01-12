@@ -68,6 +68,7 @@ impl Buf {
 }
 
 /// An immutably-borrowed buffer whose length is a multiple of the block size.
+#[derive(Clone, Copy)]
 pub struct BufRef<'a>(&'a [u8]);
 
 impl<'a> BufRef<'a> {
