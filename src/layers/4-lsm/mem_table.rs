@@ -82,6 +82,11 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
 
     /// Sync the table, update the sync ID, drop the replaced one.
     pub fn sync(&mut self, sync_id: SyncID) -> Result<()> {
+        debug_assert!(self.sync_id <= sync_id);
+        if self.sync_id == sync_id {
+            return Ok(());
+        }
+
         for (k, v_ex) in &mut self.table {
             if let Some(dropped) = v_ex.sync() {
                 self.on_drop_record

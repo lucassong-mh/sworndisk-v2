@@ -158,32 +158,36 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
     /// Puts a key-value pair to the tree.
     pub fn put(&self, key: K, value: V) -> Result<()> {
         let record = (key, value);
-        let timer = LatencyMetrics::start_timer(ReqType::Write, "wal_and_memtable", "lsmtree");
 
+        let timer = LatencyMetrics::start_timer(ReqType::Write, "wal_append", "lsmtree");
         // 1. Write WAL
         self.0.wal_append_tx.append(&record)?;
+        LatencyMetrics::stop_timer(timer);
 
         // 2. Put into MemTable
         let at_capacity = self.0.memtable_manager.put(key, value);
         if !at_capacity {
-            LatencyMetrics::stop_timer(timer);
             return Ok(());
         }
 
+        let timer = LatencyMetrics::start_timer(ReqType::Write, "wal_commit", "lsmtree");
         // TODO: Think of combining WAL's TX with minor compaction TX?
         self.0.wal_append_tx.commit()?;
-
         LatencyMetrics::stop_timer(timer);
 
+        let timer = LatencyMetrics::start_timer(ReqType::Write, "compaction", "lsmtree");
         self.0.compactor.wait_compaction()?;
 
         // 3. Trigger compaction when MemTable is at capacity
         self.0.memtable_manager.switch();
 
         self.do_compaction_tx()?;
+        LatencyMetrics::stop_timer(timer);
 
+        let timer = LatencyMetrics::start_timer(ReqType::Write, "wal_discard", "lsmtree");
         // Discard current WAL
         self.0.wal_append_tx.discard()?;
+        LatencyMetrics::stop_timer(timer);
 
         Ok(())
     }
@@ -204,14 +208,15 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
                 .require_major_compaction(LsmLevel::L0)
             {
                 let timer =
-                    LatencyMetrics::start_timer(ReqType::Write, "major_compaction", "lsmtree");
+                    LatencyMetrics::start_timer(ReqType::Write, "major_compaction", "compaction");
 
                 inner.do_compaction_tx(LsmLevel::L1)?;
 
                 LatencyMetrics::stop_timer(timer);
             }
 
-            let timer = LatencyMetrics::start_timer(ReqType::Write, "minor_compaction", "lsmtree");
+            let timer =
+                LatencyMetrics::start_timer(ReqType::Write, "minor_compaction", "compaction");
 
             // Do minor compaction
             inner.do_compaction_tx(LsmLevel::L0)?;
@@ -220,9 +225,9 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
 
             Ok(())
         });
-        // handle.join().unwrap()?; // synchronous
+        handle.join().unwrap()?; // synchronous
 
-        let _ = self.0.compactor.handle.lock().insert(handle);
+        // let _ = self.0.compactor.handle.lock().insert(handle);
         Ok(())
     }
 }
@@ -353,14 +358,13 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
     pub fn sync(&self) -> Result<()> {
         let master_sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed) + 1;
 
-        let timer = LatencyMetrics::start_timer(ReqType::Sync, "wal", "lsmtree");
+        let timer = LatencyMetrics::start_timer(ReqType::Sync, "wal_and_memtable", "lsmtree");
 
         self.wal_append_tx.sync(master_sync_id)?;
 
-        LatencyMetrics::stop_timer(timer);
-
         self.memtable_manager.sync(master_sync_id)?;
 
+        LatencyMetrics::stop_timer(timer);
         let timer = LatencyMetrics::start_timer(ReqType::Sync, "tx_log_store", "lsmtree");
 
         self.compactor.wait_compaction()?;
@@ -414,7 +418,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
     /// Read Range TX.
     fn do_read_range_tx(&self, range_query_ctx: &mut RangeQueryCtx<K, V>) -> Result<()> {
         debug_assert!(!range_query_ctx.is_completed());
-        let timer = LatencyMetrics::start_timer(ReqType::Read, "sst", "read_tx");
+        let timer = LatencyMetrics::start_timer(ReqType::Read, "sst", "read_range_tx");
         let mut tx = self.tx_log_store.new_tx();
 
         let read_res: Result<_> = tx.context(|| {
@@ -438,7 +442,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             return_errno_with_msg!(NotFound, "target sst not found");
         });
         LatencyMetrics::stop_timer(timer);
-        let timer = LatencyMetrics::start_timer(ReqType::Read, "tx_commit", "read_tx");
+        let timer = LatencyMetrics::start_timer(ReqType::Read, "tx_commit", "read_range_tx");
         if read_res.as_ref().is_err_and(|e| e.errno() != NotFound) {
             tx.abort();
             return_errno_with_msg!(TxAborted, "read TX failed")
@@ -967,7 +971,11 @@ impl<K: RecordKey<K>, V: RecordValue> MemTableManager<K, V> {
     }
 
     pub fn switch(&self) {
-        self.immut_idx.fetch_xor(1, Ordering::Release);
+        let active_idx = self.immut_idx.fetch_xor(1, Ordering::Release);
+        // Update sync ID of the active MemTable
+        let _ = self.mem_tables[active_idx as usize]
+            .write()
+            .sync(MASTER_SYNC_ID.load(Ordering::Relaxed));
     }
 
     pub fn active_mem_table(&self) -> &Arc<RwLock<MemTable<K, V>>> {
