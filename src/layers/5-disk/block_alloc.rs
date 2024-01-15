@@ -101,19 +101,14 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
     pub fn update_bitmap(&self) {
         let diff_table = self.diff_table.lock();
         let mut bitmap = self.bitmap.bitmap.lock();
-        let mut min_avail = self.bitmap.min_avail.load(Ordering::Relaxed);
         for (block_id, block_diff) in diff_table.iter() {
             let validity = match block_diff {
                 AllocDiff::Alloc => false,
-                AllocDiff::Dealloc => {
-                    min_avail = min_avail.min(*block_id);
-                    true
-                }
+                AllocDiff::Dealloc => true,
                 AllocDiff::Invalid => unreachable!(),
             };
             bitmap.set(*block_id, validity);
         }
-        self.bitmap.min_avail.store(min_avail, Ordering::Release);
         drop(bitmap);
     }
 
@@ -172,7 +167,12 @@ impl AllocBitmap {
     pub fn alloc(&self) -> Option<Hba> {
         let mut bitmap = self.bitmap.lock();
         let min_avail = self.min_avail.load(Ordering::Relaxed);
-        let hba = bitmap[min_avail..].first_one()? + min_avail;
+        let hba = if let Some(hba) = bitmap[min_avail..].first_one() {
+            hba + min_avail
+        } else {
+            bitmap.first_one()?
+        };
+
         bitmap.set(hba, false);
         self.min_avail.store(hba + 1, Ordering::Release);
         Some(hba as Hba)
@@ -183,7 +183,12 @@ impl AllocBitmap {
         let mut hbas = Vec::with_capacity(count);
         let mut min_avail = self.min_avail.load(Ordering::Relaxed);
         for _ in 0..count {
-            let hba = bitmap[min_avail..].first_one()? + min_avail;
+            let hba = if let Some(hba) = bitmap[min_avail..].first_one() {
+                hba + min_avail
+            } else {
+                min_avail = bitmap.first_one()?;
+                min_avail
+            };
             hbas.push(hba);
 
             bitmap.set(hba, false);
