@@ -225,9 +225,9 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
 
             Ok(())
         });
-        handle.join().unwrap()?; // synchronous
+        // handle.join().unwrap()?; // synchronous
 
-        // let _ = self.0.compactor.handle.lock().insert(handle);
+        let _ = self.0.compactor.handle.lock().insert(handle);
         Ok(())
     }
 }
@@ -352,7 +352,13 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             return Ok(());
         }
 
-        self.do_read_range_tx(range_query_ctx)
+        let timer = LatencyMetrics::start_timer(ReqType::Read, "read_range_tx", "lsmtree");
+
+        self.do_read_range_tx(range_query_ctx)?;
+
+        LatencyMetrics::stop_timer(timer);
+
+        Ok(())
     }
 
     pub fn sync(&self) -> Result<()> {

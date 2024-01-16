@@ -8,7 +8,7 @@
 //! allocation metadata. `TxLsmTree` and `BlockAlloc` are manipulated
 //! based on internal transactions.
 use super::bio::{BioReq, BioReqBuilder, BioReqQueue, BioResp, BioType};
-use super::block_alloc::{AllocBitmap, BlockAlloc};
+use super::block_alloc::{AllocTable, BlockAlloc};
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
@@ -45,7 +45,9 @@ struct DiskInner<D: BlockSet> {
     /// The underlying disk where user data is stored.
     user_data_disk: D,
     /// Manage space of the data disk.
-    block_validity_table: Arc<AllocBitmap>,
+    block_validity_table: Arc<AllocTable>,
+    /// TX log store for managing logs in `TxLsmTree` and block alloc logs.
+    tx_log_store: Arc<TxLogStore<D>>,
     /// A buffer to cache data blocks.
     data_buf: DataBuf,
     /// Root encryption key.
@@ -101,19 +103,19 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
         let tx_log_store = Arc::new(TxLogStore::format(lsm_tree_disk, root_key.clone())?);
-        let block_validity_table = Arc::new(AllocBitmap::new(data_disk.nblocks()));
+        let block_validity_table = Arc::new(AllocTable::new(data_disk.nblocks()));
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
         ));
 
-        let bitmap = block_validity_table.clone();
+        let table = block_validity_table.clone();
         let on_drop_record_in_memtable = move |record: &dyn AsKv<RecordKey, RecordValue>| {
             // Deallocate the host block while the corresponding record is dropped in `MemTable`
-            bitmap.set_deallocated(record.value().hba);
+            table.set_deallocated(record.value().hba);
         };
         let logical_block_table = TxLsmTree::format(
-            tx_log_store,
+            tx_log_store.clone(),
             listener_factory,
             Some(Arc::new(on_drop_record_in_memtable)),
         )?;
@@ -124,6 +126,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 logical_block_table,
                 user_data_disk: data_disk,
                 block_validity_table,
+                tx_log_store,
                 data_buf: DataBuf::new(),
                 root_key,
                 is_dropped: AtomicBool::new(false),
@@ -141,20 +144,20 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
         let tx_log_store = Arc::new(TxLogStore::recover(lsm_tree_disk, root_key)?);
-        let block_validity_table = Arc::new(AllocBitmap::new(data_disk.nblocks()));
+        let block_validity_table =
+            Arc::new(AllocTable::recover(data_disk.nblocks(), &tx_log_store)?);
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
         ));
-        block_validity_table.recover(&tx_log_store)?;
 
-        let bitmap = block_validity_table.clone();
+        let table = block_validity_table.clone();
         let on_drop_record_in_memtable = move |record: &dyn AsKv<RecordKey, RecordValue>| {
             // Deallocate the host block while the corresponding record is dropped in `MemTable`
-            bitmap.set_deallocated(record.value().hba);
+            table.set_deallocated(record.value().hba);
         };
         let logical_block_table = TxLsmTree::recover(
-            tx_log_store,
+            tx_log_store.clone(),
             listener_factory,
             Some(Arc::new(on_drop_record_in_memtable)),
         )?;
@@ -166,6 +169,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 user_data_disk: data_disk,
                 block_validity_table,
                 data_buf: DataBuf::new(),
+                tx_log_store,
                 root_key,
                 is_dropped: AtomicBool::new(false),
             }),
@@ -349,15 +353,19 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             return Ok(());
         }
 
+        let timer = LatencyMetrics::start_timer(ReqType::Read, "lsmtree", "");
         // Search in `TxLsmTree` then
         self.logical_block_table.get_range(&mut range_query_ctx)?;
-        assert!(range_query_ctx.is_completed()); // debug_assert, allow empty read
+        // TODO: `debug_assert!()`, allow empty read
+        assert!(range_query_ctx.is_completed());
 
         let mut res = range_query_ctx.as_results();
         let record_batches = {
             res.sort_by(|(_, v1), (_, v2)| v1.hba.cmp(&v2.hba));
             res.group_by(|(_, v1), (_, v2)| v2.hba - v1.hba == 1)
         };
+        LatencyMetrics::stop_timer(timer);
+        let timer = LatencyMetrics::start_timer(ReqType::Read, "data", "");
 
         // Perform disk read in batches and decryption
         let mut cipher_buf = Buf::alloc(nblocks)?;
@@ -379,6 +387,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
                 )?;
             }
         }
+        LatencyMetrics::stop_timer(timer);
         Ok(())
     }
 
@@ -487,7 +496,13 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         self.user_data_disk.flush()?;
 
         LatencyMetrics::stop_timer(timer);
+        let timer = LatencyMetrics::start_timer(ReqType::Sync, "bvt_bal_compaction", "");
 
+        /// XXX: May impact performance when there comes frequent syncs
+        self.block_validity_table
+            .do_compaction(&self.tx_log_store)?;
+
+        LatencyMetrics::stop_timer(timer);
         Ok(())
     }
 }
@@ -541,15 +556,12 @@ unsafe impl<D: BlockSet> Sync for DiskInner<D> {}
 /// Listener factory for `TxLsmTree`.
 struct TxLsmTreeListenerFactory<D> {
     store: Arc<TxLogStore<D>>,
-    alloc_bitmap: Arc<AllocBitmap>,
+    alloc_table: Arc<AllocTable>,
 }
 
 impl<D> TxLsmTreeListenerFactory<D> {
-    fn new(store: Arc<TxLogStore<D>>, alloc_bitmap: Arc<AllocBitmap>) -> Self {
-        Self {
-            store,
-            alloc_bitmap,
-        }
+    fn new(store: Arc<TxLogStore<D>>, alloc_table: Arc<AllocTable>) -> Self {
+        Self { store, alloc_table }
     }
 }
 
@@ -563,7 +575,7 @@ impl<D: BlockSet + 'static> TxEventListenerFactory<RecordKey, RecordValue>
         Arc::new(TxLsmTreeListener::new(
             tx_type,
             Arc::new(BlockAlloc::new(
-                self.alloc_bitmap.clone(),
+                self.alloc_table.clone(),
                 self.store.clone(),
             )),
         ))
@@ -631,7 +643,7 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
 
     fn on_tx_commit(&self) {
         match self.tx_type {
-            TxType::Compaction { .. } | TxType::Migration => self.block_alloc.update_bitmap(),
+            TxType::Compaction { .. } | TxType::Migration => self.block_alloc.update_alloc_table(),
         }
     }
 }

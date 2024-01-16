@@ -18,7 +18,7 @@ use std::time::Instant;
 pub(crate) type Result<T> = core::result::Result<T, Error>;
 
 fn main() {
-    let total_bytes = 2 * GiB;
+    let total_bytes = 10 * GiB;
     // Specify all benchmarks
     let benches = vec![
         BenchBuilder::new("SwornDisk::write_seq")
@@ -26,7 +26,7 @@ fn main() {
             .io_type(IoType::Write)
             .io_pattern(IoPattern::Seq)
             .total_bytes(total_bytes)
-            .buf_size(1 * MiB)
+            .buf_size(128 * KiB)
             .concurrency(1)
             .build()
             .unwrap(),
@@ -35,6 +35,7 @@ fn main() {
             .io_type(IoType::Write)
             .io_pattern(IoPattern::Rnd)
             .total_bytes(total_bytes)
+            .buf_size(4 * KiB)
             .concurrency(1)
             .build()
             .unwrap(),
@@ -52,6 +53,7 @@ fn main() {
             .io_type(IoType::Read)
             .io_pattern(IoPattern::Rnd)
             .total_bytes(total_bytes)
+            .buf_size(4 * KiB)
             .concurrency(1)
             .build()
             .unwrap(),
@@ -60,7 +62,7 @@ fn main() {
             .io_type(IoType::Write)
             .io_pattern(IoPattern::Seq)
             .total_bytes(total_bytes)
-            .buf_size(1 * MiB)
+            .buf_size(128 * KiB)
             .concurrency(1)
             .build()
             .unwrap(),
@@ -69,6 +71,7 @@ fn main() {
             .io_type(IoType::Write)
             .io_pattern(IoPattern::Rnd)
             .total_bytes(total_bytes)
+            .buf_size(4 * KiB)
             .concurrency(1)
             .build()
             .unwrap(),
@@ -86,6 +89,7 @@ fn main() {
             .io_type(IoType::Read)
             .io_pattern(IoPattern::Rnd)
             .total_bytes(total_bytes)
+            .buf_size(4 * KiB)
             .concurrency(1)
             .build()
             .unwrap(),
