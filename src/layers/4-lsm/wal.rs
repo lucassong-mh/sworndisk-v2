@@ -1,5 +1,5 @@
 //! Transactions in WriteAhead Log.
-use super::{AsKv, SyncID};
+use super::{AsKV, SyncID};
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufRef};
 use crate::layers::log::{TxLog, TxLogId, TxLogStore};
 use crate::os::Mutex;
@@ -48,7 +48,7 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
     }
 
     /// Append phase for an Append TX, mainly to append newly records to the WAL.
-    pub fn append<K: Pod, V: Pod>(&self, record: &dyn AsKv<K, V>) -> Result<()> {
+    pub fn append<K: Pod, V: Pod>(&self, record: &dyn AsKV<K, V>) -> Result<()> {
         let mut inner = self.inner.lock();
         if inner.wal_tx_and_log.is_none() {
             inner.perpare()?;

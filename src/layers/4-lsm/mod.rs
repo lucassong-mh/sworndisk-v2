@@ -49,6 +49,7 @@
 //! assert_eq!(target_value, "5");
 //! ```
 
+mod compaction;
 mod mem_table;
 mod range_query_ctx;
 mod sstable;
@@ -57,6 +58,6 @@ mod wal;
 
 pub use self::range_query_ctx::RangeQueryCtx;
 pub use self::tx_lsm_tree::{
-    AsKv, LsmLevel, RecordKey, RecordValue, SyncID, TxEventListener, TxEventListenerFactory,
+    AsKV, LsmLevel, RecordKey, RecordValue, SyncID, TxEventListener, TxEventListenerFactory,
     TxLsmTree, TxType,
 };

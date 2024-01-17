@@ -12,7 +12,7 @@ use super::block_alloc::{AllocTable, BlockAlloc};
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
-    AsKv, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, TxEventListener,
+    AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, TxEventListener,
     TxEventListenerFactory, TxLsmTree, TxType,
 };
 use crate::os::{Aead as OsAead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, RwLock};
@@ -110,7 +110,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         ));
 
         let table = block_validity_table.clone();
-        let on_drop_record_in_memtable = move |record: &dyn AsKv<RecordKey, RecordValue>| {
+        let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
             // Deallocate the host block while the corresponding record is dropped in `MemTable`
             table.set_deallocated(record.value().hba);
         };
@@ -152,7 +152,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         ));
 
         let table = block_validity_table.clone();
-        let on_drop_record_in_memtable = move |record: &dyn AsKv<RecordKey, RecordValue>| {
+        let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
             // Deallocate the host block while the corresponding record is dropped in `MemTable`
             table.set_deallocated(record.value().hba);
         };
@@ -599,7 +599,7 @@ impl<D> TxLsmTreeListener<D> {
 
 /// Register callbacks for different TXs in `TxLsmTree`.
 impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTreeListener<D> {
-    fn on_add_record(&self, record: &dyn AsKv<RecordKey, RecordValue>) -> Result<()> {
+    fn on_add_record(&self, record: &dyn AsKV<RecordKey, RecordValue>) -> Result<()> {
         match self.tx_type {
             TxType::Compaction { to_level } if to_level == LsmLevel::L0 => {
                 self.block_alloc.alloc_block(record.value().hba)
@@ -611,7 +611,7 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
         }
     }
 
-    fn on_drop_record(&self, record: &dyn AsKv<RecordKey, RecordValue>) -> Result<()> {
+    fn on_drop_record(&self, record: &dyn AsKV<RecordKey, RecordValue>) -> Result<()> {
         match self.tx_type {
             // Minor Compaction TX doesn't compact records
             TxType::Compaction { to_level } if to_level == LsmLevel::L0 => {
@@ -763,7 +763,7 @@ impl Sub<RecordKey> for RecordKey {
 impl RecordK<RecordKey> for RecordKey {}
 impl RecordV for RecordValue {}
 
-impl AsKv<RecordKey, RecordValue> for Record {
+impl AsKV<RecordKey, RecordValue> for Record {
     fn key(&self) -> &RecordKey {
         &self.key
     }

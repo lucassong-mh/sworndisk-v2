@@ -1,5 +1,5 @@
 //! MemTable.
-use super::{AsKv, RangeQueryCtx, RecordKey, RecordValue, SyncID};
+use super::{AsKV, RangeQueryCtx, RecordKey, RecordValue, SyncID};
 use crate::prelude::*;
 
 use alloc::collections::BTreeMap;
@@ -17,7 +17,7 @@ pub(super) struct MemTable<K, V> {
     size: usize,
     cap: usize,
     sync_id: SyncID,
-    on_drop_record: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
+    on_drop_record: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
 }
 
 /// An extended value which is sync-aware.
@@ -33,7 +33,7 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
     pub fn new(
         cap: usize,
         sync_id: SyncID,
-        on_drop_record: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
+        on_drop_record: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
     ) -> Self {
         Self {
             table: BTreeMap::new(),

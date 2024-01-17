@@ -5,6 +5,7 @@
 //! Responsible for managing two `MemTable`s, WAL and SSTs as `TxLog`s
 //! backed by a `TxLogStore`. All operations are executed based
 //! on internal transactions.
+use super::compaction::Compactor;
 use super::mem_table::{MemTable, ValueEx};
 use super::range_query_ctx::RangeQueryCtx;
 use super::sstable::SSTable;
@@ -15,13 +16,12 @@ use crate::os::{Mutex, RwLock};
 use crate::prelude::*;
 use crate::tx::Tx;
 
-use alloc::collections::BTreeMap;
 use core::fmt::{self, Debug};
 use core::hash::Hash;
 use core::ops::{Add, Sub};
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use itertools::Itertools;
 use pod::Pod;
+use rbtree::RBTree;
 
 // TODO: Use `Thread` in os module
 use std::thread::{self, JoinHandle};
@@ -36,12 +36,12 @@ pub type SyncID = u64;
 /// Supports user-defined callbacks in `MemTable`, during compaction and recovery.
 pub struct TxLsmTree<K, V, D>(Arc<TreeInner<K, V, D>>);
 
-#[derive(Clone)]
+/// Inner structures of `TxLsmTree`.
 pub(super) struct TreeInner<K, V, D> {
-    memtable_manager: Arc<MemTableManager<K, V>>,
-    sst_manager: Arc<RwLock<SstManager<K, V>>>,
+    memtable_manager: MemTableManager<K, V>,
+    sst_manager: RwLock<SstManager<K, V>>,
     wal_append_tx: WalAppendTx<D>,
-    compactor: Arc<Compactor>,
+    compactor: Compactor<K, V>,
     tx_log_store: Arc<TxLogStore<D>>,
     listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
 }
@@ -66,7 +66,7 @@ struct MemTableManager<K, V> {
 /// Manager of all `SSTable`s from every level in a `TxLsmTree`.
 #[derive(Debug)]
 struct SstManager<K, V> {
-    level_ssts: Vec<BTreeMap<TxLogId, Arc<SSTable<K, V>>>>,
+    level_ssts: Vec<RBTree<TxLogId, Arc<SSTable<K, V>>>>,
 }
 
 /// A factory of per-transaction event listeners.
@@ -84,10 +84,10 @@ pub trait TxEventListenerFactory<K, V> {
 /// `tx_type` indicates an internal transaction of `TxLsmTree`.
 pub trait TxEventListener<K, V> {
     /// Notify the listener that a new record is added to a LSM-Tree.
-    fn on_add_record(&self, record: &dyn AsKv<K, V>) -> Result<()>;
+    fn on_add_record(&self, record: &dyn AsKV<K, V>) -> Result<()>;
 
     /// Notify the listener that an existing record is dropped from a LSM-Tree.
-    fn on_drop_record(&self, record: &dyn AsKv<K, V>) -> Result<()>;
+    fn on_drop_record(&self, record: &dyn AsKV<K, V>) -> Result<()>;
 
     /// Notify the listener after a TX just began.
     fn on_tx_begin(&self, tx: &mut Tx) -> Result<()>;
@@ -118,18 +118,28 @@ pub trait RecordKey<K>:
 pub trait RecordValue: Pod + Debug + 'static {}
 
 /// Represent any type that includes a key and a value.
-pub trait AsKv<K, V> {
+pub trait AsKV<K, V> {
     fn key(&self) -> &K;
 
     fn value(&self) -> &V;
 }
+
+/// Represent any type that includes a key and a sync-aware value.
+pub(super) trait AsKVex<K, V> {
+    fn key(&self) -> &K;
+
+    fn value_ex(&self) -> &ValueEx<V>;
+}
+
+pub(super) const MEMTABLE_CAPACITY: usize = 81920; // TBD
+pub(super) const SSTABLE_CAPACITY: usize = MEMTABLE_CAPACITY;
 
 impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> {
     /// Format a `TxLsmTree` from a given `TxLogStore`.
     pub fn format(
         tx_log_store: Arc<TxLogStore<D>>,
         listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
-        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
     ) -> Result<Self> {
         let inner = TreeInner::format(tx_log_store, listener_factory, on_drop_record_in_memtable)?;
         Ok(Self(Arc::new(inner)))
@@ -139,7 +149,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
     pub fn recover(
         tx_log_store: Arc<TxLogStore<D>>,
         listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
-        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
     ) -> Result<Self> {
         let inner = TreeInner::recover(tx_log_store, listener_factory, on_drop_record_in_memtable)?;
         Ok(Self(Arc::new(inner)))
@@ -157,36 +167,37 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
 
     /// Puts a key-value pair to the tree.
     pub fn put(&self, key: K, value: V) -> Result<()> {
+        let inner = &self.0;
         let record = (key, value);
 
         let timer = LatencyMetrics::start_timer(ReqType::Write, "wal_append", "lsmtree");
         // 1. Write WAL
-        self.0.wal_append_tx.append(&record)?;
+        inner.wal_append_tx.append(&record)?;
         LatencyMetrics::stop_timer(timer);
 
         // 2. Put into MemTable
-        let at_capacity = self.0.memtable_manager.put(key, value);
+        let at_capacity = inner.memtable_manager.put(key, value);
         if !at_capacity {
             return Ok(());
         }
 
         let timer = LatencyMetrics::start_timer(ReqType::Write, "wal_commit", "lsmtree");
         // TODO: Think of combining WAL's TX with minor compaction TX?
-        self.0.wal_append_tx.commit()?;
+        inner.wal_append_tx.commit()?;
         LatencyMetrics::stop_timer(timer);
 
         let timer = LatencyMetrics::start_timer(ReqType::Write, "compaction", "lsmtree");
-        self.0.compactor.wait_compaction()?;
+        inner.compactor.wait_compaction()?;
 
         // 3. Trigger compaction when MemTable is at capacity
-        self.0.memtable_manager.switch();
+        inner.memtable_manager.switch();
 
         self.do_compaction_tx()?;
         LatencyMetrics::stop_timer(timer);
 
         let timer = LatencyMetrics::start_timer(ReqType::Write, "wal_discard", "lsmtree");
         // Discard current WAL
-        self.0.wal_append_tx.discard()?;
+        inner.wal_append_tx.discard()?;
         LatencyMetrics::stop_timer(timer);
 
         Ok(())
@@ -199,7 +210,6 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
 
     fn do_compaction_tx(&self) -> Result<()> {
         let inner = self.0.clone();
-
         let handle = thread::spawn(move || -> Result<()> {
             // Do major compaction first if needed
             if inner
@@ -225,30 +235,24 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
 
             Ok(())
         });
-        // handle.join().unwrap()?; // synchronous
 
-        let _ = self.0.compactor.handle.lock().insert(handle);
+        // handle.join().unwrap()?; // synchronous
+        self.0.compactor.record_handle(handle); // asynchronous
         Ok(())
     }
 }
 
 impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> {
-    pub(super) const MEMTABLE_CAPACITY: usize = 81920; // TBD
-    pub(super) const SSTABLE_CAPACITY: usize = Self::MEMTABLE_CAPACITY;
-
     pub fn format(
         tx_log_store: Arc<TxLogStore<D>>,
         listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
-        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
     ) -> Result<Self> {
         Ok(Self {
-            memtable_manager: Arc::new(MemTableManager::new(
-                Self::MEMTABLE_CAPACITY,
-                on_drop_record_in_memtable,
-            )),
-            sst_manager: Arc::new(RwLock::new(SstManager::new())),
+            memtable_manager: MemTableManager::new(MEMTABLE_CAPACITY, on_drop_record_in_memtable),
+            sst_manager: RwLock::new(SstManager::new()),
             wal_append_tx: WalAppendTx::new(&tx_log_store),
-            compactor: Arc::new(Compactor::new()),
+            compactor: Compactor::new(),
             tx_log_store,
             listener_factory,
         })
@@ -257,7 +261,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
     pub fn recover(
         tx_log_store: Arc<TxLogStore<D>>,
         listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
-        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
     ) -> Result<Self> {
         // Only synced records count, all unsynced are discarded
         let synced_records = {
@@ -280,10 +284,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             res.unwrap()
         };
 
-        let memtable_manager = Arc::new(MemTableManager::new(
-            Self::MEMTABLE_CAPACITY,
-            on_drop_record_in_memtable,
-        ));
+        let memtable_manager = MemTableManager::new(MEMTABLE_CAPACITY, on_drop_record_in_memtable);
         synced_records.into_iter().for_each(|(k, v)| {
             let _ = memtable_manager.put(k, v);
         });
@@ -312,14 +313,14 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
                 tx.abort();
                 return_errno_with_msg!(TxAborted, "recover TxLsmTree failed");
             }
-            Arc::new(RwLock::new(manager))
+            RwLock::new(manager)
         };
 
         let recov_self = Self {
             memtable_manager,
             sst_manager,
             wal_append_tx: WalAppendTx::new(&tx_log_store),
-            compactor: Arc::new(Compactor::new()),
+            compactor: Compactor::new(),
             tx_log_store,
             listener_factory,
         };
@@ -477,14 +478,13 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             to_level: LsmLevel::L0,
         };
         let event_listener = self.listener_factory.new_event_listener(tx_type);
-        let res = event_listener.on_tx_begin(&mut tx);
-        if res.is_err() {
+        event_listener.on_tx_begin(&mut tx).map_err(|_| {
             tx.abort();
-            return_errno_with_msg!(
+            Error::with_msg(
                 TxAborted,
-                "minor compaction TX callback 'on_tx_begin' failed"
-            );
-        }
+                "minor compaction TX callback 'on_tx_begin' failed",
+            )
+        })?;
 
         let res: Result<_> = tx.context(|| {
             let tx_log = self.tx_log_store.create_log(LsmLevel::L0.bucket())?;
@@ -513,14 +513,13 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             return_errno_with_msg!(TxAborted, "minor compaction TX failed");
         }
 
-        let res = event_listener.on_tx_precommit(&mut tx);
-        if res.is_err() {
+        event_listener.on_tx_precommit(&mut tx).map_err(|_| {
             tx.abort();
-            return_errno_with_msg!(
+            Error::with_msg(
                 TxAborted,
-                "minor compaction TX callback 'on_tx_precommit' failed"
-            );
-        }
+                "minor compaction TX callback 'on_tx_precommit' failed",
+            )
+        })?;
 
         tx.commit()?;
         event_listener.on_tx_commit();
@@ -538,14 +537,13 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         // Prepare TX listener
         let tx_type = TxType::Compaction { to_level };
         let event_listener = self.listener_factory.new_event_listener(tx_type);
-        let res = event_listener.on_tx_begin(&mut tx);
-        if res.is_err() {
+        event_listener.on_tx_begin(&mut tx).map_err(|_| {
             tx.abort();
-            return_errno_with_msg!(
+            Error::with_msg(
                 TxAborted,
-                "major compaction TX callback 'on_tx_begin' failed"
-            );
-        }
+                "major compaction TX callback 'on_tx_begin' failed",
+            )
+        })?;
 
         let master_sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
         let tx_log_store = self.tx_log_store.clone();
@@ -605,8 +603,8 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
                 records_vec
             };
 
-            // Compact records then create new SSTs
-            created_ssts = Self::compact_records_and_build_ssts(
+            // Compact records then build new SSTs
+            created_ssts = Compactor::compact_records_and_build_ssts(
                 upper_records.into_iter(),
                 lower_records_vec
                     .into_iter()
@@ -631,26 +629,21 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             Error::with_msg(TxAborted, "major compaction TX failed")
         })?;
 
-        let res = event_listener.on_tx_precommit(&mut tx);
-        if res.is_err() {
+        event_listener.on_tx_precommit(&mut tx).map_err(|_| {
             tx.abort();
-            return_errno_with_msg!(
+            Error::with_msg(
                 TxAborted,
-                "major compaction TX callback 'on_tx_precommit' failed"
-            );
-        }
+                "major compaction TX callback 'on_tx_precommit' failed",
+            )
+        })?;
+
         tx.commit()?;
         event_listener.on_tx_commit();
 
-        // Update SST manager
-        let mut sst_manager = self.sst_manager.write();
-        created_ssts.into_iter().for_each(|sst| {
-            let _ = sst_manager.insert(sst, to_level);
-        });
-        deleted_ssts.into_iter().for_each(|(id, level)| {
-            let _ = sst_manager.remove(id, level);
-        });
-        drop(sst_manager);
+        self.update_sst_manager(
+            created_ssts.into_iter().map(|sst| (sst, to_level)),
+            deleted_ssts.into_iter(),
+        );
 
         // Continue to do major compaction if necessary
         if self.sst_manager.read().require_major_compaction(to_level) {
@@ -661,79 +654,6 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         Ok(())
     }
 
-    // Core function for compacting records and building SSTs.
-    // TODO: Need continuously optimization
-    fn compact_records_and_build_ssts(
-        upper_records: impl Iterator<Item = (K, ValueEx<V>)>,
-        lower_records: impl Iterator<Item = (K, ValueEx<V>)>,
-        tx_log_store: &Arc<TxLogStore<D>>,
-        event_listener: &Arc<dyn TxEventListener<K, V>>,
-        to_level: LsmLevel,
-        sync_id: SyncID,
-    ) -> Result<Vec<SSTable<K, V>>> {
-        // TODO: Try `itertools::kmerge()`
-        let mut merged_map: BTreeMap<K, ValueEx<V>> = lower_records.collect();
-        let mut created_ssts = Vec::new();
-        let mut dropped_records = Vec::new();
-
-        for (k, new_v_ex) in upper_records {
-            let old_v_ex_opt = merged_map.get_mut(&k);
-            if old_v_ex_opt.is_none() {
-                let _ = merged_map.insert(k, new_v_ex);
-                continue;
-            }
-
-            let old_v_ex = old_v_ex_opt.unwrap();
-            let replaced_opt = match (new_v_ex, &old_v_ex) {
-                (ValueEx::Synced(new_v), ValueEx::Synced(old_v)) => {
-                    dropped_records.push((k, *old_v));
-                    Some(ValueEx::Synced(new_v))
-                }
-                (ValueEx::Unsynced(new_v), ValueEx::Synced(old_v)) => {
-                    Some(ValueEx::SyncedAndUnsynced(*old_v, new_v))
-                }
-                (ValueEx::Unsynced(new_v), ValueEx::Unsynced(old_v)) => {
-                    dropped_records.push((k, *old_v));
-                    Some(ValueEx::Unsynced(new_v))
-                }
-                (ValueEx::Unsynced(new_v), ValueEx::SyncedAndUnsynced(old_sv, old_usv)) => {
-                    dropped_records.push((k, *old_usv));
-                    Some(ValueEx::SyncedAndUnsynced(*old_sv, new_v))
-                }
-                (ValueEx::SyncedAndUnsynced(new_sv, new_usv), ValueEx::Synced(old_sv)) => {
-                    dropped_records.push((k, *old_sv));
-                    Some(ValueEx::SyncedAndUnsynced(new_sv, new_usv))
-                }
-                _ => {
-                    unreachable!()
-                }
-            };
-            if let Some(replaced) = replaced_opt {
-                *old_v_ex = replaced;
-            }
-        }
-
-        let new_logs = {
-            let size = align_up(merged_map.len(), Self::SSTABLE_CAPACITY) / Self::SSTABLE_CAPACITY;
-            let mut new_logs = Vec::with_capacity(size);
-            for _ in 0..size {
-                new_logs.push(tx_log_store.create_log(to_level.bucket())?);
-            }
-            new_logs
-        };
-        let mut nth = 0;
-        for records_iter in &merged_map.iter().chunks(Self::SSTABLE_CAPACITY) {
-            let new_sst = SSTable::build(records_iter, sync_id, &new_logs[nth])?;
-            created_ssts.push(new_sst);
-            nth += 1;
-        }
-
-        for record in dropped_records {
-            event_listener.on_drop_record(&record)?;
-        }
-        Ok(created_ssts)
-    }
-
     /// Migration TX, primarily to discard all unsynced records in SSTs.
     fn do_migration_tx(&self) -> Result<()> {
         let mut tx = self.tx_log_store.new_tx();
@@ -741,11 +661,10 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         // Prepare TX listener
         let tx_type = TxType::Migration;
         let event_listener = self.listener_factory.new_event_listener(tx_type);
-        let res = event_listener.on_tx_begin(&mut tx);
-        if res.is_err() {
+        event_listener.on_tx_begin(&mut tx).map_err(|_| {
             tx.abort();
-            return_errno_with_msg!(TxAborted, "migration TX callback 'on_tx_begin' failed");
-        }
+            Error::with_msg(TxAborted, "migration TX callback 'on_tx_begin' failed")
+        })?;
 
         let master_sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
         let tx_log_store = self.tx_log_store.clone();
@@ -770,11 +689,8 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
                     if !synced_records.is_empty() {
                         // Create new migrated SST
                         let new_log = tx_log_store.create_log(bucket)?;
-                        let new_sst = SSTable::build(
-                            synced_records.iter().map(|(k, v)| (k, v)),
-                            master_sync_id,
-                            &new_log,
-                        )?;
+                        let new_sst =
+                            SSTable::build(synced_records.into_iter(), master_sync_id, &new_log)?;
                         created_ssts.push((new_sst, level));
                         continue;
                     }
@@ -792,23 +708,30 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             Error::with_msg(TxAborted, "migration TX failed")
         })?;
 
-        let res = event_listener.on_tx_precommit(&mut tx);
-        if res.is_err() {
+        event_listener.on_tx_precommit(&mut tx).map_err(|_| {
             tx.abort();
-            return_errno_with_msg!(TxAborted, "migration TX callback 'on_tx_precommit' failed");
-        }
+            Error::with_msg(TxAborted, "migration TX callback 'on_tx_precommit' failed")
+        })?;
+
         tx.commit()?;
         event_listener.on_tx_commit();
 
-        // Update SST manager
+        self.update_sst_manager(created_ssts.into_iter(), deleted_ssts.into_iter());
+        Ok(())
+    }
+
+    fn update_sst_manager(
+        &self,
+        created: impl Iterator<Item = (SSTable<K, V>, LsmLevel)>,
+        deleted: impl Iterator<Item = (TxLogId, LsmLevel)>,
+    ) {
         let mut sst_manager = self.sst_manager.write();
-        created_ssts.into_iter().for_each(|(sst, level)| {
+        created.for_each(|(sst, level)| {
             let _ = sst_manager.insert(sst, level);
         });
-        deleted_ssts.into_iter().for_each(|(id, level)| {
+        deleted.for_each(|(id, level)| {
             let _ = sst_manager.remove(id, level);
         });
-        Ok(())
     }
 }
 
@@ -850,7 +773,7 @@ impl LsmLevel {
         LsmLevel::from(*self as u8 + 1)
     }
 
-    const fn bucket(&self) -> &str {
+    pub const fn bucket(&self) -> &str {
         match self {
             LsmLevel::L0 => "L0",
             LsmLevel::L1 => "L1",
@@ -880,7 +803,7 @@ impl From<u8> for LsmLevel {
 impl<K: RecordKey<K>, V: RecordValue> SstManager<K, V> {
     pub fn new() -> Self {
         let level_ssts = (0..LsmLevel::MAX_NUM_LEVELS)
-            .map(|_| BTreeMap::new())
+            .map(|_| RBTree::new())
             .collect();
         Self { level_ssts }
     }
@@ -896,7 +819,7 @@ impl<K: RecordKey<K>, V: RecordValue> SstManager<K, V> {
         let nth_level = level as usize;
         debug_assert!(nth_level < self.level_ssts.len());
         let level_ssts = &mut self.level_ssts[nth_level];
-        level_ssts.insert(sst.id(), Arc::new(sst))
+        level_ssts.replace_or_insert(sst.id(), Arc::new(sst))
     }
 
     pub fn remove(&mut self, id: TxLogId, level: LsmLevel) -> Option<Arc<SSTable<K, V>>> {
@@ -922,7 +845,7 @@ impl<K: RecordKey<K>, V: RecordValue> SstManager<K, V> {
 impl<K: RecordKey<K>, V: RecordValue> MemTableManager<K, V> {
     pub fn new(
         capacity: usize,
-        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKv<K, V>)>>,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
     ) -> Self {
         let mem_tables = {
             let sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
@@ -1005,28 +928,7 @@ impl<K: RecordKey<K>, V: RecordValue> Debug for MemTableManager<K, V> {
     }
 }
 
-/// A `Compactor` is currently used for asynchronous compaction of `TxLsmTree`.
-struct Compactor {
-    handle: Mutex<Option<JoinHandle<Result<()>>>>,
-}
-
-impl Compactor {
-    pub fn new() -> Self {
-        Self {
-            handle: Mutex::new(None),
-        }
-    }
-
-    pub fn wait_compaction(&self) -> Result<()> {
-        if let Some(handle) = self.handle.lock().take() {
-            handle.join().unwrap()
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl<K, V> AsKv<K, V> for (K, V) {
+impl<K, V> AsKV<K, V> for (K, V) {
     fn key(&self) -> &K {
         &self.0
     }
@@ -1035,7 +937,7 @@ impl<K, V> AsKv<K, V> for (K, V) {
     }
 }
 
-impl<K, V> AsKv<K, V> for (&K, &V) {
+impl<K, V> AsKV<K, V> for (&K, &V) {
     fn key(&self) -> &K {
         self.0
     }
@@ -1044,7 +946,25 @@ impl<K, V> AsKv<K, V> for (&K, &V) {
     }
 }
 
-// Safety.
+impl<K, V> AsKVex<K, V> for (K, ValueEx<V>) {
+    fn key(&self) -> &K {
+        &self.0
+    }
+    fn value_ex(&self) -> &ValueEx<V> {
+        &self.1
+    }
+}
+
+impl<K, V> AsKVex<K, V> for (&K, &ValueEx<V>) {
+    fn key(&self) -> &K {
+        self.0
+    }
+    fn value_ex(&self) -> &ValueEx<V> {
+        self.1
+    }
+}
+
+// SAFETY: `TxLsmTree` is concurrency-safe.
 unsafe impl<K, V, D: BlockSet> Send for TreeInner<K, V, D> {}
 unsafe impl<K, V, D: BlockSet> Sync for TreeInner<K, V, D> {}
 
@@ -1063,10 +983,10 @@ mod tests {
         }
     }
     impl<K, V> TxEventListener<K, V> for Listener {
-        fn on_add_record(&self, _record: &dyn AsKv<K, V>) -> Result<()> {
+        fn on_add_record(&self, _record: &dyn AsKV<K, V>) -> Result<()> {
             Ok(())
         }
-        fn on_drop_record(&self, _record: &dyn AsKv<K, V>) -> Result<()> {
+        fn on_drop_record(&self, _record: &dyn AsKV<K, V>) -> Result<()> {
             Ok(())
         }
         fn on_tx_begin(&self, _tx: &mut Tx) -> Result<()> {
@@ -1100,7 +1020,7 @@ mod tests {
             TxLsmTree::format(tx_log_store.clone(), Arc::new(Factory), None)?;
 
         // Put sufficient records which can trigger compaction before a sync command
-        let cap = TreeInner::<BlockId, Value, MemDisk>::MEMTABLE_CAPACITY;
+        let cap = MEMTABLE_CAPACITY;
         let start = 0;
         for i in start..start + cap {
             let (k, v) = (

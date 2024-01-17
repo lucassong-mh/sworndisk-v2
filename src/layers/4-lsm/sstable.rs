@@ -1,5 +1,6 @@
 //! Sorted String Table.
 use super::mem_table::ValueEx;
+use super::tx_lsm_tree::AsKVex;
 use super::{RangeQueryCtx, RecordKey, RecordValue, SyncID};
 use crate::layers::bio::{BlockSet, Buf, BufMut, BufRef, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogId, TxLogStore};
@@ -281,13 +282,14 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
     /// # Panics
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
-    pub fn build<'a, D: BlockSet + 'static, I>(
+    pub fn build<'a, D: BlockSet + 'static, I, KVex>(
         records_iter: I,
         sync_id: SyncID,
         tx_log: &'a Arc<TxLog<D>>,
     ) -> Result<Self>
     where
-        I: Iterator<Item = (&'a K, &'a ValueEx<V>)>,
+        I: Iterator<Item = KVex>,
+        KVex: AsKVex<K, V>,
         Self: 'a,
     {
         let total_records = records_iter.size_hint().0;
@@ -305,14 +307,15 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         })
     }
 
-    fn build_record_blocks<'a, D: BlockSet + 'static, I>(
+    fn build_record_blocks<'a, D: BlockSet + 'static, I, KVex>(
         records_iter: I,
         total_records: usize,
         tx_log: &'a TxLog<D>,
         cache: &mut LruCache<BlockId, Arc<RecordBlock>>,
     ) -> Result<Vec<IndexEntry<K>>>
     where
-        I: Iterator<Item = (&'a K, &'a ValueEx<V>)>,
+        I: Iterator<Item = KVex>,
+        KVex: AsKVex<K, V>,
         Self: 'a,
     {
         let mut index_vec =
@@ -322,7 +325,8 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         let mut inner_offset = 0;
 
         let mut append_buf = Vec::with_capacity(BLOCK_SIZE);
-        for (nth, (key, value_ex)) in records_iter.enumerate() {
+        for (nth, kv_ex) in records_iter.enumerate() {
+            let (key, value_ex) = (kv_ex.key(), kv_ex.value_ex());
             if inner_offset == 0 {
                 debug_assert!(append_buf.is_empty());
                 let _ = first_k.insert(*key);
