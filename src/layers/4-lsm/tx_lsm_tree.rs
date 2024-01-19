@@ -293,7 +293,9 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         let mut tx = tx_log_store.new_tx();
         let res: Result<_> = tx.context(|| {
             let wal_res = tx_log_store.open_log_in(BUCKET_WAL, false);
-            if let Err(e) = &wal_res && e.errno() == NotFound {
+            if let Err(e) = &wal_res
+                && e.errno() == NotFound
+            {
                 return Ok(vec![]);
             }
             let wal = wal_res?;
@@ -315,7 +317,9 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         let res: Result<_> = tx.context(|| {
             for (level, bucket) in LsmLevel::iter() {
                 let log_ids = tx_log_store.list_logs_in(bucket);
-                if let Err(e) = &log_ids && e.errno() == NotFound {
+                if let Err(e) = &log_ids
+                    && e.errno() == NotFound
+                {
                     continue;
                 }
 

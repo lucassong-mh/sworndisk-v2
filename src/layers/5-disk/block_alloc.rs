@@ -118,19 +118,23 @@ impl AllocTable {
 
             // Iterate each `BAL` log and apply each diff, from older to newer
             let bal_log_ids_res = store.list_logs_in(BUCKET_BLOCK_ALLOC_LOG);
-            if let Err(e) = &bal_log_ids_res && e.errno() == NotFound {
+            if let Err(e) = &bal_log_ids_res
+                && e.errno() == NotFound
+            {
                 let next_avail = bitmap.first_one().unwrap_or(0);
                 return Ok(Self {
                     bitmap: Mutex::new(bitmap),
                     next_avail: AtomicUsize::new(next_avail),
-                })
+                });
             }
             let mut bal_log_ids = bal_log_ids_res?;
             bal_log_ids.sort();
 
             for bal_log_id in bal_log_ids {
                 let bal_log_res = store.open_log(bal_log_id, false);
-                if let Err(e) = &bal_log_res && e.errno() == NotFound {
+                if let Err(e) = &bal_log_res
+                    && e.errno() == NotFound
+                {
                     continue;
                 }
                 let bal_log = bal_log_res?;
