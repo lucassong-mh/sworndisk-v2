@@ -28,7 +28,7 @@ lazy_static! {
     static ref METRICS: RwLock<Metrics> = RwLock::new(Metrics::new(true));
 }
 
-const ENABLE_METRICS: bool = false;
+const ENABLE_METRICS: bool = true;
 
 /// System metrics.
 /// It measures latency and amplification information.

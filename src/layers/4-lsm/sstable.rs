@@ -8,7 +8,6 @@ use crate::os::RwLock;
 use crate::prelude::*;
 
 use core::fmt::{self, Debug};
-use core::hash::Hash;
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::num::NonZeroUsize;
@@ -189,7 +188,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         for target_rb_pos in target_rbs {
             let target_rb = self.target_record_block(target_rb_pos, tx_log_store)?;
 
-            let mut iter = BlockQueryIter::<'_, K, V> {
+            let iter = BlockQueryIter::<'_, K, V> {
                 block: &target_rb,
                 offset: 0,
                 accessor: &accessor,
@@ -263,7 +262,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
                 &curr_record_block
             };
 
-            let mut iter = BlockScanIter {
+            let iter = BlockScanIter {
                 block: record_block,
                 offset: 0,
                 accessor: &mut accessor,

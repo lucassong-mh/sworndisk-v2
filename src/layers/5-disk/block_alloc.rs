@@ -19,7 +19,7 @@ const BUCKET_BLOCK_ALLOC_LOG: &str = "BAL";
 /// which manages validities of user data blocks.
 pub(super) struct AllocTable {
     bitmap: Mutex<BitMap>,
-    min_avail: AtomicUsize,
+    next_avail: AtomicUsize,
 }
 
 /// Per-TX block allocator in `SwornDisk`, recording validities
@@ -45,7 +45,7 @@ impl AllocTable {
     pub fn new(nblocks: usize) -> Self {
         Self {
             bitmap: Mutex::new(BitMap::repeat(true, nblocks)),
-            min_avail: AtomicUsize::new(0),
+            next_avail: AtomicUsize::new(0),
         }
     }
 
@@ -53,16 +53,16 @@ impl AllocTable {
     /// if there are no free slots.
     pub fn alloc(&self) -> Option<Hba> {
         let mut bitmap = self.bitmap.lock();
-        let min_avail = self.min_avail.load(Ordering::Relaxed);
+        let next_avail = self.next_avail.load(Ordering::Relaxed);
 
-        let hba = if let Some(hba) = bitmap[min_avail..].first_one() {
-            hba + min_avail
+        let hba = if let Some(hba) = bitmap[next_avail..].first_one() {
+            hba + next_avail
         } else {
             bitmap.first_one()?
         };
         bitmap.set(hba, false);
 
-        self.min_avail.store(hba + 1, Ordering::Release);
+        self.next_avail.store(hba + 1, Ordering::Release);
         Some(hba as Hba)
     }
 
@@ -71,22 +71,22 @@ impl AllocTable {
     pub fn alloc_batch(&self, count: usize) -> Option<Vec<Hba>> {
         let mut bitmap = self.bitmap.lock();
         let mut hbas = Vec::with_capacity(count);
-        let mut min_avail = self.min_avail.load(Ordering::Relaxed);
+        let mut next_avail = self.next_avail.load(Ordering::Relaxed);
 
         for _ in 0..count {
-            let hba = if let Some(hba) = bitmap[min_avail..].first_one() {
-                hba + min_avail
+            let hba = if let Some(hba) = bitmap[next_avail..].first_one() {
+                hba + next_avail
             } else {
-                min_avail = bitmap.first_one()?;
-                min_avail
+                next_avail = bitmap.first_one()?;
+                next_avail
             };
             hbas.push(hba);
             bitmap.set(hba, false);
 
-            min_avail += 1;
+            next_avail += 1;
         }
 
-        self.min_avail.store(min_avail, Ordering::Release);
+        self.next_avail.store(next_avail, Ordering::Release);
         Some(hbas)
     }
 
@@ -117,12 +117,12 @@ impl AllocTable {
             };
 
             // Iterate each `BAL` log and apply each diff, from older to newer
-            let mut bal_log_ids_res = store.list_logs_in(BUCKET_BLOCK_ALLOC_LOG);
+            let bal_log_ids_res = store.list_logs_in(BUCKET_BLOCK_ALLOC_LOG);
             if let Err(e) = &bal_log_ids_res && e.errno() == NotFound {
-                let min_avail = bitmap.first_one().unwrap_or(0);
+                let next_avail = bitmap.first_one().unwrap_or(0);
                 return Ok(Self {
                     bitmap: Mutex::new(bitmap),
-                    min_avail: AtomicUsize::new(min_avail),
+                    next_avail: AtomicUsize::new(next_avail),
                 })
             }
             let mut bal_log_ids = bal_log_ids_res?;
@@ -155,14 +155,14 @@ impl AllocTable {
                     }
                 }
             }
-            let min_avail = bitmap.first_one().unwrap_or(0);
+            let next_avail = bitmap.first_one().unwrap_or(0);
 
             Ok(Self {
                 bitmap: Mutex::new(bitmap),
-                min_avail: AtomicUsize::new(min_avail),
+                next_avail: AtomicUsize::new(next_avail),
             })
         });
-        let recov_self = res.map_err(|e| {
+        let recov_self = res.map_err(|_| {
             tx.abort();
             Error::with_msg(TxAborted, "recover block validity table TX aborted")
         })?;

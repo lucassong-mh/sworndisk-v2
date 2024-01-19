@@ -7,7 +7,7 @@
 //! are stored; an untrusted disk storing user data, a `BlockAlloc` for managing data blocks'
 //! allocation metadata. `TxLsmTree` and `BlockAlloc` are manipulated
 //! based on internal transactions.
-use super::bio::{BioReq, BioReqBuilder, BioReqQueue, BioResp, BioType};
+use super::bio::{BioReq, BioReqQueue, BioResp, BioType};
 use super::block_alloc::{AllocTable, BlockAlloc};
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::log::TxLogStore;
@@ -23,7 +23,6 @@ use crate::util::Aead;
 use alloc::collections::BTreeMap;
 use core::ops::{Add, RangeInclusive, Sub};
 use core::sync::atomic::{AtomicBool, Ordering};
-use lending_iterator::LendingIterator;
 use pod::Pod;
 
 /// Logical Block Address.
@@ -58,7 +57,8 @@ struct DiskInner<D: BlockSet> {
 
 impl<D: BlockSet + 'static> SwornDisk<D> {
     /// Submit a new block I/O request to the request queue (Asynchronous).
-    pub fn submit_bio(&self, bio_req: BioReq) -> BioResp {
+    // Currently not in-use.
+    fn submit_bio(&self, bio_req: BioReq) -> BioResp {
         self.inner.bio_req_queue.enqueue(bio_req)
     }
 
@@ -70,7 +70,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
     /// Read a specified number of blocks at a logical block address on the device.
     /// The block contents will be read into a single contiguous buffer.
-    pub fn read(&self, lba: Lba, mut buf: BufMut) -> Result<()> {
+    pub fn read(&self, lba: Lba, buf: BufMut) -> Result<()> {
         self.inner.read(lba, buf)
     }
 
@@ -82,13 +82,13 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
     /// Write a specified number of blocks at a logical block address on the device.
     /// The block contents reside in a single contiguous buffer.
-    pub fn write(&self, mut lba: Lba, buf: BufRef) -> Result<usize> {
+    pub fn write(&self, lba: Lba, buf: BufRef) -> Result<usize> {
         self.inner.write(lba, buf)
     }
 
     /// Write multiple blocks at a logical block address on the device.
     /// The block contents reside in several scattered buffers.
-    pub fn writev(&self, mut lba: Lba, bufs: &[BufRef]) -> Result<()> {
+    pub fn writev(&self, lba: Lba, bufs: &[BufRef]) -> Result<()> {
         self.inner.writev(lba, bufs)
     }
 
@@ -133,8 +133,9 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             }),
         };
 
-        new_self.spawn_bio_req_handler();
+        // new_self.spawn_bio_req_handler();
 
+        // XXX: Would `disk::drop()` bring unexpected behavior?
         Ok(new_self)
     }
 
@@ -175,7 +176,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             }),
         };
 
-        opened_self.spawn_bio_req_handler();
+        // opened_self.spawn_bio_req_handler();
 
         Ok(opened_self)
     }
@@ -283,7 +284,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
     /// Read a specified number of blocks at a logical block address on the device.
     /// The block contents will be read into a single contiguous buffer.
-    pub fn read(&self, lba: Lba, mut buf: BufMut) -> Result<()> {
+    pub fn read(&self, lba: Lba, buf: BufMut) -> Result<()> {
         let nblocks = buf.nblocks();
         AmplificationMetrics::acc_data_amount(AmpType::Read, nblocks);
 
@@ -369,7 +370,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
         // Perform disk read in batches and decryption
         let mut cipher_buf = Buf::alloc(nblocks)?;
-        let mut cipher_slice = cipher_buf.as_mut_slice();
+        let cipher_slice = cipher_buf.as_mut_slice();
         for record_batch in record_batches {
             self.user_data_disk.read(
                 record_batch.first().unwrap().1.hba,
@@ -498,7 +499,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         LatencyMetrics::stop_timer(timer);
         let timer = LatencyMetrics::start_timer(ReqType::Sync, "bvt_bal_compaction", "");
 
-        /// XXX: May impact performance when there comes frequent syncs
+        // XXX: May impact performance when there comes frequent syncs
         self.block_validity_table
             .do_compaction(&self.tx_log_store)?;
 
@@ -776,7 +777,8 @@ impl AsKV<RecordKey, RecordValue> for Record {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layers::{bio::MemDisk, disk::bio::BlockBuf};
+    use crate::layers::bio::MemDisk;
+    use crate::layers::disk::bio::{BioReqBuilder, BlockBuf};
 
     use core::ptr::NonNull;
     use std::thread::{self, JoinHandle};

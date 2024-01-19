@@ -12,6 +12,7 @@ use self::disks::{DiskType, FileAsDisk};
 use self::util::{DisplayData, DisplayThroughput};
 
 use libc::{fdatasync, ftruncate, open, pread, pwrite, unlink, O_CREAT, O_DIRECT, O_RDWR, O_TRUNC};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -104,8 +105,10 @@ fn run_benches(benches: Vec<Box<dyn Bench>>) {
 
     let mut benched_count = 0;
     let mut failed_count = 0;
-    for b in benches {
+    for mut b in benches {
         print!("bench {} ... ", &b);
+        b.prepare();
+
         let start = Instant::now();
         let res = b.run();
         if let Err(e) = res {
@@ -113,11 +116,12 @@ fn run_benches(benches: Vec<Box<dyn Bench>>) {
             println!("failed due to error {:?}", e);
             continue;
         }
-
         let end = Instant::now();
         let elapsed = end - start;
+
         let throughput = DisplayThroughput::new(b.total_bytes(), elapsed);
         println!("{}", throughput);
+
         b.display_ext();
         benched_count += 1;
     }
@@ -142,6 +146,9 @@ mod benches {
 
         /// Returns the total number of bytes read or written.
         fn total_bytes(&self) -> usize;
+
+        /// Do some preparatory work before running.
+        fn prepare(&mut self) {}
 
         /// Run the benchmark.
         fn run(&self) -> Result<()>;
@@ -242,12 +249,10 @@ mod benches {
                 return_errno_with_msg!(Errno::InvalidArgs, "concurrency must be greater than 0");
             }
 
-            let disk = Self::prepare_disk(disk_type, total_bytes, io_type)?;
-
             Ok(Box::new(SimpleDiskBench {
                 name,
                 disk_type,
-                disk,
+                disk: None,
                 io_type,
                 io_pattern,
                 buf_size,
@@ -255,39 +260,12 @@ mod benches {
                 concurrency,
             }))
         }
-
-        fn prepare_disk(
-            disk_type: DiskType,
-            total_bytes: usize,
-            io_type: IoType,
-        ) -> Result<Arc<dyn BenchDisk>> {
-            let total_nblocks = total_bytes / BLOCK_SIZE;
-            let disk: Arc<dyn BenchDisk> = match disk_type {
-                DiskType::SwornDisk => Arc::new(SwornDisk::create(
-                    FileAsDisk::create(total_nblocks * 4, "sworndisk.image"),
-                    AeadKey::default(),
-                )?),
-                DiskType::EncDisk => Arc::new(EncDisk::create(total_nblocks)),
-            };
-
-            if io_type == IoType::Read {
-                let disk = disk.clone();
-                let _ =
-                    thread::spawn(move || disk.write_seq(0 as BlockId, total_nblocks, 1).unwrap())
-                        .join();
-            }
-
-            if disk_type == DiskType::SwornDisk {
-                Metrics::reset();
-            }
-            Ok(disk)
-        }
     }
 
     pub struct SimpleDiskBench {
         name: String,
         disk_type: DiskType,
-        disk: Arc<dyn BenchDisk>,
+        disk: Option<Arc<dyn BenchDisk>>,
         io_type: IoType,
         io_pattern: IoPattern,
         buf_size: usize,
@@ -311,10 +289,12 @@ mod benches {
             let total_nblock = self.total_bytes / BLOCK_SIZE;
             let concurrency = self.concurrency;
 
+            let disk = self.disk.as_ref().unwrap();
+
             let local_nblocks = total_nblock / (concurrency as usize);
             let join_handles: Vec<JoinHandle<Result<()>>> = (0..concurrency)
                 .map(|i| {
-                    let disk = self.disk.clone();
+                    let disk = disk.clone();
                     let local_pos = (i as BlockId) * local_nblocks;
                     thread::spawn(move || match (io_type, io_pattern) {
                         (IoType::Read, IoPattern::Seq) => {
@@ -350,8 +330,53 @@ mod benches {
             }
         }
 
+        fn prepare(&mut self) {
+            let disk = self.prepare_disk().unwrap();
+            let _ = self.disk.insert(disk);
+        }
+
         fn display_ext(&self) {
-            self.disk.display_ext();
+            if self.disk_type == DiskType::SwornDisk {
+                Metrics::display();
+                Metrics::reset();
+            }
+        }
+    }
+
+    impl SimpleDiskBench {
+        fn prepare_disk(&self) -> Result<Arc<dyn BenchDisk>> {
+            static DISK_ID: AtomicU32 = AtomicU32::new(0);
+
+            let total_nblocks = self.total_bytes / BLOCK_SIZE;
+            let disk: Arc<dyn BenchDisk> = match self.disk_type {
+                DiskType::SwornDisk => Arc::new(SwornDisk::create(
+                    FileAsDisk::create(
+                        (20 * GiB) / BLOCK_SIZE, // TBD
+                        &format!(
+                            "sworndisk-{}.image",
+                            DISK_ID.fetch_add(1, Ordering::Release)
+                        ),
+                    ),
+                    AeadKey::default(),
+                )?),
+
+                DiskType::EncDisk => Arc::new(EncDisk::create(
+                    total_nblocks,
+                    &format!("encdisk-{}.image", DISK_ID.fetch_add(1, Ordering::Release)),
+                )),
+            };
+
+            if self.io_type == IoType::Read {
+                let disk = disk.clone();
+                let _ =
+                    thread::spawn(move || disk.write_seq(0 as BlockId, total_nblocks, 8).unwrap())
+                        .join();
+            }
+
+            if self.disk_type == DiskType::SwornDisk {
+                Metrics::reset();
+            }
+            Ok(disk)
         }
     }
 
@@ -409,8 +434,6 @@ mod disks {
 
         fn read_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()>;
         fn write_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()>;
-
-        fn display_ext(&self) {}
     }
 
     #[derive(Clone)]
@@ -567,11 +590,6 @@ mod disks {
 
             self.sync()
         }
-
-        fn display_ext(&self) {
-            Metrics::display();
-            Metrics::reset();
-        }
     }
 
     fn gen_rnd_pos(total_nblocks: usize, buf_nblocks: usize) -> BlockId {
@@ -586,9 +604,9 @@ mod disks {
     }
 
     impl EncDisk {
-        pub fn create(nblocks: usize) -> Self {
+        pub fn create(nblocks: usize, path: &str) -> Self {
             Self {
-                file_disk: FileAsDisk::create(nblocks, "encdisk.image"),
+                file_disk: FileAsDisk::create(nblocks, path),
             }
         }
 

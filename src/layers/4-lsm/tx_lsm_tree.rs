@@ -12,7 +12,7 @@ use super::sstable::SSTable;
 use super::wal::{WalAppendTx, BUCKET_WAL};
 use crate::layers::bio::BlockSet;
 use crate::layers::log::{TxLogId, TxLogStore};
-use crate::os::{Mutex, RwLock};
+use crate::os::RwLock;
 use crate::prelude::*;
 use crate::tx::Tx;
 
@@ -24,7 +24,7 @@ use pod::Pod;
 use rbtree::RBTree;
 
 // TODO: Use `Thread` in os module
-use std::thread::{self, JoinHandle};
+use std::thread;
 
 /// XXX: Master sync ID should be stored in external trusted storage
 pub static MASTER_SYNC_ID: AtomicU64 = AtomicU64::new(0);
@@ -264,61 +264,19 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
     ) -> Result<Self> {
         // Only synced records count, all unsynced are discarded
-        let synced_records = {
-            let mut tx = tx_log_store.new_tx();
-            let res: Result<_> = tx.context(|| {
-                let wal_res = tx_log_store.open_log_in(BUCKET_WAL, false);
-                if let Err(e) = &wal_res && e.errno() == NotFound {
-                    return Ok(vec![]);
-                }
-                let wal = wal_res?;
-                WalAppendTx::collect_synced_records::<K, V>(&wal)
-            });
-            if res.is_ok() {
-                tx.commit()?;
-                // TODO: Update master sync ID if mismatch
-            } else {
-                tx.abort();
-                return_errno_with_msg!(TxAborted, "recover from WAL failed");
-            }
-            res.unwrap()
-        };
+        let synced_records = Self::collect_synced_records_from_wal(&tx_log_store)?;
 
         let memtable_manager = MemTableManager::new(MEMTABLE_CAPACITY, on_drop_record_in_memtable);
         synced_records.into_iter().for_each(|(k, v)| {
             let _ = memtable_manager.put(k, v);
         });
 
-        // Prepare SST manager (load index block to cache)
-        let sst_manager = {
-            let mut manager = SstManager::new();
-            let mut tx = tx_log_store.new_tx();
-            let res: Result<_> = tx.context(|| {
-                for (level, bucket) in LsmLevel::iter() {
-                    let log_ids = tx_log_store.list_logs_in(bucket);
-                    if let Err(e) = &log_ids && e.errno() == NotFound {
-                        continue;
-                    }
-
-                    for id in log_ids? {
-                        let log = tx_log_store.open_log(id, false)?;
-                        manager.insert(SSTable::from_log(&log)?, level);
-                    }
-                }
-                Ok(())
-            });
-            if res.is_ok() {
-                tx.commit()?;
-            } else {
-                tx.abort();
-                return_errno_with_msg!(TxAborted, "recover TxLsmTree failed");
-            }
-            RwLock::new(manager)
-        };
+        // Prepare SST manager (load each SST's index blocks)
+        let sst_manager = Self::recover_sst_manager(&tx_log_store)?;
 
         let recov_self = Self {
             memtable_manager,
-            sst_manager,
+            sst_manager: RwLock::new(sst_manager),
             wal_append_tx: WalAppendTx::new(&tx_log_store),
             compactor: Compactor::new(),
             tx_log_store,
@@ -329,6 +287,52 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
         debug!("[TxLsmTree Recovery] {recov_self:?}");
         Ok(recov_self)
+    }
+
+    fn collect_synced_records_from_wal(tx_log_store: &Arc<TxLogStore<D>>) -> Result<Vec<(K, V)>> {
+        let mut tx = tx_log_store.new_tx();
+        let res: Result<_> = tx.context(|| {
+            let wal_res = tx_log_store.open_log_in(BUCKET_WAL, false);
+            if let Err(e) = &wal_res && e.errno() == NotFound {
+                return Ok(vec![]);
+            }
+            let wal = wal_res?;
+            WalAppendTx::collect_synced_records::<K, V>(&wal)
+        });
+        if res.is_ok() {
+            tx.commit()?;
+            // TODO: Update master sync ID if mismatch
+        } else {
+            tx.abort();
+            return_errno_with_msg!(TxAborted, "recover from WAL failed");
+        }
+        res
+    }
+
+    fn recover_sst_manager(tx_log_store: &Arc<TxLogStore<D>>) -> Result<SstManager<K, V>> {
+        let mut manager = SstManager::new();
+        let mut tx = tx_log_store.new_tx();
+        let res: Result<_> = tx.context(|| {
+            for (level, bucket) in LsmLevel::iter() {
+                let log_ids = tx_log_store.list_logs_in(bucket);
+                if let Err(e) = &log_ids && e.errno() == NotFound {
+                    continue;
+                }
+
+                for id in log_ids? {
+                    let log = tx_log_store.open_log(id, false)?;
+                    manager.insert(SSTable::from_log(&log)?, level);
+                }
+            }
+            Ok(())
+        });
+        if res.is_ok() {
+            tx.commit()?;
+        } else {
+            tx.abort();
+            return_errno_with_msg!(TxAborted, "recover TxLsmTree failed");
+        }
+        Ok(manager)
     }
 
     pub fn get(&self, key: &K) -> Result<V> {
@@ -395,8 +399,8 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             // Search each level from top to bottom (newer to older)
             let sst_manager = self.sst_manager.read();
 
-            for (level, bucket) in LsmLevel::iter() {
-                for (id, sst) in sst_manager.list_level(level) {
+            for (level, _bucket) in LsmLevel::iter() {
+                for (_id, sst) in sst_manager.list_level(level) {
                     if !sst.is_within_range(key) {
                         continue;
                     }
@@ -432,8 +436,8 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             // Search each level from top to bottom (newer to older)
             let sst_manager = self.sst_manager.read();
 
-            for (level, bucket) in LsmLevel::iter() {
-                for (id, sst) in sst_manager.list_level(level) {
+            for (level, _bucket) in LsmLevel::iter() {
+                for (_id, sst) in sst_manager.list_level(level) {
                     if !sst.overlap_with(&range_query_ctx.range_uncompleted().unwrap()) {
                         continue;
                     }
@@ -745,6 +749,12 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> Debug for TreeInner
     }
 }
 
+impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> {
+    fn drop(&mut self) {
+        MASTER_SYNC_ID.store(0, Ordering::Release);
+    }
+}
+
 impl LsmLevel {
     const LEVEL0_RATIO: u16 = 4;
     const LEVELI_RATIO: u16 = 10;
@@ -902,9 +912,9 @@ impl<K: RecordKey<K>, V: RecordValue> MemTableManager<K, V> {
     pub fn switch(&self) {
         let active_idx = self.immut_idx.fetch_xor(1, Ordering::Release);
         // Update sync ID of the active MemTable
-        let _ = self.mem_tables[active_idx as usize]
-            .write()
-            .sync(MASTER_SYNC_ID.load(Ordering::Relaxed));
+        let mut active_mem_table = self.mem_tables[active_idx as usize].write();
+        debug_assert!(active_mem_table.is_empty());
+        let _ = active_mem_table.sync(MASTER_SYNC_ID.load(Ordering::Relaxed));
     }
 
     pub fn active_mem_table(&self) -> &Arc<RwLock<MemTable<K, V>>> {

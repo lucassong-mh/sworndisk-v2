@@ -4,7 +4,6 @@ use crate::prelude::*;
 
 use alloc::collections::BTreeMap;
 use core::fmt::Debug;
-use pod::Pod;
 
 /// MemTable for LSM-Tree.
 ///
@@ -109,6 +108,10 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
 
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
     }
 
     pub fn at_capacity(&self) -> bool {

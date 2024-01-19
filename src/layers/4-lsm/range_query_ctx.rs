@@ -2,10 +2,7 @@
 use super::{RecordKey, RecordValue};
 use crate::prelude::*;
 
-use core::convert::Into;
-use core::hash::Hash;
-use core::ops::{Add, RangeInclusive, Sub};
-use pod::Pod;
+use core::ops::RangeInclusive;
 
 type BitMap = bitvec::prelude::BitVec<u8, bitvec::prelude::Lsb0>; // TODO: Use `BitMap` in os module instead
 

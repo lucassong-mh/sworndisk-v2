@@ -10,9 +10,8 @@ use crate::prelude::*;
 
 use core::marker::PhantomData;
 
-use core::sync::atomic::{AtomicUsize, Ordering};
 // TODO: Use `Thread` in os module
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 
 /// A `Compactor` is currently used for asynchronous compaction
 /// and specific compaction algorithm of `TxLsmTree`.
