@@ -65,7 +65,7 @@ enum QueryAccessor<K> {
     Range(RangeInclusive<K>),
 }
 
-/// Iterator over `RecordBlock`
+/// Iterator over `RecordBlock` for query purpose.
 struct BlockQueryIter<'a, K, V> {
     block: &'a RecordBlock,
     offset: usize,
@@ -80,6 +80,7 @@ struct ScanAccessor<K, V> {
     dropped_records: Vec<(K, V)>,
 }
 
+/// Iterator over `RecordBlock` for scan purpose.
 struct BlockScanIter<'a, K, V> {
     block: &'a RecordBlock,
     offset: usize,
@@ -100,14 +101,19 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
     const INDEX_ENTRY_SIZE: usize = BID_SIZE + 2 * Self::K_SIZE;
     const CACHE_CAP: usize = 1024;
 
+    /// Return the ID of this `SSTable`, which is the same ID
+    /// to the underlying `TxLog`.
     pub fn id(&self) -> TxLogId {
         self.id
     }
 
+    /// Return the sync ID of this `SSTable`, it may be smaller than the
+    /// current master sync ID.
     pub fn sync_id(&self) -> SyncID {
         self.footer.meta.sync_id
     }
 
+    /// The range of keys covered by this `SSTable`.
     pub fn range(&self) -> RangeInclusive<K> {
         RangeInclusive::new(
             self.footer.index[0].first,
@@ -115,10 +121,13 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         )
     }
 
+    /// Whether the target key is within the range, "within the range" doesn't mean
+    /// the `SSTable` do have this key.
     pub fn is_within_range(&self, key: &K) -> bool {
         self.range().contains(key)
     }
 
+    /// Whether the target range is overlapped with the range of this `SSTable`.
     pub fn overlap_with(&self, rhs_range: &RangeInclusive<K>) -> bool {
         let lhs_range = self.range();
         !(lhs_range.end() < rhs_range.start() || lhs_range.start() > rhs_range.end())
@@ -410,7 +419,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         })
     }
 
-    /// Builds a SST from a `TxLog`, load the footer and the index blocks.
+    /// Builds a SST from a `TxLog`, loads the footer and the index blocks.
     ///
     /// # Panics
     ///

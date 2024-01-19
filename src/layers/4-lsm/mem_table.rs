@@ -29,6 +29,8 @@ pub(super) enum ValueEx<V> {
 }
 
 impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
+    /// Create a new `MemTable`, given the capacity, the current sync ID,
+    /// and the callback of dropping record.
     pub fn new(
         cap: usize,
         sync_id: SyncID,
@@ -43,6 +45,7 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
         }
     }
 
+    /// Get the target value given the key.
     pub fn get(&self, key: &K) -> Option<&V> {
         let value_ex = self.table.get(key)?;
         Some(value_ex.get())
@@ -98,26 +101,32 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
         Ok(())
     }
 
+    /// Return the sync ID of this table.
     pub fn sync_id(&self) -> SyncID {
         self.sync_id
     }
 
+    /// Return an iterator over the table.
     pub fn iter(&self) -> impl Iterator<Item = (&K, &ValueEx<V>)> {
         self.table.iter()
     }
 
+    /// Return the number of records in the table.
     pub fn size(&self) -> usize {
         self.size
     }
 
+    /// Return whether the table is empty.
     pub fn is_empty(&self) -> bool {
         self.size == 0
     }
 
+    /// Return whether the table is full.
     pub fn at_capacity(&self) -> bool {
         self.size == self.cap
     }
 
+    /// Clear all records from the table.
     pub fn clear(&mut self) {
         self.table.clear();
         self.size = 0;
@@ -125,6 +134,7 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
 }
 
 impl<V: RecordValue> ValueEx<V> {
+    /// Create a new unsynced value.
     fn new(value: V) -> Self {
         Self::Unsynced(value)
     }
@@ -138,6 +148,7 @@ impl<V: RecordValue> ValueEx<V> {
         }
     }
 
+    /// Put a new value, return the replaced value if any.
     fn put(&mut self, value: V) -> Option<V> {
         let existed = core::mem::take(self);
 
@@ -158,6 +169,7 @@ impl<V: RecordValue> ValueEx<V> {
         dropped
     }
 
+    /// Sync the value, return the replaced value if any.
     fn sync(&mut self) -> Option<V> {
         let existed = core::mem::take(self);
 

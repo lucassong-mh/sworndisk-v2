@@ -24,18 +24,20 @@ pub(super) struct WalAppendTx<D> {
 }
 
 struct WalTxInner<D> {
-    /// Cache ongoing TX and appended WAL
+    /// Cache ongoing TX and appended WAL.
     wal_tx_and_log: Option<(RefCell<Tx>, Arc<TxLog<D>>)>,
-    /// Cache current log ID of WAL for later discard
+    /// Cache current log ID of WAL for later discard.
     log_id: Option<TxLogId>,
-    /// Cache appended WAL and sync record
+    /// Cache appended WAL and sync record.
     record_buf: Vec<u8>,
+    /// Store for WALs.
     tx_log_store: Arc<TxLogStore<D>>,
 }
 
 impl<D: BlockSet + 'static> WalAppendTx<D> {
     const BUF_CAP: usize = 1024 * BLOCK_SIZE;
 
+    /// Prepare a new WAL TX.
     pub fn new(store: &Arc<TxLogStore<D>>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(WalTxInner {

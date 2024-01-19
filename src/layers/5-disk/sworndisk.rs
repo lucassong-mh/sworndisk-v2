@@ -9,19 +9,19 @@
 //! based on internal transactions.
 use super::bio::{BioReq, BioReqQueue, BioResp, BioType};
 use super::block_alloc::{AllocTable, BlockAlloc};
+use super::data_buf::DataBuf;
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
     AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, TxEventListener,
     TxEventListenerFactory, TxLsmTree, TxType,
 };
-use crate::os::{Aead as OsAead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, RwLock};
+use crate::os::{Aead as OsAead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac};
 use crate::prelude::*;
 use crate::tx::Tx;
 use crate::util::Aead;
 
-use alloc::collections::BTreeMap;
-use core::ops::{Add, RangeInclusive, Sub};
+use core::ops::{Add, Sub};
 use core::sync::atomic::{AtomicBool, Ordering};
 use pod::Pod;
 
@@ -649,76 +649,8 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
     }
 }
 
-/// A buffer to cache data blocks before they are written to disk.
-struct DataBuf {
-    buf: RwLock<BTreeMap<RecordKey, Arc<DataBlock>>>,
-}
-
-/// User data block.
-struct DataBlock([u8; BLOCK_SIZE]);
-
-impl DataBuf {
-    pub fn new() -> Self {
-        Self {
-            buf: RwLock::new(BTreeMap::new()),
-        }
-    }
-
-    pub fn get(&self, key: RecordKey, buf: &mut BufMut) -> Option<()> {
-        if let Some(block) = self.buf.read().get(&key) {
-            buf.as_mut_slice().copy_from_slice(block.as_slice());
-            Some(())
-        } else {
-            None
-        }
-    }
-
-    pub fn get_range(&self, range: RangeInclusive<RecordKey>) -> Vec<(RecordKey, Arc<DataBlock>)> {
-        self.buf
-            .read()
-            .range(range)
-            .map(|(k, v)| (*k, v.clone()))
-            .collect()
-    }
-
-    pub fn put(&self, key: RecordKey, buf: BufRef) {
-        let _ = self.buf.write().insert(key, DataBlock::from_buf(buf));
-    }
-
-    pub fn len(&self) -> usize {
-        self.buf.read().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn clear(&self) {
-        self.buf.write().clear();
-    }
-
-    pub fn all_blocks(&self) -> Vec<(RecordKey, Arc<DataBlock>)> {
-        self.buf
-            .read()
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect()
-    }
-}
-
-impl DataBlock {
-    pub fn from_buf(buf: BufRef) -> Arc<Self> {
-        debug_assert_eq!(buf.nblocks(), 1);
-        Arc::new(DataBlock(buf.as_slice().try_into().unwrap()))
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        &self.0
-    }
-}
-
 /// Key-Value record for `TxLsmTree`.
-struct Record {
+pub(super) struct Record {
     key: RecordKey,
     value: RecordValue,
 }
@@ -726,7 +658,7 @@ struct Record {
 /// The key of a `Record`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-struct RecordKey {
+pub(super) struct RecordKey {
     /// Logical block address of user data block.
     pub lba: Lba,
 }
@@ -734,7 +666,7 @@ struct RecordKey {
 /// The value of a `Record`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Debug)]
-struct RecordValue {
+pub(super) struct RecordValue {
     /// Host block address of user data block.
     pub hba: Hba,
     /// Encryption key of the data block.
