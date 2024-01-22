@@ -21,7 +21,7 @@ log = "0.4"
 lru = "0.8.1"
 openssl = "0.10.55"
 postcard = "1.0.0"
-rbtree = "0.1.7"
+rbtree = "0.2.0"
 serde = {version = "1.0", features = ["derive"]}
 spin = "0.9.8"
 static_assertions = "1.1.0"

@@ -34,10 +34,10 @@ pub type SyncID = u64;
 ///
 /// Supports inserting and querying key-value records within transactions.
 /// Supports user-defined callbacks in `MemTable`, during compaction and recovery.
-pub struct TxLsmTree<K, V, D>(Arc<TreeInner<K, V, D>>);
+pub struct TxLsmTree<K: RecordKey<K>, V, D>(Arc<TreeInner<K, V, D>>);
 
 /// Inner structures of `TxLsmTree`.
-pub(super) struct TreeInner<K, V, D> {
+pub(super) struct TreeInner<K: RecordKey<K>, V, D> {
     memtable_manager: MemTableManager<K, V>,
     sst_manager: RwLock<SstManager<K, V>>,
     wal_append_tx: WalAppendTx<D>,
@@ -58,7 +58,7 @@ pub enum LsmLevel {
 }
 
 /// Manager for the active `MemTable` and the immutable `MemTable`.
-struct MemTableManager<K, V> {
+struct MemTableManager<K: RecordKey<K>, V> {
     mem_tables: [Arc<RwLock<MemTable<K, V>>>; 2],
     immut_idx: AtomicU8,
 }
@@ -764,7 +764,7 @@ impl LsmLevel {
     const LEVELI_RATIO: u16 = 10;
 
     const MAX_NUM_LEVELS: usize = 6;
-    const LEVEL_BUCKETS: [(LsmLevel, &str); Self::MAX_NUM_LEVELS] = [
+    const LEVEL_BUCKETS: [(LsmLevel, &'static str); Self::MAX_NUM_LEVELS] = [
         (LsmLevel::L0, LsmLevel::L0.bucket()),
         (LsmLevel::L1, LsmLevel::L1.bucket()),
         (LsmLevel::L2, LsmLevel::L2.bucket()),
@@ -979,8 +979,8 @@ impl<K, V> AsKVex<K, V> for (&K, &ValueEx<V>) {
 }
 
 // SAFETY: `TxLsmTree` is concurrency-safe.
-unsafe impl<K, V, D: BlockSet> Send for TreeInner<K, V, D> {}
-unsafe impl<K, V, D: BlockSet> Sync for TreeInner<K, V, D> {}
+unsafe impl<K: RecordKey<K>, V, D> Send for TreeInner<K, V, D> {}
+unsafe impl<K: RecordKey<K>, V, D> Sync for TreeInner<K, V, D> {}
 
 #[cfg(test)]
 mod tests {

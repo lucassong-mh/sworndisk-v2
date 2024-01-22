@@ -220,6 +220,8 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         Ok(())
     }
 
+    /// Locate the target record block given its position, it
+    /// resides in either the cache or the log.
     fn target_record_block<D: BlockSet + 'static>(
         &self,
         target_pos: BlockId,
@@ -315,6 +317,8 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         })
     }
 
+    /// Builds all the record blocks from the given records. Put the blocks to the log
+    /// and the cache.
     fn build_record_blocks<'a, D: BlockSet + 'static, I, KVex>(
         records_iter: I,
         total_records: usize,
@@ -384,6 +388,8 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         Ok(index_vec)
     }
 
+    /// Builds the footer from the given index entries. The footer block will be appended
+    /// to the SST log's end.
     fn build_footer<'a, D: BlockSet + 'static>(
         index_vec: Vec<IndexEntry<K>>,
         total_records: usize,

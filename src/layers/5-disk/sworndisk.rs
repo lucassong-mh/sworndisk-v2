@@ -108,16 +108,18 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             block_validity_table.clone(),
         ));
 
-        let table = block_validity_table.clone();
-        let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
-            // Deallocate the host block while the corresponding record is dropped in `MemTable`
-            table.set_deallocated(record.value().hba);
+        let logical_block_table = {
+            let table = block_validity_table.clone();
+            let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
+                // Deallocate the host block while the corresponding record is dropped in `MemTable`
+                table.set_deallocated(record.value().hba);
+            };
+            TxLsmTree::format(
+                tx_log_store.clone(),
+                listener_factory,
+                Some(Arc::new(on_drop_record_in_memtable)),
+            )?
         };
-        let logical_block_table = TxLsmTree::format(
-            tx_log_store.clone(),
-            listener_factory,
-            Some(Arc::new(on_drop_record_in_memtable)),
-        )?;
 
         let new_self = Self {
             inner: Arc::new(DiskInner {
@@ -151,16 +153,18 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             block_validity_table.clone(),
         ));
 
-        let table = block_validity_table.clone();
-        let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
-            // Deallocate the host block while the corresponding record is dropped in `MemTable`
-            table.set_deallocated(record.value().hba);
+        let logical_block_table = {
+            let table = block_validity_table.clone();
+            let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
+                // Deallocate the host block while the corresponding record is dropped in `MemTable`
+                table.set_deallocated(record.value().hba);
+            };
+            TxLsmTree::recover(
+                tx_log_store.clone(),
+                listener_factory,
+                Some(Arc::new(on_drop_record_in_memtable)),
+            )?
         };
-        let logical_block_table = TxLsmTree::recover(
-            tx_log_store.clone(),
-            listener_factory,
-            Some(Arc::new(on_drop_record_in_memtable)),
-        )?;
 
         let opened_self = Self {
             inner: Arc::new(DiskInner {
@@ -402,7 +406,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         }
         AmplificationMetrics::acc_data_amount(AmpType::Write, nblocks);
 
-        if self.data_buf.len() < Self::DATA_BUF_CAP {
+        if self.data_buf.nblocks() < Self::DATA_BUF_CAP {
             return Ok(nblocks);
         }
 
@@ -433,7 +437,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     }
 
     fn write_blocks_from_data_buf(&self) -> Result<Vec<(RecordKey, RecordValue)>> {
-        let num_write = self.data_buf.len();
+        let num_write = self.data_buf.nblocks();
         let mut records = Vec::with_capacity(num_write);
         if num_write == 0 {
             return Ok(records);

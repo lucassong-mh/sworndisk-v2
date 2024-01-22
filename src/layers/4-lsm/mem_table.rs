@@ -2,8 +2,7 @@
 use super::{AsKV, RangeQueryCtx, RecordKey, RecordValue, SyncID};
 use crate::prelude::*;
 
-use alloc::collections::BTreeMap;
-use core::fmt::Debug;
+use rbtree::RBTree;
 
 /// MemTable for LSM-Tree.
 ///
@@ -11,8 +10,8 @@ use core::fmt::Debug;
 /// Each `MemTable` is sync-aware (tagged with current sync ID).
 /// Both synced and unsynced records can co-exist.
 /// Also supports user-defined callback when a record is dropped.
-pub(super) struct MemTable<K, V> {
-    table: BTreeMap<K, ValueEx<V>>, // TODO: Try skiplist
+pub(super) struct MemTable<K: RecordKey<K>, V> {
+    table: RBTree<K, ValueEx<V>>,
     size: usize,
     cap: usize,
     sync_id: SyncID,
@@ -37,7 +36,7 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
         on_drop_record: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
     ) -> Self {
         Self {
-            table: BTreeMap::new(),
+            table: RBTree::new(),
             size: 0,
             cap,
             sync_id,
@@ -54,12 +53,12 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
     /// Range query, returns whether the request is completed.
     pub fn get_range(&self, range_query_ctx: &mut RangeQueryCtx<K, V>) -> bool {
         debug_assert!(!range_query_ctx.is_completed());
-        for (k, v_ex) in self
-            .table
-            .range(range_query_ctx.range_uncompleted().unwrap())
-        {
+        let target_range = range_query_ctx.range_uncompleted().unwrap();
+
+        for (k, v_ex) in self.table.iter().filter(|(k, _)| target_range.contains(k)) {
             range_query_ctx.complete(*k, *v_ex.get());
         }
+
         range_query_ctx.is_completed()
     }
 
@@ -89,7 +88,7 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
             return Ok(());
         }
 
-        for (k, v_ex) in &mut self.table {
+        for (k, v_ex) in self.table.iter_mut() {
             if let Some(dropped) = v_ex.sync() {
                 self.on_drop_record
                     .as_ref()
@@ -97,6 +96,7 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
                 self.size -= 1;
             }
         }
+
         self.sync_id = sync_id;
         Ok(())
     }

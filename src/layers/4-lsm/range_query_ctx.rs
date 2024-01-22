@@ -17,6 +17,7 @@ pub struct RangeQueryCtx<K, V> {
 }
 
 impl<K: RecordKey<K>, V: RecordValue> RangeQueryCtx<K, V> {
+    /// Create a new context with the given start key, and the count for query.
     pub fn new(start: K, count: usize) -> Self {
         Self {
             start,
@@ -34,16 +35,20 @@ impl<K: RecordKey<K>, V: RecordValue> RangeQueryCtx<K, V> {
         Some(first_uncompleted..=last_uncompleted)
     }
 
+    /// Whether the uncompleted range contains the target key.
     pub fn contains_uncompleted(&self, key: &K) -> bool {
         let nth = *key - self.start;
         nth < self.count && !self.complete_table[nth]
     }
 
+    /// Whether the range query context is completed, means
+    /// all slots are filled with the corresponding values.
     pub fn is_completed(&self) -> bool {
         self.complete_table.count_zeros() == 0
     }
 
-    /// Complete one slot within the range.
+    /// Complete one slot within the range, with the specific
+    /// key and the queried value.
     pub fn complete(&mut self, key: K, value: V) {
         let nth = key - self.start;
         if self.complete_table[nth] {
@@ -54,11 +59,13 @@ impl<K: RecordKey<K>, V: RecordValue> RangeQueryCtx<K, V> {
         self.complete_table.set(nth, true);
     }
 
+    /// Mark the specific slot as completed.
     pub fn mark_completed(&mut self, key: K) {
         let nth = key - self.start;
         self.complete_table.set(nth, true);
     }
 
+    /// Turn the context into final results.
     pub fn as_results(self) -> Vec<(K, V)> {
         debug_assert!(self.is_completed());
         self.res
