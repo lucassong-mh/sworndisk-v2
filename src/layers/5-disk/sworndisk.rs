@@ -16,10 +16,9 @@ use crate::layers::lsm::{
     AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, TxEventListener,
     TxEventListenerFactory, TxLsmTree, TxType,
 };
-use crate::os::{Aead as OsAead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac};
+use crate::os::{Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac};
 use crate::prelude::*;
 use crate::tx::Tx;
-use crate::util::Aead;
 
 use core::ops::{Add, Sub};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -321,7 +320,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         // Perform disk read and decryption
         let mut cipher = Buf::alloc(1)?;
         self.user_data_disk.read(value.hba, cipher.as_mut())?;
-        OsAead::new().decrypt(
+        Aead::new().decrypt(
             cipher.as_slice(),
             &value.key,
             &Iv::new_zeroed(),
@@ -378,7 +377,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             )?;
 
             for (nth, (key, value)) in record_batch.iter().enumerate() {
-                OsAead::new().decrypt(
+                Aead::new().decrypt(
                     &cipher_slice[nth * BLOCK_SIZE..(nth + 1) * BLOCK_SIZE],
                     &value.key,
                     &Iv::new_zeroed(),
@@ -457,7 +456,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             for (i, &hba) in hba_batch.iter().enumerate() {
                 let (lba, data_block) = &data_blocks[nth];
                 let key = Key::random();
-                let mac = OsAead::new().encrypt(
+                let mac = Aead::new().encrypt(
                     data_block.as_slice(),
                     &key,
                     &Iv::new_zeroed(),
