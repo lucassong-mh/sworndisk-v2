@@ -446,6 +446,7 @@ impl<L: BlockLog> Mht<L> {
     }
 
     pub fn display(&self) {
+        #[cfg(feature = "std")]
         println!("{:?}", MhtDisplayer(self));
     }
 }
