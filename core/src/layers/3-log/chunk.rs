@@ -40,6 +40,7 @@ use crate::layers::edit::Edit;
 use crate::os::{HashMap, Mutex};
 use crate::prelude::*;
 use crate::tx::{CurrentTx, Tx, TxData, TxProvider};
+use crate::util::BitMap;
 
 use core::fmt::{self, Debug};
 use serde::{Deserialize, Serialize};
@@ -196,9 +197,6 @@ impl Debug for ChunkAlloc {
 // Persistent State
 ////////////////////////////////////////////////////////////////////////////////
 
-// TODO: Use crate 'bittle'
-type BitMap = bitvec::prelude::BitVec<u8, bitvec::prelude::Lsb0>;
-
 /// The persistent state of a chunk allocator.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChunkAllocState {
@@ -231,10 +229,10 @@ impl ChunkAllocState {
             return None;
         }
 
-        let free_chunk_id = self.alloc_map[min_free..]
-            .first_zero()
-            .expect("there must exists a zero")
-            + min_free;
+        let free_chunk_id = self
+            .alloc_map
+            .first_zero(min_free)
+            .expect("there must exists a zero");
         self.alloc_map.set(free_chunk_id, true);
         self.free_count -= 1;
 

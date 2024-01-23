@@ -1,10 +1,9 @@
 // Context for range query.
 use super::{RecordKey, RecordValue};
 use crate::prelude::*;
+use crate::util::BitMap;
 
 use core::ops::RangeInclusive;
-
-type BitMap = bitvec::prelude::BitVec<u8, bitvec::prelude::Lsb0>; // TODO: Use `BitMap` in os module instead
 
 /// Context for a range query request.
 /// It tracks the completing process of each slot within the range.
@@ -13,6 +12,7 @@ pub struct RangeQueryCtx<K, V> {
     start: K,
     count: usize,
     complete_table: BitMap,
+    min_completed: usize,
     res: Vec<(K, V)>,
 }
 
@@ -23,6 +23,7 @@ impl<K: RecordKey<K>, V: RecordValue> RangeQueryCtx<K, V> {
             start,
             count,
             complete_table: BitMap::repeat(false, count),
+            min_completed: 0,
             res: Vec::with_capacity(count),
         }
     }
@@ -30,7 +31,7 @@ impl<K: RecordKey<K>, V: RecordValue> RangeQueryCtx<K, V> {
     /// Gets the uncompleted range within the whole, returns `None`
     /// if all slots are already completed.
     pub fn range_uncompleted(&self) -> Option<RangeInclusive<K>> {
-        let first_uncompleted = self.start + self.complete_table.first_zero()?;
+        let first_uncompleted = self.start + self.complete_table.first_zero(self.min_completed)?;
         let last_uncompleted = self.start + self.complete_table.last_zero()?;
         Some(first_uncompleted..=last_uncompleted)
     }
@@ -57,12 +58,14 @@ impl<K: RecordKey<K>, V: RecordValue> RangeQueryCtx<K, V> {
 
         self.res.push((key, value));
         self.complete_table.set(nth, true);
+        self.min_completed = self.min_completed.min(nth);
     }
 
     /// Mark the specific slot as completed.
     pub fn mark_completed(&mut self, key: K) {
         let nth = key - self.start;
         self.complete_table.set(nth, true);
+        self.min_completed = self.min_completed.min(nth);
     }
 
     /// Turn the context into final results.

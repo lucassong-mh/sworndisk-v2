@@ -4,13 +4,12 @@ use crate::layers::bio::{BlockSet, Buf, BufRef, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogStore};
 use crate::os::Mutex;
 use crate::prelude::*;
+use crate::util::BitMap;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use pod::Pod;
 use serde::{Deserialize, Serialize};
-
-type BitMap = bitvec::prelude::BitVec<u8, bitvec::prelude::Lsb0>;
 
 const BUCKET_BLOCK_VALIDITY_TABLE: &str = "BVT";
 const BUCKET_BLOCK_ALLOC_LOG: &str = "BAL";
@@ -55,10 +54,10 @@ impl AllocTable {
         let mut bitmap = self.bitmap.lock();
         let next_avail = self.next_avail.load(Ordering::Relaxed);
 
-        let hba = if let Some(hba) = bitmap[next_avail..].first_one() {
-            hba + next_avail
+        let hba = if let Some(hba) = bitmap.first_one(next_avail) {
+            hba
         } else {
-            bitmap.first_one()?
+            bitmap.first_one(0)?
         };
         bitmap.set(hba, false);
 
@@ -69,23 +68,19 @@ impl AllocTable {
     /// Allocate multiple free slots for a bunch of new blocks, returns `None`
     /// if there are no free slots for all.
     pub fn alloc_batch(&self, count: usize) -> Option<Vec<Hba>> {
+        debug_assert!(count > 0);
         let mut bitmap = self.bitmap.lock();
-        let mut hbas = Vec::with_capacity(count);
         let mut next_avail = self.next_avail.load(Ordering::Relaxed);
 
-        for _ in 0..count {
-            let hba = if let Some(hba) = bitmap[next_avail..].first_one() {
-                hba + next_avail
-            } else {
-                next_avail = bitmap.first_one()?;
-                next_avail
-            };
-            hbas.push(hba);
-            bitmap.set(hba, false);
+        let hbas = if let Some(hbas) = bitmap.first_ones(next_avail, count) {
+            hbas
+        } else {
+            next_avail = bitmap.first_one(0)?;
+            bitmap.first_ones(next_avail, count)?
+        };
+        hbas.iter().for_each(|hba| bitmap.set(*hba, false));
 
-            next_avail += 1;
-        }
-
+        next_avail = hbas.last().unwrap() + 1;
         self.next_avail.store(next_avail, Ordering::Release);
         Some(hbas)
     }
@@ -121,7 +116,7 @@ impl AllocTable {
             if let Err(e) = &bal_log_ids_res
                 && e.errno() == NotFound
             {
-                let next_avail = bitmap.first_one().unwrap_or(0);
+                let next_avail = bitmap.first_one(0).unwrap_or(0);
                 return Ok(Self {
                     bitmap: Mutex::new(bitmap),
                     next_avail: AtomicUsize::new(next_avail),
@@ -159,7 +154,7 @@ impl AllocTable {
                     }
                 }
             }
-            let next_avail = bitmap.first_one().unwrap_or(0);
+            let next_avail = bitmap.first_one(0).unwrap_or(0);
 
             Ok(Self {
                 bitmap: Mutex::new(bitmap),
@@ -181,7 +176,7 @@ impl AllocTable {
         let bitmap = self.bitmap.lock();
         const BITMAP_MAX_SIZE: usize = 512 * BLOCK_SIZE; // TBD
         let mut ser_buf = vec![0; BITMAP_MAX_SIZE];
-        let ser_len = postcard::to_slice::<BitMap>(bitmap.as_ref(), &mut ser_buf)
+        let ser_len = postcard::to_slice::<BitMap>(&bitmap, &mut ser_buf)
             .map_err(|_| Error::with_msg(InvalidArgs, "serialize block validity table failed"))?
             .len();
         ser_buf.resize(align_up(ser_len, BLOCK_SIZE), 0);
