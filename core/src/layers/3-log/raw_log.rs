@@ -85,16 +85,14 @@
 use super::chunk::{ChunkAlloc, ChunkId, CHUNK_NBLOCKS};
 use crate::layers::bio::{BlockLog, BlockSet, BufMut, BufRef};
 use crate::layers::edit::Edit;
-use crate::os::{Mutex, MutexGuard};
+use crate::os::{HashMap, HashSet, Mutex, MutexGuard};
 use crate::prelude::*;
 use crate::tx::{CurrentTx, Tx, TxData, TxProvider};
 use crate::util::LazyDelete;
 
-use alloc::sync::Weak;
 use core::fmt::{self, Debug};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 
 pub type RawLogId = u64;
 
@@ -135,7 +133,7 @@ impl<D: BlockSet> RawLogStore<D> {
                 disk,
                 chunk_alloc,
                 tx_provider,
-                weak_self: weak_self.clone(),
+                weak_self: weak_self.clone().into(),
             })
         };
 

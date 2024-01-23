@@ -65,10 +65,12 @@ use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::crypto::{CryptoLog, NodeCache, RootMhtMeta};
 use crate::layers::edit::{CompactPolicy, Edit, EditJournal, EditJournalMeta};
 use crate::layers::log::chunk::CHUNK_NBLOCKS;
-use crate::os::{AeadKey as Key, Mutex, RwLock, Skcipher, SkcipherIv, SkcipherKey};
+use crate::os::{
+    AeadKey as Key, HashMap, HashSet, Mutex, RwLock, Skcipher, SkcipherIv, SkcipherKey,
+};
 use crate::prelude::*;
 use crate::tx::{CurrentTx, Tx, TxData, TxId, TxProvider};
-use crate::util::{LazyDelete, RandomInit};
+use crate::util::LazyDelete;
 
 use core::any::Any;
 use core::fmt::{self, Debug};
@@ -76,7 +78,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use lru::LruCache;
 use pod::Pod;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 
 pub type TxLogId = RawLogId;
 type BucketName = String;

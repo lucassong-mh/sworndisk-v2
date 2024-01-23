@@ -116,8 +116,7 @@ fn run_benches(benches: Vec<Box<dyn Bench>>) {
             println!("failed due to error {:?}", e);
             continue;
         }
-        let end = Instant::now();
-        let elapsed = end - start;
+        let elapsed = start.elapsed();
 
         let throughput = DisplayThroughput::new(b.total_bytes(), elapsed);
         println!("{}", throughput);

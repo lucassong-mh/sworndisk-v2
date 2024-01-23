@@ -37,13 +37,12 @@
 //! then the transaction can be aborted and all changes made to `chuck_alloc`
 //! during the transaction will be rolled back automatically.
 use crate::layers::edit::Edit;
-use crate::os::Mutex;
+use crate::os::{HashMap, Mutex};
 use crate::prelude::*;
 use crate::tx::{CurrentTx, Tx, TxData, TxProvider};
 
 use core::fmt::{self, Debug};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// The ID of a chunk.
 pub type ChunkId = usize;

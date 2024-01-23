@@ -1025,8 +1025,6 @@ mod tests {
 
     #[test]
     fn tx_lsm_tree_fns() -> Result<()> {
-        env_logger::init();
-
         let nblocks = 16 * 1024;
         let mem_disk = MemDisk::create(nblocks)?;
         let tx_log_store = Arc::new(TxLogStore::format(mem_disk, Key::random())?);

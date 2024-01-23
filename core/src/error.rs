@@ -25,6 +25,8 @@ pub enum Errno {
     DecryptFailed,
     /// Not aligned to `BLOCK_SIZE`.
     NotBlockSizeAligned,
+    /// Try lock failed.
+    TryLockFailed,
 }
 
 /// The error with an error type and an error message used in this crate.
