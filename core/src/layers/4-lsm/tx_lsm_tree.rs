@@ -111,11 +111,11 @@ pub enum TxType {
 
 /// A trait that represents the key for a record in a `TxLsmTree`.
 pub trait RecordKey<K>:
-    Ord + Pod + Hash + Add<usize, Output = K> + Sub<K, Output = usize> + Debug + 'static
+    Ord + Pod + Hash + Add<usize, Output = K> + Sub<K, Output = usize> + Debug + Send + Sync + 'static
 {
 }
 /// A trait that represents the value for a record in a `TxLsmTree`.
-pub trait RecordValue: Pod + Debug + 'static {}
+pub trait RecordValue: Pod + Debug + Send + Sync + 'static {}
 
 /// Represent any type that includes a key and a value.
 pub trait AsKV<K, V> {

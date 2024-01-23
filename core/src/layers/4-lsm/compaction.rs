@@ -44,6 +44,10 @@ impl<K: RecordKey<K>, V: RecordValue> Compactor<K, V> {
     }
 
     /// Core function for compacting overlapped records and building new SSTs.
+    ///
+    /// # Panics
+    ///
+    /// This method must be called within a TX. Otherwise, this method panics.
     // TODO: Need continuously optimization
     pub fn compact_records_and_build_ssts<D: BlockSet + 'static>(
         upper_records: impl Iterator<Item = (K, ValueEx<V>)>,
@@ -86,19 +90,14 @@ impl<K: RecordKey<K>, V: RecordValue> Compactor<K, V> {
                     (None, None) => None,
                 }
             });
-            // TODO: Try not to collect
-            // let mut records_iter = records_iter.peekable();
-            // if records_iter.peek().is_none() {
-            //     break;
-            // }
-
-            let records_vec: Vec<_> = records_iter.collect();
-            if records_vec.is_empty() {
+            let mut records_iter = records_iter.peekable();
+            if records_iter.peek().is_none() {
                 break;
             }
 
             let new_log = tx_log_store.create_log(to_level.bucket())?;
-            let new_sst = SSTable::build(records_vec.into_iter(), sync_id, &new_log)?;
+            let new_sst = SSTable::build(records_iter, sync_id, &new_log)?;
+
             created_ssts.push(new_sst);
         }
 

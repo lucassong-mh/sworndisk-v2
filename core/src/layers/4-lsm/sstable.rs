@@ -302,11 +302,9 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         KVex: AsKVex<K, V>,
         Self: 'a,
     {
-        let total_records = records_iter.size_hint().0;
-        debug_assert!(total_records > 0);
-
         let mut cache = LruCache::new(NonZeroUsize::new(Self::CACHE_CAP).unwrap());
-        let index_vec = Self::build_record_blocks(records_iter, total_records, tx_log, &mut cache)?;
+        let (total_records, index_vec) =
+            Self::build_record_blocks(records_iter, tx_log, &mut cache)?;
         let footer = Self::build_footer::<D>(index_vec, total_records, sync_id, tx_log)?;
 
         Ok(Self {
@@ -321,71 +319,97 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
     /// and the cache.
     fn build_record_blocks<'a, D: BlockSet + 'static, I, KVex>(
         records_iter: I,
-        total_records: usize,
         tx_log: &'a TxLog<D>,
         cache: &mut LruCache<BlockId, Arc<RecordBlock>>,
-    ) -> Result<Vec<IndexEntry<K>>>
+    ) -> Result<(usize, Vec<IndexEntry<K>>)>
     where
         I: Iterator<Item = KVex>,
         KVex: AsKVex<K, V>,
         Self: 'a,
     {
-        let mut index_vec =
-            Vec::with_capacity(total_records / (BLOCK_SIZE / Self::MAX_RECORD_SIZE));
+        let mut index_vec = Vec::new();
+        let mut total_records = 0;
         let mut pos = 0 as BlockId;
-        let mut first_k = None;
+        let (mut first_k, mut curr_k) = (None, None);
         let mut inner_offset = 0;
 
-        let mut append_buf = Vec::with_capacity(BLOCK_SIZE);
+        let mut block_buf = Vec::with_capacity(BLOCK_SIZE);
         for (nth, kv_ex) in records_iter.enumerate() {
-            let (key, value_ex) = (kv_ex.key(), kv_ex.value_ex());
-            if inner_offset == 0 {
-                debug_assert!(append_buf.is_empty());
-                let _ = first_k.insert(*key);
-            }
+            let (key, value_ex) = (*kv_ex.key(), kv_ex.value_ex());
+            total_records += 1;
 
-            append_buf.extend_from_slice(key.as_bytes());
+            if inner_offset == 0 {
+                debug_assert!(block_buf.is_empty());
+                let _ = first_k.insert(key);
+            }
+            let _ = curr_k.insert(key);
+
+            block_buf.extend_from_slice(key.as_bytes());
             inner_offset += Self::K_SIZE;
+
             match value_ex {
                 ValueEx::Synced(v) => {
-                    append_buf.push(RecordFlag::Synced as u8);
-                    append_buf.extend_from_slice(v.as_bytes());
+                    block_buf.push(RecordFlag::Synced as u8);
+                    block_buf.extend_from_slice(v.as_bytes());
                     inner_offset += 1 + Self::V_SIZE;
                 }
                 ValueEx::Unsynced(v) => {
-                    append_buf.push(RecordFlag::Unsynced as u8);
-                    append_buf.extend_from_slice(v.as_bytes());
+                    block_buf.push(RecordFlag::Unsynced as u8);
+                    block_buf.extend_from_slice(v.as_bytes());
                     inner_offset += 1 + Self::V_SIZE;
                 }
                 ValueEx::SyncedAndUnsynced(sv, usv) => {
-                    append_buf.push(RecordFlag::SyncedAndUnsynced as u8);
-                    append_buf.extend_from_slice(sv.as_bytes());
-                    append_buf.extend_from_slice(usv.as_bytes());
+                    block_buf.push(RecordFlag::SyncedAndUnsynced as u8);
+                    block_buf.extend_from_slice(sv.as_bytes());
+                    block_buf.extend_from_slice(usv.as_bytes());
                     inner_offset += Self::MAX_RECORD_SIZE;
                 }
             }
 
-            if BLOCK_SIZE - inner_offset >= Self::MAX_RECORD_SIZE && nth != total_records - 1 {
+            let cap_remained = BLOCK_SIZE - inner_offset;
+            if cap_remained >= Self::MAX_RECORD_SIZE {
                 continue;
             }
 
-            append_buf.resize(BLOCK_SIZE, 0);
-            index_vec.push(IndexEntry {
+            let index_entry = IndexEntry {
                 pos,
                 first: first_k.unwrap(),
-                last: *key,
-            });
-
-            let record_block = RecordBlock::from_buf(append_buf.clone());
-            tx_log.append(BufRef::try_from(&record_block.buf[..]).unwrap())?;
-            cache.put(pos, Arc::new(record_block));
+                last: key,
+            };
+            build_one_record_block(&index_entry, &mut block_buf, tx_log, cache)?;
+            index_vec.push(index_entry);
 
             pos += 1;
             inner_offset = 0;
-            append_buf.clear();
+            block_buf.clear();
+        }
+        debug_assert!(total_records > 0);
+
+        if !block_buf.is_empty() {
+            let last_entry = IndexEntry {
+                pos,
+                first: first_k.unwrap(),
+                last: curr_k.unwrap(),
+            };
+            build_one_record_block(&last_entry, &mut block_buf, tx_log, cache)?;
+            index_vec.push(last_entry);
         }
 
-        Ok(index_vec)
+        fn build_one_record_block<K: RecordKey<K>, D: BlockSet + 'static>(
+            entry: &IndexEntry<K>,
+            buf: &mut Vec<u8>,
+            tx_log: &TxLog<D>,
+            cache: &mut LruCache<BlockId, Arc<RecordBlock>>,
+        ) -> Result<()> {
+            buf.resize(BLOCK_SIZE, 0);
+            let record_block = RecordBlock::from_buf(buf.clone());
+
+            tx_log.append(BufRef::try_from(record_block.as_slice()).unwrap())?;
+            cache.put(entry.pos, Arc::new(record_block));
+            Ok(())
+        }
+
+        Ok((total_records, index_vec))
     }
 
     /// Builds the footer from the given index entries. The footer block will be appended
@@ -479,6 +503,10 @@ impl RecordBlock {
     pub fn from_buf(buf: Vec<u8>) -> Self {
         debug_assert_eq!(buf.len(), BLOCK_SIZE);
         Self { buf }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf
     }
 }
 
