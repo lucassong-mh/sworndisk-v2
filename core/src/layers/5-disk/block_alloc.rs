@@ -269,11 +269,8 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
             return Ok(());
         }
 
-        let diff_log = if let Ok(log) = self.store.open_log_in(BUCKET_BLOCK_ALLOC_LOG, true) {
-            log
-        } else {
-            self.store.create_log(BUCKET_BLOCK_ALLOC_LOG)?
-        };
+        // TODO: Put this into prepare phase
+        let diff_log = self.store.create_log(BUCKET_BLOCK_ALLOC_LOG)?;
 
         let mut diff_buf = Vec::with_capacity(BLOCK_SIZE);
         for (block_id, block_diff) in diff_table.iter() {

@@ -63,7 +63,8 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
             record_buf.extend_from_slice(record.value().as_bytes());
         }
 
-        if inner.record_buf.len() < Self::BUF_CAP {
+        const MAX_RECORD_SIZE: usize = 49;
+        if inner.record_buf.len() <= Self::BUF_CAP - MAX_RECORD_SIZE {
             return Ok(());
         }
 
@@ -158,14 +159,20 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
 
         let k_size = size_of::<K>();
         let v_size = size_of::<V>();
+        let total_bytes = nblocks * BLOCK_SIZE;
         let mut offset = 0;
         let (mut max_sync_id, mut synced_len) = (None, 0);
         loop {
-            let flag = WalAppendFlag::try_from(buf_slice[offset]);
-            if flag.is_err() || offset >= nblocks * BLOCK_SIZE - 1 {
+            const MIN_RECORD_SIZE: usize = 9;
+            if offset > total_bytes - MIN_RECORD_SIZE {
                 break;
             }
+
+            let flag = WalAppendFlag::try_from(buf_slice[offset]);
             offset += 1;
+            if flag.is_err() {
+                continue;
+            }
 
             match flag.unwrap() {
                 WalAppendFlag::Record => {
@@ -176,6 +183,7 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
                         offset += k_size + v_size;
                         (k, v)
                     };
+
                     records.push(record);
                 }
                 WalAppendFlag::Sync => {
@@ -184,9 +192,10 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
                             .try_into()
                             .unwrap(),
                     );
+                    offset += size_of::<SyncID>();
+
                     let _ = max_sync_id.insert(sync_id);
                     synced_len = records.len();
-                    offset += size_of::<SyncID>();
                 }
             }
         }

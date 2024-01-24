@@ -503,6 +503,9 @@ impl<'a, D: BlockSet> RawLogRef<'a, D> {
             nblocks -= num_read;
             buf_slice = &mut buf_slice[num_read * BLOCK_SIZE..];
         }
+        if nblocks == 0 {
+            return Ok(());
+        }
 
         // Read from the tail if possible and necessary
         let tail_opt = &self.log_tail;
@@ -525,22 +528,30 @@ impl<'a, D: BlockSet> RawLogRef<'a, D> {
             .expect("raw log must be opened in append mode");
 
         // Allocate new chunks if necessary
-        let new_chunks = {
+        let new_chunks_opt = {
             let chunks_needed = log_tail.calc_needed_chunks(append_nblocks);
-            let mut chunk_ids = Vec::with_capacity(chunks_needed);
-            for _ in 0..chunks_needed {
-                let new_chunk_id = self
-                    .log_store
-                    .chunk_alloc
-                    .alloc()
-                    .ok_or(Error::with_msg(OutOfMemory, "chunk allocation failed"))?;
-                chunk_ids.push(new_chunk_id);
+            if chunks_needed > 0 {
+                // TODO: Support batch allocation
+                let mut chunk_ids = Vec::with_capacity(chunks_needed);
+                for _ in 0..chunks_needed {
+                    let new_chunk_id = self
+                        .log_store
+                        .chunk_alloc
+                        .alloc()
+                        .ok_or(Error::with_msg(OutOfMemory, "chunk allocation failed"))?;
+                    chunk_ids.push(new_chunk_id);
+                }
+                Some(chunk_ids)
+            } else {
+                None
             }
-            chunk_ids
         };
-        log_tail.tail_mut_with(|tail: &mut RawLogTail| {
-            tail.chunks.extend(new_chunks);
-        });
+
+        if let Some(new_chunks) = new_chunks_opt {
+            log_tail.tail_mut_with(|tail: &mut RawLogTail| {
+                tail.chunks.extend(new_chunks);
+            });
+        }
 
         log_tail.append(buf, &self.log_store.disk)?;
 
@@ -591,20 +602,18 @@ impl<'a> RawLogHeadRef<'a> {
     }
 
     /// Collect and prepare a set of blocks in head for read
-    pub fn prepare_blocks(&self, offset: BlockId, nblocks: usize) -> Vec<BlockId> {
-        let chunks = &self.entry.head.chunks;
+    pub fn prepare_blocks(&self, mut offset: BlockId, nblocks: usize) -> Vec<BlockId> {
         let mut res_blocks = Vec::with_capacity(nblocks);
+        let chunks = &self.entry.head.chunks;
 
-        let mut curr_chunk_idx = offset / CHUNK_NBLOCKS;
-        let mut curr_chunk_inner_offset = offset % CHUNK_NBLOCKS;
         while res_blocks.len() != nblocks {
+            let mut curr_chunk_idx = offset / CHUNK_NBLOCKS;
+            let mut curr_chunk_inner_offset = offset % CHUNK_NBLOCKS;
+
             res_blocks.push(chunks[curr_chunk_idx] * CHUNK_NBLOCKS + curr_chunk_inner_offset);
-            curr_chunk_inner_offset += 1;
-            if curr_chunk_inner_offset == CHUNK_NBLOCKS {
-                curr_chunk_inner_offset = 0;
-                curr_chunk_idx += 1;
-            }
+            offset += 1;
         }
+
         res_blocks
     }
 }
@@ -701,45 +710,38 @@ impl<'a> RawLogTailRef<'a> {
     }
 
     /// Collect and prepare a set of blocks in tail for read/append
-    fn prepare_blocks(&self, offset: BlockId, nblocks: usize) -> Vec<BlockId> {
+    fn prepare_blocks(&self, mut offset: BlockId, nblocks: usize) -> Vec<BlockId> {
         self.tail_with(|tail: &RawLogTail| {
             let mut res_blocks = Vec::with_capacity(nblocks);
-            let mut step = 0;
-            if offset < tail.head_last_chunk_free_blocks as _ {
-                for i in 0..tail.head_last_chunk_free_blocks {
-                    // Collect available blocks from the last chunk of the head first if necessary
+            let head_last_chunk_free_blocks = tail.head_last_chunk_free_blocks as usize;
+
+            // Collect available blocks from the last chunk of the head first if necessary
+            if offset < head_last_chunk_free_blocks as _ {
+                for i in offset..head_last_chunk_free_blocks {
+                    let avail_chunk = tail.head_last_chunk_id * CHUNK_NBLOCKS
+                        + (CHUNK_NBLOCKS - head_last_chunk_free_blocks as usize + i as usize);
+                    res_blocks.push(avail_chunk);
+
                     if res_blocks.len() == nblocks {
-                        debug_assert_eq!(step, offset + nblocks);
                         return res_blocks;
                     }
-                    if step >= offset && step - offset < tail.head_last_chunk_free_blocks as _ {
-                        let avail_chunk = tail.head_last_chunk_id * CHUNK_NBLOCKS
-                            + (CHUNK_NBLOCKS - tail.head_last_chunk_free_blocks as usize
-                                + i as usize);
-                        res_blocks.push(avail_chunk);
-                    }
-                    step += 1;
                 }
+
+                offset = 0;
+            } else {
+                offset -= head_last_chunk_free_blocks;
             }
 
             // Collect available blocks from the tail first if necessary
-            let mut curr_chunk_idx = 0;
-            let mut curr_chunk_inner_offset = 0;
             let chunks = &tail.chunks;
             while res_blocks.len() != nblocks {
-                if step >= offset {
-                    res_blocks
-                        .push(chunks[curr_chunk_idx] * CHUNK_NBLOCKS + curr_chunk_inner_offset);
-                }
-                step += 1;
-                curr_chunk_inner_offset += 1;
-                if curr_chunk_inner_offset == CHUNK_NBLOCKS {
-                    curr_chunk_inner_offset = 0;
-                    curr_chunk_idx += 1;
-                }
+                let curr_chunk_idx = offset / CHUNK_NBLOCKS;
+                let curr_chunk_inner_offset = offset % CHUNK_NBLOCKS;
+
+                res_blocks.push(chunks[curr_chunk_idx] * CHUNK_NBLOCKS + curr_chunk_inner_offset);
+                offset += 1;
             }
 
-            debug_assert_eq!(step, offset + nblocks);
             res_blocks
         })
     }
@@ -1122,13 +1124,10 @@ mod tests {
         let res: Result<_> = tx.context(|| {
             let log = raw_log_store.open_log(log_id, true)?;
 
-            let mut buf = Buf::alloc(CHUNK_NBLOCKS)?;
-            log.read(1, buf.as_mut())?;
+            let mut buf = Buf::alloc(4)?;
+            log.read(1 as BlockId, buf.as_mut())?;
             assert_eq!(&buf.as_slice()[..3 * BLOCK_SIZE], &[2u8; 3 * BLOCK_SIZE]);
-            assert_eq!(
-                &buf.as_slice()[3 * BLOCK_SIZE..CHUNK_SIZE],
-                &[5u8; 1021 * BLOCK_SIZE]
-            );
+            assert_eq!(&buf.as_slice()[3 * BLOCK_SIZE..], &[5u8; BLOCK_SIZE]);
 
             Ok(())
         });

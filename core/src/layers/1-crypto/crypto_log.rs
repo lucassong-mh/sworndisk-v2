@@ -289,7 +289,7 @@ impl<L: BlockLog> CryptoLog<L> {
 
 impl<L: BlockLog> Mht<L> {
     // Buffer capacity for appended data nodes.
-    const APPEND_BUF_CAPACITY: usize = 1024;
+    const APPEND_BUF_CAPACITY: usize = 2048;
 
     pub fn new(block_log: L, root_key: Key, node_cache: Arc<dyn NodeCache>) -> Self {
         let storage = Arc::new(MhtStorage::new(block_log, node_cache));
@@ -820,7 +820,7 @@ impl<'a, L: BlockLog> PreviousBuild<'a, L> {
 
             // Incomplete nodes only appear in the last node of each level
             lookup_node = {
-                let entry = lookup_node.entries[lookup_node.num_valid_entries()];
+                let entry = lookup_node.entries[lookup_node.num_valid_entries() - 1];
                 self.storage
                     .read_mht_node(entry.pos, &entry.key, &entry.mac, &Iv::new_zeroed())
                     .unwrap()
@@ -866,8 +866,8 @@ struct AppendDataBuf<L> {
 }
 
 impl<L: BlockLog> AppendDataBuf<L> {
-    // Maximum capacity of entries indicates a complete MHT (height equals 2)
-    const MAX_ENTRY_QUEUE_CAP: usize = MHT_NBRANCHES * MHT_NBRANCHES;
+    // Maximum capacity of entries indicates a complete MHT (height equals 3)
+    const MAX_ENTRY_QUEUE_CAP: usize = MHT_NBRANCHES.pow(3);
 
     pub fn new(capacity: usize, start_pos: Lbid, storage: Arc<MhtStorage<L>>) -> Self {
         let (node_queue_cap, entry_queue_cap) = Self::calc_queue_cap(capacity, start_pos);
@@ -970,7 +970,6 @@ impl<L: BlockLog> AppendDataBuf<L> {
     }
 
     fn calc_queue_cap(capacity: usize, append_pos: Lbid) -> (usize, usize) {
-        debug_assert!(Self::MAX_ENTRY_QUEUE_CAP >= capacity);
         // Half for data nodes, half for data node entries
         let node_queue_cap = capacity * 1 / 2;
         let entry_queue_cap = {

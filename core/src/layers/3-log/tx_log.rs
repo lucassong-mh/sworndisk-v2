@@ -568,6 +568,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     /// # Panics
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
+    // TODO: Remove `can_append` like original implementation
     pub fn open_log_in(&self, bucket: &str, can_append: bool) -> Result<Arc<TxLog<D>>> {
         let log_ids = self.list_logs_in(bucket)?;
         let max_log_id = log_ids

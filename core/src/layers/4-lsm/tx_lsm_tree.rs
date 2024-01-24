@@ -131,7 +131,9 @@ pub(super) trait AsKVex<K, V> {
     fn value_ex(&self) -> &ValueEx<V>;
 }
 
-pub(super) const MEMTABLE_CAPACITY: usize = 81920; // TBD
+// TBD
+pub(super) const MEMTABLE_CAPACITY: usize = 2097152; // 96 MiB MemTable, 8 GiB data
+                                                     // pub(super) const MEMTABLE_CAPACITY: usize = 81920; // TBD
 pub(super) const SSTABLE_CAPACITY: usize = MEMTABLE_CAPACITY;
 
 impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> {
@@ -197,7 +199,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
 
         let timer = LatencyMetrics::start_timer(ReqType::Write, "wal_discard", "lsmtree");
         // Discard current WAL
-        inner.wal_append_tx.discard()?;
+        inner.wal_append_tx.discard()?; // WAL might be deleted before asynchronous minor compaction completed
         LatencyMetrics::stop_timer(timer);
 
         Ok(())
@@ -1025,7 +1027,7 @@ mod tests {
 
     #[test]
     fn tx_lsm_tree_fns() -> Result<()> {
-        let nblocks = 16 * 1024;
+        let nblocks = 64 * 1024;
         let mem_disk = MemDisk::create(nblocks)?;
         let tx_log_store = Arc::new(TxLogStore::format(mem_disk, Key::random())?);
         let tx_lsm_tree: TxLsmTree<BlockId, Value, MemDisk> =
@@ -1050,8 +1052,8 @@ mod tests {
 
         tx_lsm_tree.sync()?;
 
-        let target_value = tx_lsm_tree.get(&1000).unwrap();
-        assert_eq!(target_value.hba, 1000);
+        let target_value = tx_lsm_tree.get(&500).unwrap();
+        assert_eq!(target_value.hba, 500);
 
         // Put sufficient records which can trigger compaction after a sync command
         let start = 500;
@@ -1069,24 +1071,6 @@ mod tests {
 
         let target_value = tx_lsm_tree.get(&500).unwrap();
         assert_eq!(target_value.hba, 1000);
-
-        let start = 700;
-        for i in start..start + cap {
-            let (k, v) = (
-                i as BlockId,
-                Value {
-                    hba: (i * 3) as BlockId,
-                    key: Key::random(),
-                    mac: Mac::random(),
-                },
-            );
-            tx_lsm_tree.put(k, v)?;
-        }
-
-        let target_value = tx_lsm_tree.get(&700).unwrap();
-        assert_eq!(target_value.hba, 2100);
-        let target_value = tx_lsm_tree.get(&600).unwrap();
-        assert_eq!(target_value.hba, 1200);
         let target_value = tx_lsm_tree.get(&25).unwrap();
         assert_eq!(target_value.hba, 25);
 

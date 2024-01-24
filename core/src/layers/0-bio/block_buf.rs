@@ -95,9 +95,16 @@ impl<'a> TryFrom<&'a [u8]> for BufRef<'a> {
     type Error = crate::error::Error;
 
     fn try_from(buf: &'a [u8]) -> Result<Self> {
-        if buf.len() % BLOCK_SIZE != 0 {
-            return_errno!(Errno::NotBlockSizeAligned);
+        if buf.is_empty() {
+            return_errno_with_msg!(InvalidArgs, "empty buf in `BufRef::try_from`");
         }
+        if buf.len() % BLOCK_SIZE != 0 {
+            return_errno_with_msg!(
+                NotBlockSizeAligned,
+                "buf not block size aligned `BufRef::try_from`"
+            );
+        }
+
         let new_self = Self(buf);
         Ok(new_self)
     }
@@ -143,9 +150,16 @@ impl<'a> TryFrom<&'a mut [u8]> for BufMut<'a> {
     type Error = crate::error::Error;
 
     fn try_from(buf: &'a mut [u8]) -> Result<Self> {
-        if buf.len() % BLOCK_SIZE != 0 {
-            return_errno!(Errno::NotBlockSizeAligned);
+        if buf.is_empty() {
+            return_errno_with_msg!(InvalidArgs, "empty buf in `BufMut::try_from`");
         }
+        if buf.len() % BLOCK_SIZE != 0 {
+            return_errno_with_msg!(
+                NotBlockSizeAligned,
+                "buf not block size aligned `BufMut::try_from`"
+            );
+        }
+
         let new_self = Self(buf);
         Ok(new_self)
     }

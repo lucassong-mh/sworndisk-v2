@@ -198,11 +198,11 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     }
 
     fn subdisk_for_data(disk: &D) -> Result<D> {
-        disk.subset(0..disk.nblocks() / 10 * 5) // TBD
+        disk.subset(0..disk.nblocks() / 2) // TBD
     }
 
     fn subdisk_for_logical_block_table(disk: &D) -> Result<D> {
-        disk.subset(disk.nblocks() / 10 * 5..disk.nblocks()) // TBD
+        disk.subset(disk.nblocks() / 2..disk.nblocks()) // TBD
     }
 }
 
