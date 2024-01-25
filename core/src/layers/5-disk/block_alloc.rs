@@ -173,7 +173,7 @@ impl AllocTable {
     pub fn do_compaction<D: BlockSet + 'static>(&self, store: &Arc<TxLogStore<D>>) -> Result<()> {
         // Serialize the block validity table
         let bitmap = self.bitmap.lock();
-        const BITMAP_MAX_SIZE: usize = 512 * BLOCK_SIZE; // TBD
+        const BITMAP_MAX_SIZE: usize = 1024 * BLOCK_SIZE; // TBD
         let mut ser_buf = vec![0; BITMAP_MAX_SIZE];
         let ser_len = postcard::to_slice::<BitMap>(&bitmap, &mut ser_buf)
             .map_err(|_| Error::with_msg(InvalidArgs, "serialize block validity table failed"))?

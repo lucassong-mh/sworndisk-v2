@@ -39,9 +39,10 @@ struct Footer<K> {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Debug)]
 struct FooterMeta {
-    index_nblocks: u16,
     num_index: u16,
+    index_nblocks: u16,
     total_records: u32,
+    record_block_size: u32,
     sync_id: SyncID,
 }
 const FOOTER_META_SIZE: usize = size_of::<FooterMeta>();
@@ -59,6 +60,8 @@ struct IndexEntry<K> {
 struct RecordBlock {
     buf: Vec<u8>,
 }
+/// The size of a `RecordBlock`, which is a multiple of `BLOCK_SIZE`.
+const RECORD_BLOCK_SIZE: usize = 32 * BLOCK_SIZE;
 
 /// Accessor for a query.
 enum QueryAccessor<K> {
@@ -91,9 +94,9 @@ struct BlockScanIter<'a, K, V> {
 /// Format on a `TxLog`:
 ///
 /// ```text
-/// |   [record]    |   [record]    |...|         Footer            |
-/// |K|flag|V(V)|...|   [record]    |...| [IndexEntry] | FooterMeta |
-/// |  BLOCK_SIZE   |  BLOCK_SIZE   |...|                           |
+/// |    [Record]     |    [Record]     |...|         Footer            |
+/// |K|flag|V(V)| ... |    [Record]     |...| [IndexEntry] | FooterMeta |
+/// |RECORD_BLOCK_SIZE|RECORD_BLOCK_SIZE|...|                           |
 /// ```
 impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
     const K_SIZE: usize = size_of::<K>();
@@ -232,7 +235,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         let target_rb = if let Some(cached_rb) = cached_rb_opt {
             cached_rb
         } else {
-            let mut rb = RecordBlock::from_buf(vec![0; BLOCK_SIZE]);
+            let mut rb = RecordBlock::from_buf(vec![0; RECORD_BLOCK_SIZE]);
             let tx_log = tx_log_store.open_log(self.id, false)?;
             tx_log.read(target_pos, BufMut::try_from(&mut rb.buf[..]).unwrap())?;
             Arc::new(rb)
@@ -260,18 +263,21 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
             discard_unsynced,
             dropped_records: Vec::new(),
         };
-        let mut curr_record_block = RecordBlock::from_buf(vec![0u8; BLOCK_SIZE]);
 
+        let mut curr_rb_opt = None;
         for entry in self.footer.index.iter() {
             let record_block_opt = self.cache.write().get(&entry.pos).cloned();
             let record_block = if let Some(record_block) = record_block_opt.as_ref() {
                 record_block
             } else {
+                if curr_rb_opt.is_none() {
+                    let _ = curr_rb_opt.insert(RecordBlock::from_buf(vec![0u8; RECORD_BLOCK_SIZE]));
+                }
                 tx_log.read(
                     entry.pos,
-                    BufMut::try_from(&mut curr_record_block.buf[..]).unwrap(),
+                    BufMut::try_from(curr_rb_opt.as_mut().unwrap().as_mut_slice()).unwrap(),
                 )?;
-                &curr_record_block
+                curr_rb_opt.as_ref().unwrap()
             };
 
             let iter = BlockScanIter {
@@ -334,7 +340,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         let (mut first_k, mut curr_k) = (None, None);
         let mut inner_offset = 0;
 
-        let mut block_buf = Vec::with_capacity(BLOCK_SIZE);
+        let mut block_buf = Vec::with_capacity(RECORD_BLOCK_SIZE);
         for (nth, kv_ex) in records_iter.enumerate() {
             let (key, value_ex) = (*kv_ex.key(), kv_ex.value_ex());
             total_records += 1;
@@ -367,7 +373,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
                 }
             }
 
-            let cap_remained = BLOCK_SIZE - inner_offset;
+            let cap_remained = RECORD_BLOCK_SIZE - inner_offset;
             if cap_remained >= Self::MAX_RECORD_SIZE {
                 continue;
             }
@@ -402,7 +408,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
             tx_log: &TxLog<D>,
             cache: &mut LruCache<BlockId, Arc<RecordBlock>>,
         ) -> Result<()> {
-            buf.resize(BLOCK_SIZE, 0);
+            buf.resize(RECORD_BLOCK_SIZE, 0);
             let record_block = RecordBlock::from_buf(buf.clone());
 
             tx_log.append(BufRef::try_from(record_block.as_slice()).unwrap())?;
@@ -436,9 +442,10 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         }
         append_buf.resize(footer_buf_len, 0);
         let meta = FooterMeta {
-            index_nblocks: (footer_buf_len / BLOCK_SIZE) as _,
             num_index: index_vec.len() as _,
+            index_nblocks: (footer_buf_len / BLOCK_SIZE) as _,
             total_records: total_records as _,
+            record_block_size: RECORD_BLOCK_SIZE as _,
             sync_id,
         };
         append_buf[footer_buf_len - FOOTER_META_SIZE..].copy_from_slice(meta.as_bytes());
@@ -502,12 +509,16 @@ impl<K: RecordKey<K>> IndexEntry<K> {
 
 impl RecordBlock {
     pub fn from_buf(buf: Vec<u8>) -> Self {
-        debug_assert_eq!(buf.len(), BLOCK_SIZE);
+        debug_assert_eq!(buf.len(), RECORD_BLOCK_SIZE);
         Self { buf }
     }
 
     pub fn as_slice(&self) -> &[u8] {
         &self.buf
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf
     }
 }
 
@@ -528,7 +539,7 @@ impl<K: RecordKey<K>, V: RecordValue> Iterator for BlockQueryIter<'_, K, V> {
         let buf_slice = &self.block.buf;
         let (k_size, v_size) = (SSTable::<K, V>::K_SIZE, SSTable::<K, V>::V_SIZE);
 
-        if offset + SSTable::<K, V>::MAX_RECORD_SIZE > BLOCK_SIZE {
+        if offset + SSTable::<K, V>::MAX_RECORD_SIZE > RECORD_BLOCK_SIZE {
             return None;
         }
 
@@ -585,7 +596,7 @@ impl<K: RecordKey<K>, V: RecordValue> Iterator for BlockScanIter<'_, K, V> {
         );
 
         let (key, value_ex) = loop {
-            if offset + SSTable::<K, V>::MAX_RECORD_SIZE > BLOCK_SIZE {
+            if offset + SSTable::<K, V>::MAX_RECORD_SIZE > RECORD_BLOCK_SIZE {
                 return None;
             }
 
@@ -662,7 +673,7 @@ enum RecordFlag {
     Synced = 7,
     Unsynced = 11,
     SyncedAndUnsynced = 19,
-    Invalid = 0,
+    Invalid,
 }
 
 impl From<u8> for RecordFlag {
