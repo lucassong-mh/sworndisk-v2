@@ -628,6 +628,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         Ok(())
     }
 
+    /// Moves the log of a given ID from one bucket to another.
     pub fn move_log(&self, log_id: TxLogId, from_bucket: &str, to_bucket: &str) -> Result<()> {
         let mut current_tx = self.tx_provider.current();
 
@@ -986,14 +987,24 @@ impl TxLogStoreState {
     pub fn move_log(&mut self, log_id: TxLogId, from_bucket: &str, to_bucket: &str) {
         let entry = self.log_table.get_mut(&log_id).unwrap();
         debug_assert_eq!(entry.bucket, from_bucket);
-        entry.bucket = to_bucket.to_string();
+        let to_bucket = to_bucket.to_string();
+        entry.bucket = to_bucket.clone();
 
         self.bucket_table
             .get_mut(from_bucket)
-            .map(|bucket| bucket.log_ids.remove(&log_id));
-        self.bucket_table
-            .get_mut(to_bucket)
-            .map(|bucket| bucket.log_ids.insert(log_id));
+            .map(|bucket| bucket.log_ids.remove(&log_id))
+            .expect("`from_bucket` must exist");
+
+        if let Some(bucket) = self.bucket_table.get_mut(&to_bucket) {
+            bucket.log_ids.insert(log_id);
+        } else {
+            let _ = self.bucket_table.insert(
+                to_bucket,
+                Bucket {
+                    log_ids: HashSet::from([log_id]),
+                },
+            );
+        }
     }
 
     pub fn find_log(&self, log_id: TxLogId) -> Result<&TxLogEntry> {

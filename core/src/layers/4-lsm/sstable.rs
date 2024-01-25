@@ -55,6 +55,7 @@ struct IndexEntry<K> {
 }
 
 /// A block full of serialized records.
+// TODO: Choose an appropriate record block size.
 struct RecordBlock {
     buf: Vec<u8>,
 }
