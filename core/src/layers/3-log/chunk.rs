@@ -133,6 +133,28 @@ impl ChunkAlloc {
         Some(chunk_id)
     }
 
+    /// Allocates `count` number of chunks. Returns IDs of newly-allocated
+    /// chunks, returns `None` if any allocation fails.
+    pub fn alloc_batch(&self, count: usize) -> Option<Vec<ChunkId>> {
+        let chunk_ids = {
+            let mut ids = Vec::with_capacity(count);
+            let mut state = self.state.lock();
+            for _ in 0..count {
+                ids.push(state.alloc()?); // Update global state immediately
+            }
+            ids
+        };
+
+        let mut current_tx = self.tx_provider.current();
+        current_tx.data_mut_with(|edit: &mut ChunkAllocEdit| {
+            for chunk_id in &chunk_ids {
+                edit.alloc(*chunk_id);
+            }
+        });
+
+        Some(chunk_ids)
+    }
+
     /// Deallocates the chunk of a given ID.
     ///
     /// # Panic
@@ -391,11 +413,11 @@ mod tests {
         debug_assert!(alloc_cnt <= chunk_alloc.capacity() && dealloc_cnt <= alloc_cnt);
         let mut tx = chunk_alloc.new_tx();
         tx.context(|| {
-            let mut allocated_chunk_ids = Vec::with_capacity(alloc_cnt);
-            for _ in 0..alloc_cnt {
-                let chunk_id = chunk_alloc.alloc().unwrap();
-                allocated_chunk_ids.push(chunk_id);
-            }
+            let chunk_id = chunk_alloc.alloc().unwrap();
+            let chunk_ids = chunk_alloc.alloc_batch(alloc_cnt - 1).unwrap();
+            let allocated_chunk_ids: Vec<ChunkId> = core::iter::once(chunk_id)
+                .chain(chunk_ids.into_iter())
+                .collect();
 
             chunk_alloc.dealloc(allocated_chunk_ids[0]);
             chunk_alloc.dealloc_batch(

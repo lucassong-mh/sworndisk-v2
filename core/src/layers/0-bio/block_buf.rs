@@ -18,7 +18,6 @@
 //!
 
 use super::BLOCK_SIZE;
-use crate::error::Errno;
 use crate::os::Pages;
 use crate::prelude::*;
 

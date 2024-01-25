@@ -37,7 +37,7 @@
 //!     // TX 2: Open then read the created log
 //!     let mut tx = tx_log_store.new_tx();
 //!     let res: Result<_> = tx.context(|| {
-//!         let log = tx_log_store.open_log_in(bucket, false)?;
+//!         let log = tx_log_store.open_log_in(bucket)?;
 //!         let mut buf = Buf::alloc(1)?;
 //!         log.read(0 as BlockId, buf.as_mut())?;
 //!         assert_eq!(buf.as_slice()[0], content);
@@ -568,14 +568,13 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     /// # Panics
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
-    // TODO: Remove `can_append` like original implementation
-    pub fn open_log_in(&self, bucket: &str, can_append: bool) -> Result<Arc<TxLog<D>>> {
+    pub fn open_log_in(&self, bucket: &str) -> Result<Arc<TxLog<D>>> {
         let log_ids = self.list_logs_in(bucket)?;
         let max_log_id = log_ids
             .iter()
             .max()
             .ok_or(Error::with_msg(NotFound, "tx log not found"))?;
-        self.open_log(*max_log_id, can_append)
+        self.open_log(*max_log_id, false)
     }
 
     /// Checks whether the log of a given log ID exists or not.
@@ -1364,7 +1363,7 @@ mod tests {
             log.read(0, buf.as_mut())?;
             assert_eq!(buf.as_slice()[0], content);
 
-            let log = tx_log_store.open_log_in(bucket, false)?;
+            let log = tx_log_store.open_log_in(bucket)?;
             assert_eq!(log.id(), log_id);
             log.read(0 as BlockId, buf.as_mut())?;
             assert_eq!(buf.as_slice()[0], content);

@@ -2,17 +2,17 @@
 use crate::os::{Mutex, MutexGuard};
 use crate::prelude::*;
 
-use alloc::collections::VecDeque;
 use anymap::hashbrown::AnyMap;
 use core::any::Any;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use crossbeam_queue::SegQueue;
 
 /// A queue for managing block I/O requests (`BioReq`).
 /// It provides a concurrency-safe way to store and manage
 /// block I/O requests that need to be processed by a block device.
 pub struct BioReqQueue {
-    queue: Mutex<VecDeque<BioReq>>,
+    queue: Mutex<SegQueue<BioReq>>,
     num_reqs: AtomicUsize,
 }
 
@@ -20,7 +20,7 @@ impl BioReqQueue {
     /// Create a new `BioReqQueue` instance.
     pub fn new() -> Self {
         Self {
-            queue: Mutex::new(VecDeque::new()),
+            queue: Mutex::new(SegQueue::new()),
             num_reqs: AtomicUsize::new(0),
         }
     }
@@ -28,14 +28,14 @@ impl BioReqQueue {
     /// Enqueue a block I/O request.
     pub fn enqueue(&self, req: BioReq) -> Result<()> {
         req.submit();
-        self.queue.lock().push_back(req);
+        self.queue.lock().push(req);
         self.num_reqs.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
     /// Dequeue a block I/O request.
     pub fn dequeue(&self) -> Option<BioReq> {
-        let req_opt = self.queue.lock().pop_front();
+        let req_opt = self.queue.lock().pop();
         self.num_reqs.fetch_sub(1, Ordering::Release);
         req_opt
     }

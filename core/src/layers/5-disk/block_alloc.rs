@@ -2,12 +2,11 @@
 use super::sworndisk::Hba;
 use crate::layers::bio::{BlockSet, Buf, BufRef, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogStore};
-use crate::os::Mutex;
+use crate::os::{HashMap, Mutex};
 use crate::prelude::*;
 use crate::util::BitMap;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
-use hashbrown::HashMap;
 use pod::Pod;
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +27,7 @@ pub(super) struct BlockAlloc<D> {
     alloc_table: Arc<AllocTable>, // Point to the global allocator
     diff_table: Mutex<HashMap<Hba, AllocDiff>>, // Per-TX diffs of block validity
     store: Arc<TxLogStore<D>>,    // Store for diff log from L3
-    diff_log: Mutex<Option<Arc<TxLog<D>>>>, // Opened diff log
+    diff_log: Mutex<Option<Arc<TxLog<D>>>>, // Opened diff log (currently not in-use)
 }
 
 /// Incremental diff of block validity.
@@ -94,7 +93,7 @@ impl AllocTable {
         let mut tx = store.new_tx();
         let res: Result<_> = tx.context(|| {
             // Recover the block validity table from `BVT` log first
-            let bvt_log_res = store.open_log_in(BUCKET_BLOCK_ALLOC_LOG, false);
+            let bvt_log_res = store.open_log_in(BUCKET_BLOCK_VALIDITY_TABLE);
             let mut bitmap = match bvt_log_res {
                 Ok(bvt_log) => {
                     let mut buf = Buf::alloc(bvt_log.nblocks())?;
@@ -269,15 +268,15 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
             return Ok(());
         }
 
-        // TODO: Put this into prepare phase
-        let diff_log = self.store.create_log(BUCKET_BLOCK_ALLOC_LOG)?;
-
         let mut diff_buf = Vec::with_capacity(BLOCK_SIZE);
         for (block_id, block_diff) in diff_table.iter() {
             diff_buf.push(*block_diff as u8);
             diff_buf.extend_from_slice(block_id.as_bytes());
         }
+        drop(diff_table);
         diff_buf.resize(align_up(diff_buf.len(), BLOCK_SIZE), 0);
+
+        let diff_log = self.store.create_log(BUCKET_BLOCK_ALLOC_LOG)?;
         diff_log.append(BufRef::try_from(&diff_buf[..]).unwrap())
     }
 

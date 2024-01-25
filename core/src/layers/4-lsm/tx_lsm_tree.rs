@@ -287,6 +287,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
         recov_self.do_migration_tx()?;
 
+        #[cfg(feature = "std")]
         debug!("[TxLsmTree Recovery] {recov_self:?}");
         Ok(recov_self)
     }
@@ -294,7 +295,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
     fn collect_synced_records_from_wal(tx_log_store: &Arc<TxLogStore<D>>) -> Result<Vec<(K, V)>> {
         let mut tx = tx_log_store.new_tx();
         let res: Result<_> = tx.context(|| {
-            let wal_res = tx_log_store.open_log_in(BUCKET_WAL, false);
+            let wal_res = tx_log_store.open_log_in(BUCKET_WAL);
             if let Err(e) = &wal_res
                 && e.errno() == NotFound
             {
@@ -535,6 +536,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         event_listener.on_tx_commit();
         self.memtable_manager.immut_mem_table().write().clear();
 
+        #[cfg(feature = "std")]
         debug!("[TxLsmTree Minor Compaction] {self:?}");
         Ok(())
     }
@@ -660,6 +662,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             self.do_major_compaction(to_level.lower_level())?;
         }
 
+        #[cfg(feature = "std")]
         debug!("[TxLsmTree Major Compaction] {self:?}");
         Ok(())
     }

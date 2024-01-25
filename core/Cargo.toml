@@ -11,8 +11,8 @@ pod = {git = "https://github.com/asterinas/pod", rev = "7fa2ed2"}
 ahash = { version = "=0.7.7", default-features = false }
 anymap = { version = "=1.0.0-beta.2", default-features = false, features = ["hashbrown"] }
 array-init = "2.1.0"
-bitvec = {version = "1.0.1", default-features = false, features = ["atomic", "alloc", "serde"]}
 bittle = "0.5.6"
+crossbeam-queue = { version = "=0.3.11", default-features = false, features = ["alloc"] }
 hashbrown = { version = "=0.12.3", features = ["serde"] }
 lazy_static = {version = "1.4.0", features = ["spin_no_std"]}
 lending-iterator = "=0.1.7"
@@ -32,7 +32,7 @@ doctest = false
 [features]
 default = ["std"]
 jinux = []
-linux = []
+linux = ["bindings"]
 occlum = []
 std = ["log", "openssl", "spin"]
 

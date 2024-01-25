@@ -531,16 +531,11 @@ impl<'a, D: BlockSet> RawLogRef<'a, D> {
         let new_chunks_opt = {
             let chunks_needed = log_tail.calc_needed_chunks(append_nblocks);
             if chunks_needed > 0 {
-                // TODO: Support batch allocation
-                let mut chunk_ids = Vec::with_capacity(chunks_needed);
-                for _ in 0..chunks_needed {
-                    let new_chunk_id = self
-                        .log_store
-                        .chunk_alloc
-                        .alloc()
-                        .ok_or(Error::with_msg(OutOfMemory, "chunk allocation failed"))?;
-                    chunk_ids.push(new_chunk_id);
-                }
+                let chunk_ids = self
+                    .log_store
+                    .chunk_alloc
+                    .alloc_batch(chunks_needed)
+                    .ok_or(Error::with_msg(OutOfMemory, "chunk allocation failed"))?;
                 Some(chunk_ids)
             } else {
                 None

@@ -1,13 +1,12 @@
 use super::{Iv, Key, Mac};
 use crate::layers::bio::{BlockId, BlockLog, Buf, BufMut, BufRef, BLOCK_SIZE};
-use crate::os::{Aead, RwLock};
+use crate::os::{Aead, HashMap, RwLock};
 use crate::prelude::*;
 
 use core::any::Any;
 use core::cell::RefCell;
 use core::fmt::{self, Debug};
 use core::mem::size_of;
-use hashbrown::HashMap;
 use pod::Pod;
 use serde::{Deserialize, Serialize};
 use static_assertions::const_assert;
