@@ -131,9 +131,7 @@ pub(super) trait AsKVex<K, V> {
     fn value_ex(&self) -> &ValueEx<V>;
 }
 
-// TBD
-pub(super) const MEMTABLE_CAPACITY: usize = 2097152; // 96 MiB MemTable, 8 GiB data
-                                                     // pub(super) const MEMTABLE_CAPACITY: usize = 81920; // TBD
+pub(super) const MEMTABLE_CAPACITY: usize = 2097152; // 96 MiB MemTable, cover 8 GiB data // TBD
 pub(super) const SSTABLE_CAPACITY: usize = MEMTABLE_CAPACITY;
 
 impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> {

@@ -629,6 +629,10 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     }
 
     /// Moves the log of a given ID from one bucket to another.
+    ///
+    /// # Panics
+    ///
+    /// This method must be called within a TX. Otherwise, this method panics.
     pub fn move_log(&self, log_id: TxLogId, from_bucket: &str, to_bucket: &str) -> Result<()> {
         let mut current_tx = self.tx_provider.current();
 

@@ -198,11 +198,11 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     }
 
     fn subdisk_for_data(disk: &D) -> Result<D> {
-        disk.subset(0..disk.nblocks() / 2) // TBD
+        disk.subset(0..disk.nblocks() * 15 / 16) // TBD
     }
 
     fn subdisk_for_logical_block_table(disk: &D) -> Result<D> {
-        disk.subset(disk.nblocks() / 2..disk.nblocks()) // TBD
+        disk.subset(disk.nblocks() * 15 / 16..disk.nblocks()) // TBD
     }
 }
 
@@ -392,6 +392,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             }
         }
         LatencyMetrics::stop_timer(timer);
+
         Ok(())
     }
 
@@ -720,7 +721,7 @@ mod tests {
 
     #[test]
     fn sworndisk_fns() -> Result<()> {
-        let nblocks = 8 * 1024;
+        let nblocks = 64 * 1024;
         let mem_disk = MemDisk::create(nblocks)?;
         let root_key = Key::random();
         // Create a new `SwornDisk` then do some writes

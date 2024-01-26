@@ -19,7 +19,7 @@ use std::time::Instant;
 pub(crate) type Result<T> = core::result::Result<T, Error>;
 
 fn main() {
-    let total_bytes = 10 * GiB;
+    let total_bytes = 100 * GiB;
     // Specify all benchmarks
     let benches = vec![
         BenchBuilder::new("SwornDisk::write_seq")
@@ -27,7 +27,7 @@ fn main() {
             .io_type(IoType::Write)
             .io_pattern(IoPattern::Seq)
             .total_bytes(total_bytes)
-            .buf_size(128 * KiB)
+            .buf_size(256 * KiB)
             .concurrency(1)
             .build()
             .unwrap(),
@@ -37,6 +37,24 @@ fn main() {
             .io_pattern(IoPattern::Rnd)
             .total_bytes(total_bytes)
             .buf_size(4 * KiB)
+            .concurrency(1)
+            .build()
+            .unwrap(),
+        BenchBuilder::new("SwornDisk::write_rnd")
+            .disk_type(DiskType::SwornDisk)
+            .io_type(IoType::Write)
+            .io_pattern(IoPattern::Rnd)
+            .total_bytes(total_bytes)
+            .buf_size(32 * KiB)
+            .concurrency(1)
+            .build()
+            .unwrap(),
+        BenchBuilder::new("SwornDisk::write_rnd")
+            .disk_type(DiskType::SwornDisk)
+            .io_type(IoType::Write)
+            .io_pattern(IoPattern::Rnd)
+            .total_bytes(total_bytes)
+            .buf_size(256 * KiB)
             .concurrency(1)
             .build()
             .unwrap(),
@@ -58,12 +76,30 @@ fn main() {
             .concurrency(1)
             .build()
             .unwrap(),
+        BenchBuilder::new("SwornDisk::read_rnd")
+            .disk_type(DiskType::SwornDisk)
+            .io_type(IoType::Read)
+            .io_pattern(IoPattern::Rnd)
+            .total_bytes(total_bytes)
+            .buf_size(32 * KiB)
+            .concurrency(1)
+            .build()
+            .unwrap(),
+        BenchBuilder::new("SwornDisk::read_rnd")
+            .disk_type(DiskType::SwornDisk)
+            .io_type(IoType::Read)
+            .io_pattern(IoPattern::Rnd)
+            .total_bytes(total_bytes)
+            .buf_size(256 * KiB)
+            .concurrency(1)
+            .build()
+            .unwrap(),
         BenchBuilder::new("EncDisk::write_seq")
             .disk_type(DiskType::EncDisk)
             .io_type(IoType::Write)
             .io_pattern(IoPattern::Seq)
             .total_bytes(total_bytes)
-            .buf_size(128 * KiB)
+            .buf_size(256 * KiB)
             .concurrency(1)
             .build()
             .unwrap(),
@@ -73,6 +109,24 @@ fn main() {
             .io_pattern(IoPattern::Rnd)
             .total_bytes(total_bytes)
             .buf_size(4 * KiB)
+            .concurrency(1)
+            .build()
+            .unwrap(),
+        BenchBuilder::new("EncDisk::write_rnd")
+            .disk_type(DiskType::EncDisk)
+            .io_type(IoType::Write)
+            .io_pattern(IoPattern::Rnd)
+            .total_bytes(total_bytes)
+            .buf_size(32 * KiB)
+            .concurrency(1)
+            .build()
+            .unwrap(),
+        BenchBuilder::new("EncDisk::write_rnd")
+            .disk_type(DiskType::EncDisk)
+            .io_type(IoType::Write)
+            .io_pattern(IoPattern::Rnd)
+            .total_bytes(total_bytes)
+            .buf_size(256 * KiB)
             .concurrency(1)
             .build()
             .unwrap(),
@@ -91,6 +145,24 @@ fn main() {
             .io_pattern(IoPattern::Rnd)
             .total_bytes(total_bytes)
             .buf_size(4 * KiB)
+            .concurrency(1)
+            .build()
+            .unwrap(),
+        BenchBuilder::new("EncDisk::read_rnd")
+            .disk_type(DiskType::EncDisk)
+            .io_type(IoType::Read)
+            .io_pattern(IoPattern::Rnd)
+            .total_bytes(total_bytes)
+            .buf_size(32 * KiB)
+            .concurrency(1)
+            .build()
+            .unwrap(),
+        BenchBuilder::new("EncDisk::read_rnd")
+            .disk_type(DiskType::EncDisk)
+            .io_type(IoType::Read)
+            .io_pattern(IoPattern::Rnd)
+            .total_bytes(total_bytes)
+            .buf_size(256 * KiB)
             .concurrency(1)
             .build()
             .unwrap(),
@@ -350,7 +422,7 @@ mod benches {
             let disk: Arc<dyn BenchDisk> = match self.disk_type {
                 DiskType::SwornDisk => Arc::new(SwornDisk::create(
                     FileAsDisk::create(
-                        (20 * GiB) / BLOCK_SIZE, // TBD
+                        total_nblocks * 5 / 4, // TBD
                         &format!(
                             "sworndisk-{}.image",
                             DISK_ID.fetch_add(1, Ordering::Release)
@@ -367,9 +439,10 @@ mod benches {
 
             if self.io_type == IoType::Read {
                 let disk = disk.clone();
-                let _ =
-                    thread::spawn(move || disk.write_seq(0 as BlockId, total_nblocks, 8).unwrap())
-                        .join();
+                let _ = thread::spawn(move || {
+                    disk.write_seq(0 as BlockId, total_nblocks, 1024).unwrap()
+                })
+                .join();
             }
 
             if self.disk_type == DiskType::SwornDisk {
