@@ -111,7 +111,7 @@ impl BitMap {
 
     /// Get the number of zero bits in the bitmap.
     pub fn count_zeros(&self) -> usize {
-        let mut total_zeros = self.bits.count_zeros() as usize;
+        let total_zeros = self.bits.count_zeros() as usize;
         total_zeros - self.bits_not_in_use()
     }
 

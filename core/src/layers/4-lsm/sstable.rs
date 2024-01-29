@@ -1,7 +1,7 @@
 //! Sorted String Table.
 use super::mem_table::ValueEx;
 use super::tx_lsm_tree::AsKVex;
-use super::{RangeQueryCtx, RecordKey, RecordValue, SyncID};
+use super::{RangeQueryCtx, RecordKey, RecordValue, SyncID, TxEventListener};
 use crate::layers::bio::{BlockSet, Buf, BufMut, BufRef, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogId, TxLogStore};
 use crate::os::RwLock;
@@ -302,6 +302,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         records_iter: I,
         sync_id: SyncID,
         tx_log: &'a Arc<TxLog<D>>,
+        listener: &Arc<dyn TxEventListener<K, V>>,
     ) -> Result<Self>
     where
         I: Iterator<Item = KVex>,
@@ -310,7 +311,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
     {
         let mut cache = LruCache::new(NonZeroUsize::new(Self::CACHE_CAP).unwrap());
         let (total_records, index_vec) =
-            Self::build_record_blocks(records_iter, tx_log, &mut cache)?;
+            Self::build_record_blocks(records_iter, tx_log, &mut cache, listener)?;
         let footer = Self::build_footer::<D>(index_vec, total_records, sync_id, tx_log)?;
 
         Ok(Self {
@@ -327,6 +328,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         records_iter: I,
         tx_log: &'a TxLog<D>,
         cache: &mut LruCache<BlockId, Arc<RecordBlock>>,
+        listener: &Arc<dyn TxEventListener<K, V>>,
     ) -> Result<(usize, Vec<IndexEntry<K>>)>
     where
         I: Iterator<Item = KVex>,
@@ -340,7 +342,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         let mut inner_offset = 0;
 
         let mut block_buf = Vec::with_capacity(RECORD_BLOCK_SIZE);
-        for (nth, kv_ex) in records_iter.enumerate() {
+        for kv_ex in records_iter {
             let (key, value_ex) = (*kv_ex.key(), kv_ex.value_ex());
             total_records += 1;
 
@@ -357,17 +359,24 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
                 ValueEx::Synced(v) => {
                     block_buf.push(RecordFlag::Synced as u8);
                     block_buf.extend_from_slice(v.as_bytes());
+
+                    listener.on_add_record(&(&key, v))?;
                     inner_offset += 1 + Self::V_SIZE;
                 }
                 ValueEx::Unsynced(v) => {
                     block_buf.push(RecordFlag::Unsynced as u8);
                     block_buf.extend_from_slice(v.as_bytes());
+
+                    listener.on_add_record(&(&key, v))?;
                     inner_offset += 1 + Self::V_SIZE;
                 }
                 ValueEx::SyncedAndUnsynced(sv, usv) => {
                     block_buf.push(RecordFlag::SyncedAndUnsynced as u8);
                     block_buf.extend_from_slice(sv.as_bytes());
                     block_buf.extend_from_slice(usv.as_bytes());
+
+                    listener.on_add_record(&(&key, sv))?;
+                    listener.on_add_record(&(&key, usv))?;
                     inner_offset += Self::MAX_RECORD_SIZE;
                 }
             }

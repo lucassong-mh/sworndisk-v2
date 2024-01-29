@@ -51,7 +51,7 @@ impl AllocTable {
     /// if there are no free slots.
     pub fn alloc(&self) -> Option<Hba> {
         let mut bitmap = self.bitmap.lock();
-        let next_avail = self.next_avail.load(Ordering::Relaxed);
+        let next_avail = self.next_avail.load(Ordering::Acquire);
 
         let hba = if let Some(hba) = bitmap.first_one(next_avail) {
             hba
@@ -69,7 +69,7 @@ impl AllocTable {
     pub fn alloc_batch(&self, count: usize) -> Option<Vec<Hba>> {
         debug_assert!(count > 0);
         let mut bitmap = self.bitmap.lock();
-        let mut next_avail = self.next_avail.load(Ordering::Relaxed);
+        let mut next_avail = self.next_avail.load(Ordering::Acquire);
 
         let hbas = if let Some(hbas) = bitmap.first_ones(next_avail, count) {
             hbas

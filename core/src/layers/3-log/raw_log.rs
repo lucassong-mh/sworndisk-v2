@@ -602,8 +602,8 @@ impl<'a> RawLogHeadRef<'a> {
         let chunks = &self.entry.head.chunks;
 
         while res_blocks.len() != nblocks {
-            let mut curr_chunk_idx = offset / CHUNK_NBLOCKS;
-            let mut curr_chunk_inner_offset = offset % CHUNK_NBLOCKS;
+            let curr_chunk_idx = offset / CHUNK_NBLOCKS;
+            let curr_chunk_inner_offset = offset % CHUNK_NBLOCKS;
 
             res_blocks.push(chunks[curr_chunk_idx] * CHUNK_NBLOCKS + curr_chunk_inner_offset);
             offset += 1;

@@ -1,11 +1,7 @@
 //! MemTable.
 use super::{AsKV, RangeQueryCtx, RecordKey, RecordValue, SyncID};
+use crate::os::BTreeMap;
 use crate::prelude::*;
-
-use alloc::collections::BTreeMap;
-// XXX: Suffer from bad performance in range search.
-// TODO: Use `SkipMap` instead
-// use rbtree::RBTree;
 
 /// MemTable for LSM-Tree.
 ///
@@ -15,7 +11,6 @@ use alloc::collections::BTreeMap;
 /// Also supports user-defined callback when a record is dropped.
 pub(super) struct MemTable<K: RecordKey<K>, V> {
     table: BTreeMap<K, ValueEx<V>>,
-    // table: RBTree<K, ValueEx<V>>,
     size: usize,
     cap: usize,
     sync_id: SyncID,
@@ -41,7 +36,6 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
     ) -> Self {
         Self {
             table: BTreeMap::new(),
-            // table: RBTree::new(),
             size: 0,
             cap,
             sync_id,
@@ -59,10 +53,6 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
     pub fn get_range(&self, range_query_ctx: &mut RangeQueryCtx<K, V>) -> bool {
         debug_assert!(!range_query_ctx.is_completed());
         let target_range = range_query_ctx.range_uncompleted().unwrap();
-
-        // for (k, v_ex) in self.table.iter().filter(|(k, _)| target_range.contains(k)) {
-        //     range_query_ctx.complete(*k, *v_ex.get());
-        // }
 
         for (k, v_ex) in self.table.range(target_range) {
             range_query_ctx.complete(*k, *v_ex.get());

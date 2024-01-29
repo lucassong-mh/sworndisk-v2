@@ -96,7 +96,7 @@ impl<K: RecordKey<K>, V: RecordValue> Compactor<K, V> {
             }
 
             let new_log = tx_log_store.create_log(to_level.bucket())?;
-            let new_sst = SSTable::build(records_iter, sync_id, &new_log)?;
+            let new_sst = SSTable::build(records_iter, sync_id, &new_log, event_listener)?;
 
             created_ssts.push(new_sst);
         }

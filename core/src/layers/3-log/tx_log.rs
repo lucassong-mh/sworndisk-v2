@@ -306,7 +306,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
                     .open_table
                     .iter()
                     .filter_map(|(id, inner_log)| {
-                        if inner_log.is_dirty.load(Ordering::Relaxed) {
+                        if inner_log.is_dirty.load(Ordering::Acquire) {
                             Some((*id, inner_log.clone()))
                         } else {
                             None
@@ -638,7 +638,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
 
         current_tx.data_mut_with(|open_log_table: &mut OpenLogTable<D>| {
             open_log_table.open_table.get(&log_id).map(|log| {
-                debug_assert!(log.bucket == from_bucket && !log.is_dirty.load(Ordering::Relaxed))
+                debug_assert!(log.bucket == from_bucket && !log.is_dirty.load(Ordering::Acquire))
             });
         });
 
@@ -815,7 +815,7 @@ impl<D: BlockSet + 'static> Debug for TxLog<D> {
             .field("id", &self.inner_log.log_id)
             .field("bucket", &self.inner_log.bucket)
             .field("crypto_log", &self.inner_log.crypto_log)
-            .field("is_dirty", &self.inner_log.is_dirty.load(Ordering::Relaxed))
+            .field("is_dirty", &self.inner_log.is_dirty.load(Ordering::Acquire))
             .finish()
     }
 }

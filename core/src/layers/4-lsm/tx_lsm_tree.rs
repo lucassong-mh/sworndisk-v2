@@ -12,7 +12,7 @@ use super::sstable::SSTable;
 use super::wal::{WalAppendTx, BUCKET_WAL};
 use crate::layers::bio::BlockSet;
 use crate::layers::log::{TxLogId, TxLogStore};
-use crate::os::RwLock;
+use crate::os::{BTreeMap, RwLock};
 use crate::prelude::*;
 use crate::tx::Tx;
 
@@ -21,7 +21,6 @@ use core::hash::Hash;
 use core::ops::{Add, Sub};
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use pod::Pod;
-use rbtree::RBTree;
 
 // TODO: Use `Thread` in os module
 use std::thread;
@@ -66,7 +65,7 @@ struct MemTableManager<K: RecordKey<K>, V> {
 /// Manager of all `SSTable`s from every level in a `TxLsmTree`.
 #[derive(Debug)]
 struct SstManager<K, V> {
-    level_ssts: Vec<RBTree<TxLogId, Arc<SSTable<K, V>>>>,
+    level_ssts: Vec<BTreeMap<TxLogId, Arc<SSTable<K, V>>>>,
 }
 
 /// A factory of per-transaction event listeners.
@@ -372,7 +371,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
     }
 
     pub fn sync(&self) -> Result<()> {
-        let master_sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed) + 1;
+        let master_sync_id = MASTER_SYNC_ID.load(Ordering::Acquire) + 1;
 
         let timer = LatencyMetrics::start_timer(ReqType::Sync, "wal_and_memtable", "lsmtree");
 
@@ -500,20 +499,10 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
             // Cook records in immutable MemTable into a new SST
             let immut_mem_table = self.memtable_manager.immut_mem_table().read();
-            let records_iter = immut_mem_table.iter().map(|(k, v_ex)| {
-                match v_ex {
-                    ValueEx::Synced(v) | ValueEx::Unsynced(v) => {
-                        event_listener.on_add_record(&(k, v)).unwrap();
-                    }
-                    ValueEx::SyncedAndUnsynced(sv, usv) => {
-                        event_listener.on_add_record(&(k, sv)).unwrap();
-                        event_listener.on_add_record(&(k, usv)).unwrap();
-                    }
-                }
-                (k, v_ex)
-            });
+            let records_iter = immut_mem_table.iter();
             let sync_id = immut_mem_table.sync_id();
-            let sst = SSTable::build(records_iter, sync_id, &tx_log)?;
+
+            let sst = SSTable::build(records_iter, sync_id, &tx_log, &event_listener)?;
             self.sst_manager.write().insert(sst, LsmLevel::L0);
             Ok(())
         });
@@ -555,7 +544,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             )
         })?;
 
-        let master_sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
+        let master_sync_id = MASTER_SYNC_ID.load(Ordering::Acquire);
         let tx_log_store = self.tx_log_store.clone();
         let listener = event_listener.clone();
         let res: Result<_> = tx.context(move || {
@@ -677,7 +666,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             Error::with_msg(TxAborted, "migration TX callback 'on_tx_begin' failed")
         })?;
 
-        let master_sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
+        let master_sync_id = MASTER_SYNC_ID.load(Ordering::Acquire);
         let tx_log_store = self.tx_log_store.clone();
         let listener = event_listener.clone();
         let res: Result<_> = tx.context(move || {
@@ -700,8 +689,12 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
                     if !synced_records.is_empty() {
                         // Create new migrated SST
                         let new_log = tx_log_store.create_log(bucket)?;
-                        let new_sst =
-                            SSTable::build(synced_records.into_iter(), master_sync_id, &new_log)?;
+                        let new_sst = SSTable::build(
+                            synced_records.into_iter(),
+                            master_sync_id,
+                            &new_log,
+                            &listener,
+                        )?;
                         created_ssts.push((new_sst, level));
                         continue;
                     }
@@ -820,7 +813,7 @@ impl From<u8> for LsmLevel {
 impl<K: RecordKey<K>, V: RecordValue> SstManager<K, V> {
     pub fn new() -> Self {
         let level_ssts = (0..LsmLevel::MAX_NUM_LEVELS)
-            .map(|_| RBTree::new())
+            .map(|_| BTreeMap::new())
             .collect();
         Self { level_ssts }
     }
@@ -836,7 +829,7 @@ impl<K: RecordKey<K>, V: RecordValue> SstManager<K, V> {
         let nth_level = level as usize;
         debug_assert!(nth_level < self.level_ssts.len());
         let level_ssts = &mut self.level_ssts[nth_level];
-        level_ssts.replace_or_insert(sst.id(), Arc::new(sst))
+        level_ssts.insert(sst.id(), Arc::new(sst))
     }
 
     pub fn remove(&mut self, id: TxLogId, level: LsmLevel) -> Option<Arc<SSTable<K, V>>> {
@@ -846,7 +839,7 @@ impl<K: RecordKey<K>, V: RecordValue> SstManager<K, V> {
 
     pub fn move_sst(&mut self, id: TxLogId, from: LsmLevel, to: LsmLevel) {
         let moved = self.level_ssts[from as usize].remove(&id).unwrap();
-        self.level_ssts[to as usize].insert(id, moved);
+        let _ = self.level_ssts[to as usize].insert(id, moved);
     }
 
     pub fn require_major_compaction(&self, from_level: LsmLevel) -> bool {
@@ -865,7 +858,7 @@ impl<K: RecordKey<K>, V: RecordValue> MemTableManager<K, V> {
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
     ) -> Self {
         let mem_tables = {
-            let sync_id = MASTER_SYNC_ID.load(Ordering::Relaxed);
+            let sync_id = MASTER_SYNC_ID.load(Ordering::Acquire);
             let mem_table = Arc::new(RwLock::new(MemTable::new(
                 capacity,
                 sync_id,
@@ -921,15 +914,15 @@ impl<K: RecordKey<K>, V: RecordValue> MemTableManager<K, V> {
         // Update sync ID of the active MemTable
         let mut active_mem_table = self.mem_tables[active_idx as usize].write();
         debug_assert!(active_mem_table.is_empty());
-        let _ = active_mem_table.sync(MASTER_SYNC_ID.load(Ordering::Relaxed));
+        let _ = active_mem_table.sync(MASTER_SYNC_ID.load(Ordering::Acquire));
     }
 
     pub fn active_mem_table(&self) -> &Arc<RwLock<MemTable<K, V>>> {
-        &self.mem_tables[(self.immut_idx.load(Ordering::Relaxed) as usize) ^ 1]
+        &self.mem_tables[(self.immut_idx.load(Ordering::Acquire) as usize) ^ 1]
     }
 
     pub fn immut_mem_table(&self) -> &Arc<RwLock<MemTable<K, V>>> {
-        &self.mem_tables[self.immut_idx.load(Ordering::Relaxed) as usize]
+        &self.mem_tables[self.immut_idx.load(Ordering::Acquire) as usize]
     }
 }
 

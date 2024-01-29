@@ -128,7 +128,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 user_data_disk: data_disk,
                 block_validity_table,
                 tx_log_store,
-                data_buf: DataBuf::new(),
+                data_buf: DataBuf::new(DATA_BUF_CAP),
                 root_key,
                 is_dropped: AtomicBool::new(false),
             }),
@@ -172,7 +172,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 logical_block_table,
                 user_data_disk: data_disk,
                 block_validity_table,
-                data_buf: DataBuf::new(),
+                data_buf: DataBuf::new(DATA_BUF_CAP),
                 tx_log_store,
                 root_key,
                 is_dropped: AtomicBool::new(false),
@@ -206,15 +206,15 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     }
 }
 
-impl<D: BlockSet + 'static> DiskInner<D> {
-    /// Capacity of the user data blocks buffer.
-    const DATA_BUF_CAP: usize = 1024;
+/// Capacity of the user data blocks buffer.
+const DATA_BUF_CAP: usize = 1024;
 
+impl<D: BlockSet + 'static> DiskInner<D> {
     /// Continuously loop and handle any pending block I/O requests.
     pub fn handle_bio_reqs_looped(&self) {
         loop {
             if self.bio_req_queue.is_empty() {
-                if self.is_dropped.load(Ordering::Relaxed) {
+                if self.is_dropped.load(Ordering::Acquire) {
                     break;
                 }
 
@@ -400,14 +400,15 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     /// The block contents reside in a single contiguous buffer.
     pub fn write(&self, mut lba: Lba, buf: BufRef) -> Result<usize> {
         let nblocks = buf.nblocks();
+        let mut buf_at_capacity = false;
         // Write block contents to `DataBuf` directly
         for block_buf in buf.iter() {
-            self.data_buf.put(RecordKey { lba }, block_buf);
+            buf_at_capacity = self.data_buf.put(RecordKey { lba }, block_buf);
             lba += 1;
         }
         AmplificationMetrics::acc_data_amount(AmpType::Write, nblocks);
 
-        if self.data_buf.nblocks() < Self::DATA_BUF_CAP {
+        if !buf_at_capacity {
             return Ok(nblocks);
         }
 
@@ -611,7 +612,8 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
             }
             // Major Compaction TX and Migration TX do not add new records
             TxType::Compaction { .. } | TxType::Migration => {
-                unreachable!();
+                // Do nothing
+                Ok(())
             }
         }
     }

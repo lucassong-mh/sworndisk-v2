@@ -42,7 +42,7 @@ impl BioReqQueue {
 
     /// Returns the number of pending requests in this queue.
     pub fn num_reqs(&self) -> usize {
-        self.num_reqs.load(Ordering::Relaxed)
+        self.num_reqs.load(Ordering::Acquire)
     }
 
     /// Returns whether there are no pending requests in this queue.

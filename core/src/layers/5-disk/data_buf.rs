@@ -1,30 +1,28 @@
 //! Data buffering.
 use super::sworndisk::RecordKey;
 use crate::layers::bio::{BufMut, BufRef};
-use crate::os::RwLock;
+use crate::os::{BTreeMap, RwLock};
 use crate::prelude::*;
 
 use core::fmt::{self, Debug};
 use core::ops::RangeInclusive;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use rbtree::RBTree;
 
 /// A buffer to cache data blocks before they are written to disk.
 #[derive(Debug)]
 pub(super) struct DataBuf {
-    buf: RwLock<RBTree<RecordKey, Arc<DataBlock>>>,
-    size: AtomicUsize,
+    buf: RwLock<BTreeMap<RecordKey, Arc<DataBlock>>>,
+    cap: usize,
 }
 
 /// User data block.
 pub(super) struct DataBlock([u8; BLOCK_SIZE]);
 
 impl DataBuf {
-    /// Create a new empty data buffer.
-    pub fn new() -> Self {
+    /// Create a new empty data buffer with a given capacity.
+    pub fn new(cap: usize) -> Self {
         Self {
-            buf: RwLock::new(RBTree::new()),
-            size: AtomicUsize::new(0),
+            buf: RwLock::new(BTreeMap::new()),
+            cap,
         }
     }
 
@@ -55,16 +53,23 @@ impl DataBuf {
             .collect()
     }
 
-    /// Put the data block in `buf` into the buffer.
-    pub fn put(&self, key: RecordKey, buf: BufRef) {
+    /// Put the data block in `buf` into the buffer. Return
+    /// whether the buffer is full after insertion.
+    pub fn put(&self, key: RecordKey, buf: BufRef) -> bool {
         debug_assert_eq!(buf.nblocks(), 1);
-        self.buf.write().insert(key, DataBlock::from_buf(buf));
-        self.size.fetch_add(1, Ordering::Release);
+        let mut data_buf = self.buf.write();
+        let _ = data_buf.insert(key, DataBlock::from_buf(buf));
+        data_buf.len() >= self.cap
     }
 
     /// Return the number of data blocks of the buffer.
     pub fn nblocks(&self) -> usize {
-        self.size.load(Ordering::Relaxed)
+        self.buf.read().len()
+    }
+
+    /// Return whether the buffer is full.
+    pub fn at_capacity(&self) -> bool {
+        self.nblocks() >= self.cap
     }
 
     /// Return whether the buffer is empty.
@@ -75,7 +80,6 @@ impl DataBuf {
     /// Empty the buffer.
     pub fn clear(&self) {
         self.buf.write().clear();
-        self.size.store(0, Ordering::Release);
     }
 
     /// Return all the buffered data blocks.
