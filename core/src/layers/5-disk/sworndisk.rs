@@ -439,7 +439,9 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     }
 
     fn write_blocks_from_data_buf(&self) -> Result<Vec<(RecordKey, RecordValue)>> {
-        let num_write = self.data_buf.nblocks();
+        let data_blocks = self.data_buf.all_blocks();
+
+        let num_write = data_blocks.len();
         let mut records = Vec::with_capacity(num_write);
         if num_write == 0 {
             return Ok(records);
@@ -453,7 +455,6 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         debug_assert_eq!(hbas.len(), num_write);
         let hba_batches = hbas.group_by(|hba1, hba2| hba2 - hba1 == 1);
 
-        let data_blocks = self.data_buf.all_blocks();
         // Perform encryption and batch disk write
         let mut cipher_buf = Buf::alloc(num_write)?;
         let mut cipher_slice = cipher_buf.as_mut_slice();

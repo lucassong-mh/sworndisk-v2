@@ -90,7 +90,6 @@ use crate::prelude::*;
 use crate::tx::{CurrentTx, Tx, TxData, TxProvider};
 use crate::util::LazyDelete;
 
-use core::fmt::{self, Debug};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
 

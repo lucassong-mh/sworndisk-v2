@@ -3,8 +3,6 @@ use super::{AsKV, RangeQueryCtx, RecordKey, RecordValue, SyncID};
 use crate::os::{BTreeMap, Mutex, RwLock, RwLockReadGuard};
 use crate::prelude::*;
 
-use core::fmt;
-
 /// Manager for an active `MemTable` and an immutable `MemTable`
 /// in a `TxLsmTree`.
 pub(super) struct MemTableManager<K: RecordKey<K>, V> {

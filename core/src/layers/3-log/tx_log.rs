@@ -65,15 +65,12 @@ use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::crypto::{CryptoLog, NodeCache, RootMhtMeta};
 use crate::layers::edit::{CompactPolicy, Edit, EditJournal, EditJournalMeta};
 use crate::layers::log::chunk::CHUNK_NBLOCKS;
-use crate::os::{
-    AeadKey as Key, HashMap, HashSet, Mutex, RwLock, Skcipher, SkcipherIv, SkcipherKey,
-};
+use crate::os::{AeadKey as Key, HashMap, HashSet, Mutex, Skcipher, SkcipherIv, SkcipherKey};
 use crate::prelude::*;
 use crate::tx::{CurrentTx, Tx, TxData, TxId, TxProvider};
 use crate::util::LazyDelete;
 
 use core::any::Any;
-use core::fmt::{self, Debug};
 use core::sync::atomic::{AtomicBool, Ordering};
 use lru::LruCache;
 use pod::Pod;
@@ -382,7 +379,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
             let log_caches = &mut state.log_caches;
             for (log_id, open_cache) in open_cache_table.open_table.iter_mut() {
                 let log_cache = log_caches.get_mut(log_id).unwrap();
-                let mut cache_inner = log_cache.inner.write();
+                let mut cache_inner = log_cache.inner.lock();
                 if cache_inner.lru_cache.is_empty() {
                     core::mem::swap(&mut cache_inner.lru_cache, &mut open_cache.lru_cache);
                     return;
@@ -821,7 +818,7 @@ impl<D: BlockSet + 'static> Debug for TxLog<D> {
 }
 
 pub struct CryptoLogCache {
-    inner: RwLock<CacheInner>,
+    inner: Mutex<CacheInner>,
     log_id: TxLogId,
     tx_provider: Arc<TxProvider>,
 }
@@ -834,7 +831,7 @@ pub(super) struct CacheInner {
 impl CryptoLogCache {
     fn new(log_id: TxLogId, tx_provider: &Arc<TxProvider>) -> Self {
         Self {
-            inner: RwLock::new(CacheInner::new()),
+            inner: Mutex::new(CacheInner::new()),
             log_id,
             tx_provider: tx_provider.clone(),
         }
@@ -856,7 +853,7 @@ impl NodeCache for CryptoLogCache {
             return value_opt;
         }
 
-        let mut inner = self.inner.write();
+        let mut inner = self.inner.lock();
         inner.lru_cache.get(&pos).cloned()
     }
 

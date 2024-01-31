@@ -42,7 +42,6 @@ use crate::prelude::*;
 use crate::tx::{CurrentTx, Tx, TxData, TxProvider};
 use crate::util::BitMap;
 
-use core::fmt::{self, Debug};
 use serde::{Deserialize, Serialize};
 
 /// The ID of a chunk.

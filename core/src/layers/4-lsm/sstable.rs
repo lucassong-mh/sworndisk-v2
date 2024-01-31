@@ -4,10 +4,9 @@ use super::tx_lsm_tree::AsKVex;
 use super::{RangeQueryCtx, RecordKey, RecordValue, SyncID, TxEventListener};
 use crate::layers::bio::{BlockSet, Buf, BufMut, BufRef, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogId, TxLogStore};
-use crate::os::RwLock;
+use crate::os::Mutex;
 use crate::prelude::*;
 
-use core::fmt::{self, Debug};
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::num::NonZeroUsize;
@@ -23,7 +22,7 @@ use pod::Pod;
 pub(super) struct SSTable<K, V> {
     id: TxLogId,
     footer: Footer<K>,
-    cache: RwLock<LruCache<BlockId, Arc<RecordBlock>>>,
+    cache: Mutex<LruCache<BlockId, Arc<RecordBlock>>>,
     phantom: PhantomData<(K, V)>,
 }
 
@@ -238,7 +237,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         target_pos: BlockId,
         tx_log_store: &Arc<TxLogStore<D>>,
     ) -> Result<Arc<RecordBlock>> {
-        let mut cache = self.cache.write();
+        let mut cache = self.cache.lock();
         if let Some(cached_rb) = cache.get(&target_pos) {
             Ok(cached_rb.clone())
         } else {
@@ -334,7 +333,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         Ok(Self {
             id: tx_log.id(),
             footer,
-            cache: RwLock::new(cache),
+            cache: Mutex::new(cache),
             phantom: PhantomData,
         })
     }
@@ -517,7 +516,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         Ok(Self {
             id: tx_log.id(),
             footer,
-            cache: RwLock::new(LruCache::new(NonZeroUsize::new(Self::CACHE_CAP).unwrap())),
+            cache: Mutex::new(LruCache::new(NonZeroUsize::new(Self::CACHE_CAP).unwrap())),
             phantom: PhantomData,
         })
     }

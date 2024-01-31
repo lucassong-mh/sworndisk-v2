@@ -1,16 +1,15 @@
 //! Data buffering.
 use super::sworndisk::RecordKey;
 use crate::layers::bio::{BufMut, BufRef};
-use crate::os::{BTreeMap, RwLock};
+use crate::os::{BTreeMap, Mutex};
 use crate::prelude::*;
 
-use core::fmt::{self, Debug};
 use core::ops::RangeInclusive;
 
 /// A buffer to cache data blocks before they are written to disk.
 #[derive(Debug)]
 pub(super) struct DataBuf {
-    buf: RwLock<BTreeMap<RecordKey, Arc<DataBlock>>>,
+    buf: Mutex<BTreeMap<RecordKey, Arc<DataBlock>>>,
     cap: usize,
 }
 
@@ -21,7 +20,7 @@ impl DataBuf {
     /// Create a new empty data buffer with a given capacity.
     pub fn new(cap: usize) -> Self {
         Self {
-            buf: RwLock::new(BTreeMap::new()),
+            buf: Mutex::new(BTreeMap::new()),
             cap,
         }
     }
@@ -30,7 +29,7 @@ impl DataBuf {
     /// the content into `buf`.
     pub fn get(&self, key: RecordKey, buf: &mut BufMut) -> Option<()> {
         debug_assert_eq!(buf.nblocks(), 1);
-        if let Some(block) = self.buf.read().get(&key) {
+        if let Some(block) = self.buf.lock().get(&key) {
             buf.as_mut_slice().copy_from_slice(block.as_slice());
             Some(())
         } else {
@@ -41,7 +40,7 @@ impl DataBuf {
     /// Get the buffered data blocks which keys are within the given range.
     pub fn get_range(&self, range: RangeInclusive<RecordKey>) -> Vec<(RecordKey, Arc<DataBlock>)> {
         self.buf
-            .read()
+            .lock()
             .iter()
             .filter_map(|(k, v)| {
                 if range.contains(k) {
@@ -57,14 +56,14 @@ impl DataBuf {
     /// whether the buffer is full after insertion.
     pub fn put(&self, key: RecordKey, buf: BufRef) -> bool {
         debug_assert_eq!(buf.nblocks(), 1);
-        let mut data_buf = self.buf.write();
+        let mut data_buf = self.buf.lock();
         let _ = data_buf.insert(key, DataBlock::from_buf(buf));
         data_buf.len() >= self.cap
     }
 
     /// Return the number of data blocks of the buffer.
     pub fn nblocks(&self) -> usize {
-        self.buf.read().len()
+        self.buf.lock().len()
     }
 
     /// Return whether the buffer is full.
@@ -79,13 +78,13 @@ impl DataBuf {
 
     /// Empty the buffer.
     pub fn clear(&self) {
-        self.buf.write().clear();
+        self.buf.lock().clear();
     }
 
     /// Return all the buffered data blocks.
     pub fn all_blocks(&self) -> Vec<(RecordKey, Arc<DataBlock>)> {
         self.buf
-            .read()
+            .lock()
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect()

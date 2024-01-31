@@ -16,9 +16,8 @@ use crate::os::{BTreeMap, RwLock};
 use crate::prelude::*;
 use crate::tx::Tx;
 
-use core::fmt::{self, Debug};
 use core::hash::Hash;
-use core::ops::{Add, Sub};
+use core::ops::{Add, RangeInclusive, Sub};
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use pod::Pod;
 
@@ -449,7 +448,6 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         let read_res: Result<_> = tx.context(|| {
             // Search each level from top to bottom (newer to older)
             let sst_manager = self.sst_manager.read();
-
             for (level, _bucket) in LsmLevel::iter() {
                 for (_id, sst) in sst_manager.list_level(level) {
                     if !sst.overlap_with(&range_query_ctx.range_uncompleted().unwrap()) {
@@ -567,14 +565,8 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
                 .map(|(id, sst)| (*id, sst.clone()))
                 .unwrap();
             let lower_ssts: Vec<(TxLogId, Arc<SSTable<K, V>>)> = sst_manager
-                .list_level(to_level)
-                .filter_map(|(id, sst)| {
-                    if sst.overlap_with(&upper_sst.range()) {
-                        Some((*id, sst.clone()))
-                    } else {
-                        None
-                    }
-                })
+                .find_overlapped_ssts(&upper_sst.range(), to_level)
+                .map(|(id, sst)| (*id, sst.clone()))
                 .collect();
             drop(sst_manager);
 
@@ -605,11 +597,11 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             )?;
 
             // Delete the old SSTs
-            tx_log_store.delete_log(upper_sst_id)?;
-            deleted_ssts.push((upper_sst_id, from_level));
-            for (id, _) in lower_ssts {
+            for (id, level) in core::iter::once((upper_sst_id, from_level))
+                .chain(lower_ssts.into_iter().map(|(id, _)| (id, to_level)))
+            {
                 tx_log_store.delete_log(id)?;
-                deleted_ssts.push((id, to_level));
+                deleted_ssts.push((id, level));
             }
             Ok((created_ssts, deleted_ssts))
         });
@@ -682,9 +674,9 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
                         continue;
                     }
 
-                    deleted_ssts.push((id, level));
-                    // Delete old SST
+                    // Delete the old SST
                     tx_log_store.delete_log(id)?;
+                    deleted_ssts.push((id, level));
                 }
             }
 
@@ -792,7 +784,6 @@ impl From<u8> for LsmLevel {
     }
 }
 
-// FIXME: Should changes support abort?
 impl<K: RecordKey<K>, V: RecordValue> SstManager<K, V> {
     pub fn new() -> Self {
         let level_ssts = (0..LsmLevel::MAX_NUM_LEVELS)
@@ -823,6 +814,15 @@ impl<K: RecordKey<K>, V: RecordValue> SstManager<K, V> {
     pub fn move_sst(&mut self, id: TxLogId, from: LsmLevel, to: LsmLevel) {
         let moved = self.level_ssts[from as usize].remove(&id).unwrap();
         let _ = self.level_ssts[to as usize].insert(id, moved);
+    }
+
+    pub fn find_overlapped_ssts<'a>(
+        &'a self,
+        range: &'a RangeInclusive<K>,
+        level: LsmLevel,
+    ) -> impl Iterator<Item = (&TxLogId, &Arc<SSTable<K, V>>)> + 'a {
+        self.list_level(level)
+            .filter(|(_, sst)| sst.overlap_with(range))
     }
 
     pub fn require_major_compaction(&self, from_level: LsmLevel) -> bool {
