@@ -48,7 +48,6 @@ impl<K: RecordKey<K>, V: RecordValue> Compactor<K, V> {
     /// # Panics
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
-    // TODO: Need continuously optimization
     pub fn compact_records_and_build_ssts<D: BlockSet + 'static>(
         upper_records: impl Iterator<Item = (K, ValueEx<V>)>,
         lower_records: impl Iterator<Item = (K, ValueEx<V>)>,
@@ -96,7 +95,7 @@ impl<K: RecordKey<K>, V: RecordValue> Compactor<K, V> {
             }
 
             let new_log = tx_log_store.create_log(to_level.bucket())?;
-            let new_sst = SSTable::build(records_iter, sync_id, &new_log, event_listener)?;
+            let new_sst = SSTable::build(records_iter, sync_id, &new_log, None)?;
 
             created_ssts.push(new_sst);
         }

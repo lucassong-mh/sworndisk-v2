@@ -502,7 +502,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             let records_iter = immut_mem_table.iter();
             let sync_id = immut_mem_table.sync_id();
 
-            let sst = SSTable::build(records_iter, sync_id, &tx_log, &event_listener)?;
+            let sst = SSTable::build(records_iter, sync_id, &tx_log, Some(&event_listener))?;
             self.sst_manager.write().insert(sst, LsmLevel::L0);
             Ok(())
         });
@@ -578,36 +578,17 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
                 return Ok((created_ssts, deleted_ssts));
             }
 
-            let upper_records = {
-                let tx_log = tx_log_store.open_log(upper_sst_id, false)?;
-                let (records, dropped_records) =
-                    upper_sst.access_scan(&tx_log, master_sync_id, false)?;
-                for record in dropped_records {
-                    listener.on_drop_record(&record)?;
-                }
-                records
-            };
+            let upper_records_iter =
+                upper_sst.iter(master_sync_id, false, &tx_log_store, Some(&listener));
 
-            let lower_records_vec = {
-                let mut records_vec = Vec::with_capacity(lower_ssts.len());
-                for (id, sst) in &lower_ssts {
-                    let tx_log = tx_log_store.open_log(*id, false)?;
-                    let (records, dropped_records) =
-                        sst.access_scan(&tx_log, master_sync_id, false)?;
-                    for record in dropped_records {
-                        listener.on_drop_record(&record)?;
-                    }
-                    records_vec.push(records);
-                }
-                records_vec
-            };
+            let lower_records_iter = lower_ssts.iter().flat_map(|(_, sst)| {
+                sst.iter(master_sync_id, false, &tx_log_store, Some(&listener))
+            });
 
             // Compact records then build new SSTs
             created_ssts = Compactor::compact_records_and_build_ssts(
-                upper_records.into_iter(),
-                lower_records_vec
-                    .into_iter()
-                    .flat_map(|records| records.into_iter()),
+                upper_records_iter,
+                lower_records_iter,
                 &tx_log_store,
                 &listener,
                 to_level,
@@ -679,22 +660,15 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
                 // master id, who may have unsynced records
                 for (&id, sst) in ssts.filter(|(_, sst)| sst.sync_id() == master_sync_id) {
                     // Collect synced records only
-                    let log = tx_log_store.open_log(id, false)?;
-                    let (synced_records, dropped_records) =
-                        sst.access_scan(&log, master_sync_id, true)?;
-                    for (k, v) in dropped_records {
-                        listener.on_drop_record(&(k, v))?;
-                    }
+                    let mut synced_records_iter = sst
+                        .iter(master_sync_id, true, &tx_log_store, Some(&listener))
+                        .peekable();
 
-                    if !synced_records.is_empty() {
+                    if synced_records_iter.peek().is_some() {
                         // Create new migrated SST
                         let new_log = tx_log_store.create_log(bucket)?;
-                        let new_sst = SSTable::build(
-                            synced_records.into_iter(),
-                            master_sync_id,
-                            &new_log,
-                            &listener,
-                        )?;
+                        let new_sst =
+                            SSTable::build(synced_records_iter, master_sync_id, &new_log, None)?;
                         created_ssts.push((new_sst, level));
                         continue;
                     }

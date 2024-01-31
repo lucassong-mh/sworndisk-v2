@@ -997,7 +997,7 @@ impl TxLogStoreState {
         self.bucket_table
             .get_mut(from_bucket)
             .map(|bucket| bucket.log_ids.remove(&log_id))
-            .expect("`from_bucket` must exist");
+            .expect("`from_bucket` '{from_bucket:?}' must exist");
 
         if let Some(bucket) = self.bucket_table.get_mut(&to_bucket) {
             bucket.log_ids.insert(log_id);

@@ -76,18 +76,26 @@ struct BlockQueryIter<'a, K, V> {
     phantom: PhantomData<(K, V)>,
 }
 
-/// Accessor for a whole scan
-struct ScanAccessor<K, V> {
+/// Accessor for a whole table scan.
+struct ScanAccessor<'a, K, V> {
     all_synced: bool,
     discard_unsynced: bool,
-    dropped_records: Vec<(K, V)>,
+    event_listener: Option<&'a Arc<dyn TxEventListener<K, V>>>,
 }
 
 /// Iterator over `RecordBlock` for scan purpose.
 struct BlockScanIter<'a, K, V> {
-    block: &'a RecordBlock,
+    block: Arc<RecordBlock>,
     offset: usize,
-    accessor: &'a mut ScanAccessor<K, V>,
+    accessor: ScanAccessor<'a, K, V>,
+}
+
+/// Iterator over `SSTable`.
+pub(super) struct SstIter<'a, K, V, D> {
+    sst: &'a SSTable<K, V>,
+    curr_nth_index: usize,
+    curr_rb_iter: Option<BlockScanIter<'a, K, V>>,
+    tx_log_store: &'a Arc<TxLogStore<D>>,
 }
 
 /// Format on a `TxLog`:
@@ -230,16 +238,55 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         target_pos: BlockId,
         tx_log_store: &Arc<TxLogStore<D>>,
     ) -> Result<Arc<RecordBlock>> {
-        let cached_rb_opt = self.cache.write().get(&target_pos).cloned();
-        let target_rb = if let Some(cached_rb) = cached_rb_opt {
-            cached_rb
+        let mut cache = self.cache.write();
+        if let Some(cached_rb) = cache.get(&target_pos) {
+            Ok(cached_rb.clone())
         } else {
             let mut rb = RecordBlock::from_buf(vec![0; RECORD_BLOCK_SIZE]);
+            // TODO: Avoid opening the log on every call.
             let tx_log = tx_log_store.open_log(self.id, false)?;
-            tx_log.read(target_pos, BufMut::try_from(&mut rb.buf[..]).unwrap())?;
-            Arc::new(rb)
+            tx_log.read(target_pos, BufMut::try_from(rb.as_mut_slice()).unwrap())?;
+            let rb = Arc::new(rb);
+            cache.put(target_pos, rb.clone());
+            Ok(rb)
+        }
+    }
+
+    /// Return the iterator over this `SSTable`.
+    /// The given `event_listener` (optional) is used on dropping records
+    /// during iteration.
+    ///
+    /// # Panics
+    ///
+    /// This method must be called within a TX. Otherwise, this method panics.
+    pub fn iter<'a, D: BlockSet + 'static>(
+        &'a self,
+        sync_id: SyncID,
+        discard_unsynced: bool,
+        tx_log_store: &'a Arc<TxLogStore<D>>,
+        event_listener: Option<&'a Arc<dyn TxEventListener<K, V>>>,
+    ) -> SstIter<'a, K, V, D> {
+        let all_synced = sync_id > self.sync_id();
+        let accessor = ScanAccessor {
+            all_synced,
+            discard_unsynced,
+            event_listener,
         };
-        Ok(target_rb)
+
+        let first_rb = self
+            .target_record_block(self.footer.index[0].pos, tx_log_store)
+            .unwrap();
+
+        SstIter {
+            sst: self,
+            curr_nth_index: 0,
+            curr_rb_iter: Some(BlockScanIter {
+                block: first_rb,
+                offset: 0,
+                accessor,
+            }),
+            tx_log_store,
+        }
     }
 
     /// Scan the whole SST and collect all records.
@@ -249,51 +296,21 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
     /// This method must be called within a TX. Otherwise, this method panics.
     pub fn access_scan<D: BlockSet + 'static>(
         &self,
-        tx_log: &Arc<TxLog<D>>,
         sync_id: SyncID,
         discard_unsynced: bool,
-    ) -> Result<(Vec<(K, ValueEx<V>)>, Vec<(K, V)>)> {
-        debug_assert!(sync_id >= self.sync_id());
-        let all_synced = sync_id > self.sync_id();
-        let mut records = Vec::with_capacity(self.footer.meta.total_records as _);
-
-        let mut accessor = ScanAccessor {
-            all_synced,
-            discard_unsynced,
-            dropped_records: Vec::new(),
-        };
-
-        let mut curr_rb_opt = None;
-        for entry in self.footer.index.iter() {
-            let record_block_opt = self.cache.write().get(&entry.pos).cloned();
-            let record_block = if let Some(record_block) = record_block_opt.as_ref() {
-                record_block
-            } else {
-                if curr_rb_opt.is_none() {
-                    let _ = curr_rb_opt.insert(RecordBlock::from_buf(vec![0u8; RECORD_BLOCK_SIZE]));
-                }
-                tx_log.read(
-                    entry.pos,
-                    BufMut::try_from(curr_rb_opt.as_mut().unwrap().as_mut_slice()).unwrap(),
-                )?;
-                curr_rb_opt.as_ref().unwrap()
-            };
-
-            let iter = BlockScanIter {
-                block: record_block,
-                offset: 0,
-                accessor: &mut accessor,
-            };
-            records.extend(iter);
-        }
-
-        debug_assert!(records.is_sorted_by_key(|(k, _)| k));
-        Ok((records, accessor.dropped_records))
+        tx_log_store: &Arc<TxLogStore<D>>,
+        event_listener: Option<&Arc<dyn TxEventListener<K, V>>>,
+    ) -> Result<Vec<(K, ValueEx<V>)>> {
+        let all_records = self
+            .iter(sync_id, discard_unsynced, tx_log_store, event_listener)
+            .collect();
+        Ok(all_records)
     }
 
     /// Building functions below
 
     /// Builds a SST given a bunch of records, after the SST becomes immutable.
+    /// The given `event_listener` (optional) is used on adding records.
     ///
     /// # Panics
     ///
@@ -302,7 +319,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         records_iter: I,
         sync_id: SyncID,
         tx_log: &'a Arc<TxLog<D>>,
-        listener: &Arc<dyn TxEventListener<K, V>>,
+        event_listener: Option<&'a Arc<dyn TxEventListener<K, V>>>,
     ) -> Result<Self>
     where
         I: Iterator<Item = KVex>,
@@ -311,7 +328,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
     {
         let mut cache = LruCache::new(NonZeroUsize::new(Self::CACHE_CAP).unwrap());
         let (total_records, index_vec) =
-            Self::build_record_blocks(records_iter, tx_log, &mut cache, listener)?;
+            Self::build_record_blocks(records_iter, tx_log, &mut cache, event_listener)?;
         let footer = Self::build_footer::<D>(index_vec, total_records, sync_id, tx_log)?;
 
         Ok(Self {
@@ -328,7 +345,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         records_iter: I,
         tx_log: &'a TxLog<D>,
         cache: &mut LruCache<BlockId, Arc<RecordBlock>>,
-        listener: &Arc<dyn TxEventListener<K, V>>,
+        event_listener: Option<&'a Arc<dyn TxEventListener<K, V>>>,
     ) -> Result<(usize, Vec<IndexEntry<K>>)>
     where
         I: Iterator<Item = KVex>,
@@ -360,14 +377,18 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
                     block_buf.push(RecordFlag::Synced as u8);
                     block_buf.extend_from_slice(v.as_bytes());
 
-                    listener.on_add_record(&(&key, v))?;
+                    if let Some(listener) = event_listener {
+                        listener.on_add_record(&(&key, v))?;
+                    }
                     inner_offset += 1 + Self::V_SIZE;
                 }
                 ValueEx::Unsynced(v) => {
                     block_buf.push(RecordFlag::Unsynced as u8);
                     block_buf.extend_from_slice(v.as_bytes());
 
-                    listener.on_add_record(&(&key, v))?;
+                    if let Some(listener) = event_listener {
+                        listener.on_add_record(&(&key, v))?;
+                    }
                     inner_offset += 1 + Self::V_SIZE;
                 }
                 ValueEx::SyncedAndUnsynced(sv, usv) => {
@@ -375,8 +396,10 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
                     block_buf.extend_from_slice(sv.as_bytes());
                     block_buf.extend_from_slice(usv.as_bytes());
 
-                    listener.on_add_record(&(&key, sv))?;
-                    listener.on_add_record(&(&key, usv))?;
+                    if let Some(listener) = event_listener {
+                        listener.on_add_record(&(&key, sv))?;
+                        listener.on_add_record(&(&key, usv))?;
+                    }
                     inner_offset += Self::MAX_RECORD_SIZE;
                 }
             }
@@ -597,10 +620,10 @@ impl<K: RecordKey<K>, V: RecordValue> Iterator for BlockScanIter<'_, K, V> {
         let mut offset = self.offset;
         let buf_slice = &self.block.buf;
         let (k_size, v_size) = (SSTable::<K, V>::K_SIZE, SSTable::<K, V>::V_SIZE);
-        let (all_synced, discard_unsynced, dropped_records) = (
+        let (all_synced, discard_unsynced, event_listener) = (
             self.accessor.all_synced,
             self.accessor.discard_unsynced,
-            &mut self.accessor.dropped_records,
+            &self.accessor.event_listener,
         );
 
         let (key, value_ex) = loop {
@@ -629,7 +652,9 @@ impl<K: RecordKey<K>, V: RecordValue> Iterator for BlockScanIter<'_, K, V> {
                     if all_synced {
                         ValueEx::Synced(v)
                     } else if discard_unsynced {
-                        dropped_records.push((key, v));
+                        if let Some(listener) = event_listener {
+                            listener.on_drop_record(&(key, v)).unwrap();
+                        }
                         continue;
                     } else {
                         ValueEx::Unsynced(v)
@@ -641,10 +666,14 @@ impl<K: RecordKey<K>, V: RecordValue> Iterator for BlockScanIter<'_, K, V> {
                     let usv = V::from_bytes(&buf_slice[offset..offset + v_size]);
                     offset += v_size;
                     if all_synced {
-                        dropped_records.push((key, sv));
+                        if let Some(listener) = event_listener {
+                            listener.on_drop_record(&(key, sv)).unwrap();
+                        }
                         ValueEx::Synced(usv)
                     } else if discard_unsynced {
-                        dropped_records.push((key, usv));
+                        if let Some(listener) = event_listener {
+                            listener.on_drop_record(&(key, usv)).unwrap();
+                        }
                         ValueEx::Synced(sv)
                     } else {
                         ValueEx::SyncedAndUnsynced(sv, usv)
@@ -657,6 +686,42 @@ impl<K: RecordKey<K>, V: RecordValue> Iterator for BlockScanIter<'_, K, V> {
 
         self.offset = offset;
         Some((key, value_ex))
+    }
+}
+
+impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> Iterator for SstIter<'_, K, V, D> {
+    type Item = (K, ValueEx<V>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Iterate over the current record block first
+        if let Some(next) = self.curr_rb_iter.as_mut().unwrap().next() {
+            return Some(next);
+        }
+
+        let curr_rb_iter = self.curr_rb_iter.take().unwrap();
+
+        self.curr_nth_index += 1;
+        // Iteration goes to the end
+        if self.curr_nth_index >= self.sst.footer.meta.num_index as _ {
+            return None;
+        }
+
+        // Ready to iterate the next record block
+        let next_pos = self.sst.footer.index[self.curr_nth_index].pos;
+        let next_rb = self
+            .sst
+            .target_record_block(next_pos, self.tx_log_store)
+            .unwrap();
+
+        let mut next_rb_iter = BlockScanIter {
+            block: next_rb,
+            offset: 0,
+            accessor: curr_rb_iter.accessor,
+        };
+        let next = next_rb_iter.next()?;
+
+        let _ = self.curr_rb_iter.insert(next_rb_iter);
+        Some(next)
     }
 }
 
