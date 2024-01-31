@@ -258,7 +258,7 @@ impl ChunkAllocState {
         self.alloc_map.set(free_chunk_id, true);
         self.free_count -= 1;
 
-        // Keep the invariance that all free chunk IDs are no less than `min_free``
+        // Keep the invariance that all free chunk IDs are no less than `min_free`
         self.min_free = free_chunk_id + 1;
 
         Some(free_chunk_id)

@@ -1,7 +1,16 @@
 //! MemTable.
 use super::{AsKV, RangeQueryCtx, RecordKey, RecordValue, SyncID};
-use crate::os::BTreeMap;
+use crate::os::{BTreeMap, Mutex, RwLock, RwLockReadGuard};
 use crate::prelude::*;
+
+use core::fmt;
+
+/// Manager for an active `MemTable` and an immutable `MemTable`
+/// in a `TxLsmTree`.
+pub(super) struct MemTableManager<K: RecordKey<K>, V> {
+    active: Mutex<MemTable<K, V>>,
+    immutable: RwLock<MemTable<K, V>>, // Read-only most of the time
+}
 
 /// MemTable for LSM-Tree.
 ///
@@ -26,8 +35,84 @@ pub(super) enum ValueEx<V> {
     SyncedAndUnsynced(V, V),
 }
 
+impl<K: RecordKey<K>, V: RecordValue> MemTableManager<K, V> {
+    /// Creates a new `MemTableManager` given the current master sync ID,
+    /// the capacity and the callback when dropping records.
+    pub fn new(
+        sync_id: SyncID,
+        capacity: usize,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
+    ) -> Self {
+        let active = Mutex::new(MemTable::new(
+            capacity,
+            sync_id,
+            on_drop_record_in_memtable.clone(),
+        ));
+        let immutable = RwLock::new(MemTable::new(capacity, sync_id, on_drop_record_in_memtable));
+
+        Self { active, immutable }
+    }
+
+    /// Gets the target value of the given key from the `MemTable`s.
+    pub fn get(&self, key: &K) -> Option<V> {
+        if let Some(value) = self.active.lock().get(key) {
+            return Some(value.clone());
+        }
+
+        if let Some(value) = self.immutable.read().get(key) {
+            return Some(value.clone());
+        }
+
+        None
+    }
+
+    /// Gets the range of values from the `MemTable`s.
+    pub fn get_range(&self, range_query_ctx: &mut RangeQueryCtx<K, V>) -> bool {
+        let is_completed = self.active.lock().get_range(range_query_ctx);
+        if is_completed {
+            return is_completed;
+        }
+
+        self.immutable.read().get_range(range_query_ctx)
+    }
+
+    /// Puts a key-value pair into the active `MemTable`, and
+    /// return whether the active `MemTable` is full.
+    pub fn put(&self, key: K, value: V) -> bool {
+        let mut active = self.active.lock();
+        let _ = active.put(key, value);
+        active.at_capacity()
+    }
+
+    /// Sync the active `MemTable` with the given sync ID.
+    pub fn sync(&self, sync_id: SyncID) -> Result<()> {
+        self.active.lock().sync(sync_id)
+    }
+
+    /// Switch two `MemTable`s. Should only be called in a situation that
+    /// the active `MemTable` becomes full and the immutable `MemTable` is
+    /// ready to be cleared.
+    pub fn switch(&self) -> Result<()> {
+        let mut active = self.active.lock();
+        let sync_id = active.sync_id();
+        let mut immutable = self.immutable.write();
+        immutable.clear();
+        debug_assert!(immutable.is_empty());
+
+        core::mem::swap(&mut *active, &mut *immutable);
+
+        // Update sync ID of the switched active `MemTable`
+        active.sync(sync_id)
+    }
+
+    /// Gets the immutable `MemTable` instance (read-only).
+    pub fn immutable_memtable(&self) -> RwLockReadGuard<MemTable<K, V>> {
+        self.immutable.read()
+    }
+}
+
 impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
-    /// Create a new `MemTable`, given the capacity, the current sync ID,
+    /// Creates a new `MemTable`, given the capacity, the current sync ID,
     /// and the callback of dropping record.
     pub fn new(
         cap: usize,
@@ -43,7 +128,7 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
         }
     }
 
-    /// Get the target value given the key.
+    /// Gets the target value given the key.
     pub fn get(&self, key: &K) -> Option<&V> {
         let value_ex = self.table.get(key)?;
         Some(value_ex.get())
@@ -61,7 +146,7 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
         range_query_ctx.is_completed()
     }
 
-    /// Put a new K-V record to the table, drop the old one.
+    /// Puts a new K-V record to the table, drop the old one.
     pub fn put(&mut self, key: K, value: V) -> Option<V> {
         if let Some(value_ex) = self.table.get_mut(&key) {
             if let Some(dropped) = value_ex.put(value) {
@@ -75,7 +160,7 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
             }
         }
 
-        self.table.insert(key, ValueEx::new(value));
+        let _ = self.table.insert(key, ValueEx::new(value));
         self.size += 1;
         None
     }
@@ -133,7 +218,7 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
 }
 
 impl<V: RecordValue> ValueEx<V> {
-    /// Create a new unsynced value.
+    /// Creates a new unsynced value.
     fn new(value: V) -> Self {
         Self::Unsynced(value)
     }
@@ -147,7 +232,7 @@ impl<V: RecordValue> ValueEx<V> {
         }
     }
 
-    /// Put a new value, return the replaced value if any.
+    /// Puts a new value, return the replaced value if any.
     fn put(&mut self, value: V) -> Option<V> {
         let existed = core::mem::take(self);
 
@@ -190,5 +275,14 @@ impl<V: RecordValue> ValueEx<V> {
 impl<V: RecordValue> Default for ValueEx<V> {
     fn default() -> Self {
         Self::Unsynced(V::new_uninit())
+    }
+}
+
+impl<K: RecordKey<K>, V: RecordValue> Debug for MemTableManager<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemTableManager")
+            .field("active_memtable_size", &self.active.lock().size())
+            .field("immutable_memtable_size", &self.immutable_memtable().size())
+            .finish()
     }
 }
