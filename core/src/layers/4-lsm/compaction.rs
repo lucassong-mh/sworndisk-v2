@@ -31,7 +31,9 @@ impl<K: RecordKey<K>, V: RecordValue> Compactor<K, V> {
 
     /// Record current compaction thread handle.
     pub fn record_handle(&self, handle: JoinHandle<Result<()>>) {
-        let _ = self.handle.lock().insert(handle);
+        let mut handle_opt = self.handle.lock();
+        assert!(handle_opt.is_none());
+        let _ = handle_opt.insert(handle);
     }
 
     /// Wait until the compaction is finished.

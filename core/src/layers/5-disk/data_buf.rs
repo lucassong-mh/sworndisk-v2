@@ -6,15 +6,31 @@ use crate::prelude::*;
 
 use core::ops::RangeInclusive;
 
+// TODO: Put them into os module
+use std::sync::{Condvar, Mutex as StdMutex};
+
 /// A buffer to cache data blocks before they are written to disk.
 #[derive(Debug)]
 pub(super) struct DataBuf {
     buf: Mutex<BTreeMap<RecordKey, Arc<DataBlock>>>,
     cap: usize,
+    cvar: Condvar,
+    state: StdMutex<BufState>,
 }
 
 /// User data block.
 pub(super) struct DataBlock([u8; BLOCK_SIZE]);
+
+/// State of the `DataBuf`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BufState {
+    /// `Vacant` indicates the buffer has available space,
+    /// the buffer is ready to read or write.
+    Vacant,
+    /// `Full` indicates the buffer capacity is run out,
+    /// the buffer cannot write, can read.
+    Full,
+}
 
 impl DataBuf {
     /// Create a new empty data buffer with a given capacity.
@@ -22,6 +38,8 @@ impl DataBuf {
         Self {
             buf: Mutex::new(BTreeMap::new()),
             cap,
+            cvar: Condvar::new(),
+            state: StdMutex::new(BufState::Vacant),
         }
     }
 
@@ -56,9 +74,21 @@ impl DataBuf {
     /// whether the buffer is full after insertion.
     pub fn put(&self, key: RecordKey, buf: BufRef) -> bool {
         debug_assert_eq!(buf.nblocks(), 1);
+
+        let mut state = self.state.lock().unwrap();
+        while *state != BufState::Vacant {
+            state = self.cvar.wait(state).unwrap();
+        }
+        debug_assert_eq!(*state, BufState::Vacant);
+
         let mut data_buf = self.buf.lock();
         let _ = data_buf.insert(key, DataBlock::from_buf(buf));
-        data_buf.len() >= self.cap
+
+        let is_full = data_buf.len() >= self.cap;
+        if is_full {
+            *state = BufState::Full;
+        }
+        is_full
     }
 
     /// Return the number of data blocks of the buffer.
@@ -78,7 +108,13 @@ impl DataBuf {
 
     /// Empty the buffer.
     pub fn clear(&self) {
+        let mut state = self.state.lock().unwrap();
+        debug_assert_eq!(*state, BufState::Full);
+
         self.buf.lock().clear();
+
+        *state = BufState::Vacant;
+        self.cvar.notify_all();
     }
 
     /// Return all the buffered data blocks.

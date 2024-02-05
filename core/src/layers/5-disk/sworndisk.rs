@@ -16,7 +16,7 @@ use crate::layers::lsm::{
     AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, TxEventListener,
     TxEventListenerFactory, TxLsmTree, TxType,
 };
-use crate::os::{Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac};
+use crate::os::{Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, Mutex};
 use crate::prelude::*;
 use crate::tx::Tx;
 
@@ -52,6 +52,8 @@ struct DiskInner<D: BlockSet> {
     root_key: Key,
     /// Whether `SwornDisk` is dropped.
     is_dropped: AtomicBool,
+    /// Scope lock.
+    lock: Mutex<()>,
 }
 
 impl<D: BlockSet + 'static> SwornDisk<D> {
@@ -131,6 +133,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 data_buf: DataBuf::new(DATA_BUF_CAP),
                 root_key,
                 is_dropped: AtomicBool::new(false),
+                lock: Mutex::new(()),
             }),
         };
 
@@ -176,6 +179,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 tx_log_store,
                 root_key,
                 is_dropped: AtomicBool::new(false),
+                lock: Mutex::new(()),
             }),
         };
 
@@ -400,20 +404,34 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     /// The block contents reside in a single contiguous buffer.
     pub fn write(&self, mut lba: Lba, buf: BufRef) -> Result<usize> {
         let nblocks = buf.nblocks();
-        let mut buf_at_capacity = false;
-        // Write block contents to `DataBuf` directly
-        for block_buf in buf.iter() {
-            buf_at_capacity = self.data_buf.put(RecordKey { lba }, block_buf);
-            lba += 1;
-        }
         AmplificationMetrics::acc_data_amount(AmpType::Write, nblocks);
 
-        if !buf_at_capacity {
-            return Ok(nblocks);
+        // Write block contents to `DataBuf` directly
+        for block_buf in buf.iter() {
+            let buf_at_capacity = self.data_buf.put(RecordKey { lba }, block_buf);
+
+            // Flush all data blocks in `DataBuf` to disk if it's full
+            if buf_at_capacity {
+                self.flush_data_buf()?;
+            }
+            lba += 1;
         }
 
+        Ok(nblocks)
+    }
+
+    /// Write multiple blocks at a logical block address on the device.
+    /// The block contents reside in several scattered buffers.
+    pub fn writev(&self, mut lba: Lba, bufs: &[BufRef]) -> Result<()> {
+        for buf in bufs {
+            self.write(lba, *buf)?;
+            lba += buf.nblocks();
+        }
+        Ok(())
+    }
+
+    fn flush_data_buf(&self) -> Result<()> {
         let timer = LatencyMetrics::start_timer(ReqType::Write, "data", "");
-        // Flush all data blocks in `DataBuf` to disk if it's full
         let records = self.write_blocks_from_data_buf()?;
         LatencyMetrics::stop_timer(timer);
 
@@ -425,16 +443,6 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         LatencyMetrics::stop_timer(timer);
 
         self.data_buf.clear();
-        Ok(nblocks)
-    }
-
-    /// Write multiple blocks at a logical block address on the device.
-    /// The block contents reside in several scattered buffers.
-    pub fn writev(&self, mut lba: Lba, bufs: &[BufRef]) -> Result<()> {
-        for buf in bufs {
-            self.write(lba, *buf)?;
-            lba += buf.nblocks();
-        }
         Ok(())
     }
 
@@ -487,6 +495,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
     /// Sync all cached data in the device to the storage medium for durability.
     pub fn sync(&self) -> Result<()> {
+        let _lock = self.lock.lock();
         let timer = LatencyMetrics::start_timer(ReqType::Sync, "data", "");
 
         self.write_blocks_from_data_buf()?;
