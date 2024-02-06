@@ -24,7 +24,7 @@ use pod::Pod;
 // TODO: Use `Thread` in os module
 use std::thread;
 
-/// XXX: Master sync ID should be stored in external trusted storage
+// XXX: Master sync ID should be stored in external trusted storage
 pub static MASTER_SYNC_ID: AtomicU64 = AtomicU64::new(0);
 pub type SyncID = u64;
 
@@ -52,7 +52,7 @@ pub enum LsmLevel {
     L2,
     L3,
     L4,
-    L5, // Include over 300 TB data
+    L5, // Cover over 10 TB data (over 800 TB user data from L5)
 }
 
 /// Manager of all `SSTable`s from every level in a `TxLsmTree`.
@@ -123,6 +123,7 @@ pub(super) trait AsKVex<K, V> {
     fn value_ex(&self) -> &ValueEx<V>;
 }
 
+/// Capacity of each `MemTable` and `SSTable`.
 pub(super) const MEMTABLE_CAPACITY: usize = 2097152; // 96 MiB MemTable, cover 8 GiB data // TBD
 pub(super) const SSTABLE_CAPACITY: usize = MEMTABLE_CAPACITY;
 

@@ -76,7 +76,9 @@ use lru::LruCache;
 use pod::Pod;
 use serde::{Deserialize, Serialize};
 
+/// The ID of a TX log.
 pub type TxLogId = RawLogId;
+/// The name of a TX log bucket.
 type BucketName = String;
 
 /// A store of transactional logs.
@@ -105,10 +107,8 @@ pub struct Superblock {
 }
 
 impl<D: BlockSet + 'static> TxLogStore<D> {
-    /// Formats the disk to create a new instance of `TxLogStore`.
-    ///
-    /// Each instance will be assigned a unique, automatically-generated root
-    /// key.
+    /// Formats the disk to create a new instance of `TxLogStore`,
+    /// with the given root key.
     pub fn format(disk: D, root_key: Key) -> Result<Self> {
         let total_nblocks = disk.nblocks();
         let (log_store_nblocks, journal_nblocks) =
@@ -153,6 +153,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         ))
     }
 
+    /// Calculate the number of blocks required for the store and the journal.
     fn calc_store_and_journal_nblocks(total_nblocks: usize) -> (usize, usize) {
         let log_store_nblocks = {
             let nblocks = (total_nblocks - 1) * 9 / 10;
@@ -160,7 +161,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         };
         let journal_nblocks = total_nblocks - 1 - log_store_nblocks;
         debug_assert!(1 + log_store_nblocks + journal_nblocks <= total_nblocks);
-        (log_store_nblocks, journal_nblocks)
+        (log_store_nblocks, journal_nblocks) // TBD
     }
 
     /// Recovers an existing `TxLogStore` from a disk using the given key.
@@ -202,6 +203,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         Ok(tx_log_store)
     }
 
+    /// Constructs a `TxLogStore` from its parts.
     fn from_parts(
         state: TxLogStoreState,
         root_key: Key,
@@ -296,6 +298,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         new_self
     }
 
+    /// Record all dirty logs in the current TX.
     fn update_dirty_log_metas(current_tx: &mut CurrentTx<'_>) -> Result<()> {
         let dirty_logs: Vec<(TxLogId, Arc<TxLogInner<D>>)> =
             current_tx.data_with(|open_log_table: &OpenLogTable<D>| {
@@ -368,7 +371,6 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         }
     }
 
-    // TODO: Need performance improvement
     fn apply_log_caches(state: &mut State, current_tx: &mut CurrentTx<'_>) {
         // Apply per-TX log cache
         current_tx.data_mut_with(|open_cache_table: &mut OpenLogCache| {
@@ -376,6 +378,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
                 return;
             }
 
+            // TODO: May need performance improvement
             let log_caches = &mut state.log_caches;
             for (log_id, open_cache) in open_cache_table.open_table.iter_mut() {
                 let log_cache = log_caches.get_mut(log_id).unwrap();
@@ -390,36 +393,6 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
                 });
             }
         });
-    }
-
-    /// Lists the IDs of all logs in a bucket.
-    ///
-    /// # Panics
-    ///
-    /// This method must be called within a TX. Otherwise, this method panics.
-    pub fn list_logs_in(&self, bucket_name: &str) -> Result<Vec<TxLogId>> {
-        let state = self.state.lock();
-        let mut log_id_set = state.persistent.list_logs_in(bucket_name)?;
-        let current_tx = self.tx_provider.current();
-        current_tx.data_with(|store_edit: &TxLogStoreEdit| {
-            for (&log_id, log_edit) in &store_edit.edit_table {
-                match log_edit {
-                    TxLogEdit::Create(create) => {
-                        if create.bucket == bucket_name {
-                            log_id_set.insert(log_id);
-                        }
-                    }
-                    TxLogEdit::Append(_) | TxLogEdit::Move(_) => {}
-                    TxLogEdit::Delete => {
-                        if log_id_set.contains(&log_id) {
-                            log_id_set.remove(&log_id);
-                        }
-                    }
-                }
-            }
-        });
-        let log_id_vec = log_id_set.into_iter().collect::<Vec<_>>();
-        Ok(log_id_vec)
     }
 
     /// Creates a new, empty log in a bucket.
@@ -560,6 +533,36 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         Ok(inner_log)
     }
 
+    /// Lists the IDs of all logs in a bucket.
+    ///
+    /// # Panics
+    ///
+    /// This method must be called within a TX. Otherwise, this method panics.
+    pub fn list_logs_in(&self, bucket_name: &str) -> Result<Vec<TxLogId>> {
+        let state = self.state.lock();
+        let mut log_id_set = state.persistent.list_logs_in(bucket_name)?;
+        let current_tx = self.tx_provider.current();
+        current_tx.data_with(|store_edit: &TxLogStoreEdit| {
+            for (&log_id, log_edit) in &store_edit.edit_table {
+                match log_edit {
+                    TxLogEdit::Create(create) => {
+                        if create.bucket == bucket_name {
+                            log_id_set.insert(log_id);
+                        }
+                    }
+                    TxLogEdit::Append(_) | TxLogEdit::Move(_) => {}
+                    TxLogEdit::Delete => {
+                        if log_id_set.contains(&log_id) {
+                            log_id_set.remove(&log_id);
+                        }
+                    }
+                }
+            }
+        });
+        let log_id_vec = log_id_set.into_iter().collect::<Vec<_>>();
+        Ok(log_id_vec)
+    }
+
     /// Opens the log with the maximum ID in a bucket.
     ///
     /// # Panics
@@ -661,6 +664,7 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         self.tx_provider.current()
     }
 
+    /// Syncs all the data managed by `TxLogStore` for persistence.
     pub fn sync(&self) -> Result<()> {
         self.raw_log_store.sync()?;
         self.journal.lock().flush()?;
@@ -688,6 +692,7 @@ impl Superblock {
         self.journal_area_meta.total_nblocks() + self.chunk_area_nblocks
     }
 
+    /// Reads the `Superblock` on the disk with the given root key.
     pub fn open<D: BlockSet>(disk: &D, root_key: &Key) -> Result<Self> {
         let mut cipher = Buf::alloc(1)?;
         disk.read(0, cipher.as_mut())?;
@@ -703,7 +708,8 @@ impl Superblock {
         ))
     }
 
-    fn persist<D: BlockSet>(&self, disk: &D, root_key: &Key) -> Result<()> {
+    /// Persists the `Superblock` on the disk with the given root key.
+    pub fn persist<D: BlockSet>(&self, disk: &D, root_key: &Key) -> Result<()> {
         let mut plain = Buf::alloc(1)?;
         plain.as_mut_slice()[..Self::SUPERBLOCK_SIZE].copy_from_slice(self.as_bytes());
         let mut cipher = Buf::alloc(1)?;
@@ -729,6 +735,7 @@ pub struct TxLog<D> {
     can_append: bool,
 }
 
+/// Inner structures of a transactional log.
 struct TxLogInner<D> {
     log_id: TxLogId,
     tx_id: TxId,
@@ -817,6 +824,7 @@ impl<D: BlockSet + 'static> Debug for TxLog<D> {
     }
 }
 
+/// Node cache for `CryptoLog` in a transactional log.
 pub struct CryptoLogCache {
     inner: Mutex<CacheInner>,
     log_id: TxLogId,
@@ -826,7 +834,6 @@ pub struct CryptoLogCache {
 pub(super) struct CacheInner {
     pub lru_cache: LruCache<BlockId, Arc<dyn Any + Send + Sync>>,
 }
-// TODO: Give the cache a bound
 
 impl CryptoLogCache {
     fn new(log_id: TxLogId, tx_provider: &Arc<TxProvider>) -> Self {
@@ -842,6 +849,7 @@ impl CryptoLogCache {
 impl NodeCache for CryptoLogCache {
     fn get(&self, pos: BlockId) -> Option<Arc<dyn Any + Send + Sync>> {
         let mut current = self.tx_provider.current();
+
         let value_opt = current.data_mut_with(|open_cache_table: &mut OpenLogCache| {
             open_cache_table
                 .open_table
@@ -863,6 +871,7 @@ impl NodeCache for CryptoLogCache {
         value: Arc<dyn Any + Send + Sync>,
     ) -> Option<Arc<dyn Any + Send + Sync>> {
         let mut current = self.tx_provider.current();
+
         current.data_mut_with(|open_cache_table: &mut OpenLogCache| {
             debug_assert!(open_cache_table.open_table.contains_key(&self.log_id));
             let open_cache = open_cache_table.open_table.get_mut(&self.log_id).unwrap();
@@ -873,6 +882,7 @@ impl NodeCache for CryptoLogCache {
 
 impl CacheInner {
     pub fn new() -> Self {
+        // TODO: Give the cache a bound
         Self {
             lru_cache: LruCache::unbounded(),
         }
@@ -969,6 +979,28 @@ impl TxLogStoreState {
         }
     }
 
+    pub fn find_log(&self, log_id: TxLogId) -> Result<&TxLogEntry> {
+        self.log_table
+            .get(&log_id)
+            .ok_or(Error::with_msg(NotFound, "log entry not found"))
+    }
+
+    pub fn list_logs_in(&self, bucket: &str) -> Result<HashSet<TxLogId>> {
+        let bucket = self
+            .bucket_table
+            .get(bucket)
+            .ok_or(Error::with_msg(NotFound, "bucket not found"))?;
+        Ok(bucket.log_ids.clone())
+    }
+
+    pub fn list_all_logs(&self) -> impl Iterator<Item = TxLogId> + '_ {
+        self.log_table.iter().map(|(id, _)| *id)
+    }
+
+    pub fn contains_log(&self, log_id: TxLogId) -> bool {
+        self.log_table.contains_key(&log_id)
+    }
+
     pub fn append_log(&mut self, log_id: TxLogId, root_mht: RootMhtMeta) {
         let entry = self.log_table.get_mut(&log_id).unwrap();
         entry.root_mht = root_mht;
@@ -1006,28 +1038,6 @@ impl TxLogStoreState {
                 },
             );
         }
-    }
-
-    pub fn find_log(&self, log_id: TxLogId) -> Result<&TxLogEntry> {
-        self.log_table
-            .get(&log_id)
-            .ok_or(Error::with_msg(NotFound, "log entry not found"))
-    }
-
-    pub fn list_logs_in(&self, bucket: &str) -> Result<HashSet<TxLogId>> {
-        let bucket = self
-            .bucket_table
-            .get(bucket)
-            .ok_or(Error::with_msg(NotFound, "bucket not found"))?;
-        Ok(bucket.log_ids.clone())
-    }
-
-    pub fn list_all_logs(&self) -> impl Iterator<Item = TxLogId> + '_ {
-        self.log_table.iter().map(|(id, _)| *id)
-    }
-
-    pub fn contains_log(&self, log_id: TxLogId) -> bool {
-        self.log_table.contains_key(&log_id)
     }
 }
 

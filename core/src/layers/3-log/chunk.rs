@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 /// The ID of a chunk.
 pub type ChunkId = usize;
 
-/// Number of blocks of a chunk
+/// Number of blocks of a chunk.
 pub const CHUNK_NBLOCKS: usize = 1024;
 /// The chunk size is a multiple of the block size.
 pub const CHUNK_SIZE: usize = CHUNK_NBLOCKS * BLOCK_SIZE;
@@ -221,8 +221,8 @@ impl Debug for ChunkAlloc {
 /// The persistent state of a chunk allocator.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChunkAllocState {
-    // A bitmap where each bit indicates whether a corresponding chunk has been
-    // allocated.
+    // A bitmap where each bit indicates whether a corresponding chunk
+    // has been allocated.
     alloc_map: BitMap,
     // The number of free chunks.
     free_count: usize,
@@ -379,7 +379,7 @@ impl Edit<ChunkAllocState> for ChunkAllocEdit {
                     // Journal's state also needs to be updated
                     if !state.is_chunk_allocated(chunk_id) {
                         let _allocated_id = state.alloc().unwrap();
-                        // `_allocated_id` may not be equal to `chunk_id`due to concurrent TXs,
+                        // `_allocated_id` may not be equal to `chunk_id` due to concurrent TXs,
                         // but eventually the state will be consistent
                     }
 

@@ -10,7 +10,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use pod::Pod;
 use serde::{Deserialize, Serialize};
 
+/// The bucket name of block validity table.
 const BUCKET_BLOCK_VALIDITY_TABLE: &str = "BVT";
+/// The bucket name of block alloc/dealloc log.
 const BUCKET_BLOCK_ALLOC_LOG: &str = "BAL";
 
 /// Block validity table. Global allocator for `SwornDisk`,

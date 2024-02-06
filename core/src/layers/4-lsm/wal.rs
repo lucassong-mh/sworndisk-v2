@@ -11,6 +11,7 @@ use core::fmt::Debug;
 use core::mem::size_of;
 use pod::Pod;
 
+/// The bucket name of WAL.
 pub(super) const BUCKET_WAL: &str = "WAL";
 
 /// WAL append TX in `TxLsmTree`.
@@ -24,11 +25,11 @@ pub(super) struct WalAppendTx<D> {
 }
 
 struct WalTxInner<D> {
-    /// Cache ongoing TX and appended WAL.
+    /// Ongoing TX and appended WAL.
     wal_tx_and_log: Option<(RefCell<Tx>, Arc<TxLog<D>>)>,
-    /// Cache current log ID of WAL for later discard.
+    /// Current log ID of WAL for later discard.
     log_id: Option<TxLogId>,
-    /// Cache appended WAL and sync record.
+    /// A buffer to cache appended records.
     record_buf: Vec<u8>,
     /// Store for WALs.
     tx_log_store: Arc<TxLogStore<D>>,
