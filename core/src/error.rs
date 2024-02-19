@@ -23,6 +23,8 @@ pub enum Errno {
     EncryptFailed,
     /// Decryption operation failed.
     DecryptFailed,
+    /// MAC (Message Authentication Code) mismatched.
+    MacMismatched,
     /// Not aligned to `BLOCK_SIZE`.
     NotBlockSizeAligned,
     /// Try lock failed.

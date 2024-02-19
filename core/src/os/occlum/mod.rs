@@ -7,19 +7,27 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 use pod::Pod;
 use serde::{Deserialize, Serialize};
-use sgx_rand::{thread_rng, Rng};
+use sgx_rand::{thread_rng, Rng as _};
 use sgx_tcrypto::{rsgx_aes_ctr_decrypt, rsgx_aes_ctr_encrypt};
 use sgx_tcrypto::{rsgx_rijndael128GCM_decrypt, rsgx_rijndael128GCM_encrypt};
 use sgx_tstd::alloc::{alloc, dealloc, Layout};
 use sgx_types::sgx_status_t;
 
+pub use hashbrown::{HashMap, HashSet};
 /// Reuse lock implementation of crate spin.
 pub use spin::{
     Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockUpgradableGuard, RwLockWriteGuard,
 };
 
+pub use sgx_tstd::boxed::Box;
+pub use sgx_tstd::collections::BTreeMap;
+pub use sgx_tstd::string::{String, ToString};
+pub use sgx_tstd::sync::{Arc, Weak};
+#[macro_use]
+pub use sgx_tstd::vec::Vec;
+
 /// Unique ID for the OS thread.
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(transparent)]
 pub struct Tid(sgx_libc::pthread_t);
 
@@ -49,9 +57,8 @@ impl PageAllocator {
         // SAFETY: the `count` is non-zero, then the `Layout` has
         // non-zero size, so it's safe.
         unsafe {
-            let layout =
-                alloc::alloc::Layout::from_size_align_unchecked(len * PAGE_SIZE, PAGE_SIZE);
-            let ptr = alloc::alloc::alloc(layout);
+            let layout = Layout::from_size_align_unchecked(len * PAGE_SIZE, PAGE_SIZE);
+            let ptr = alloc(layout);
             NonNull::new(ptr)
         }
     }
@@ -69,9 +76,8 @@ impl PageAllocator {
     unsafe fn dealloc(ptr: *mut u8, len: usize) {
         // SAFETY: the caller should pass valid `ptr` and `len`.
         unsafe {
-            let layout =
-                alloc::alloc::Layout::from_size_align_unchecked(len * PAGE_SIZE, PAGE_SIZE);
-            alloc::alloc::dealloc(ptr, layout)
+            let layout = Layout::from_size_align_unchecked(len * PAGE_SIZE, PAGE_SIZE);
+            dealloc(ptr, layout)
         }
     }
 }
@@ -212,7 +218,7 @@ impl crate::util::Aead for Aead {
     ) -> Result<Self::Mac> {
         let mut mac = AeadMac::default();
 
-        rsgx_rijndael128GCM_encrypt(key, input, iv, aad, output, &mut mac)
+        rsgx_rijndael128GCM_encrypt(&key.0, input, &iv.0, aad, output, &mut mac.0)
             .map_err(|_| Error::new(Errno::EncryptFailed))?;
 
         Ok(mac)
@@ -227,10 +233,14 @@ impl crate::util::Aead for Aead {
         mac: &Self::Mac,
         output: &mut [u8],
     ) -> Result<()> {
-        rsgx_rijndael128GCM_decrypt(key, input, iv, aad, mac, output)
-            .map_err(|_| Error::new(Errno::DecryptFailed))?;
-
-        Ok(())
+        rsgx_rijndael128GCM_decrypt(&key.0, input, &iv.0, aad, &mac.0, output).map_err(|e| {
+            let errno = if e == sgx_status_t::SGX_ERROR_MAC_MISMATCH {
+                Errno::MacMismatched
+            } else {
+                Errno::DecryptFailed
+            };
+            Error::new(errno)
+        })
     }
 }
 
@@ -261,10 +271,11 @@ impl crate::util::Skcipher for Skcipher {
         iv: &Self::Iv,
         output: &mut [u8],
     ) -> Result<()> {
-        let ctr_inc_bits = 128u32;
-        rsgx_aes_ctr_encrypt(key, input, iv, ctr_inc_bits, output)?;
+        let ctr_inc_bits = 128_u32;
+        let mut ctr = *iv;
 
-        Ok(())
+        rsgx_aes_ctr_encrypt(&key.0, input, &mut ctr.0, ctr_inc_bits, output)
+            .map_err(|_| Error::new(Errno::EncryptFailed))
     }
 
     fn decrypt(
@@ -274,9 +285,16 @@ impl crate::util::Skcipher for Skcipher {
         iv: &Self::Iv,
         output: &mut [u8],
     ) -> Result<()> {
-        let ctr_inc_bits = 128u32;
-        rsgx_aes_ctr_decrypt(key, input, iv, ctr_inc_bits, output)?;
+        let ctr_inc_bits = 128_u32;
+        let mut ctr = *iv;
 
-        Ok(())
+        rsgx_aes_ctr_decrypt(&key.0, input, &mut ctr.0, ctr_inc_bits, output).map_err(|e| {
+            let errno = if e == sgx_status_t::SGX_ERROR_MAC_MISMATCH {
+                Errno::MacMismatched
+            } else {
+                Errno::DecryptFailed
+            };
+            Error::new(errno)
+        })
     }
 }

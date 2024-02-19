@@ -22,6 +22,9 @@ use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use pod::Pod;
 
 // TODO: Use `Thread` in os module
+#[cfg(feature = "occlum")]
+use sgx_tstd::thread;
+#[cfg(feature = "std")]
 use std::thread;
 
 // XXX: Master sync ID should be stored in external trusted storage

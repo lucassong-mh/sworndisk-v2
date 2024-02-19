@@ -4,6 +4,9 @@ use crate::os::{BTreeMap, Mutex, RwLock, RwLockReadGuard};
 use crate::prelude::*;
 
 // TODO: Put them into os module
+#[cfg(feature = "occlum")]
+use sgx_tstd::sync::{SgxCondvar as Condvar, SgxMutex as StdMutex};
+#[cfg(feature = "std")]
 use std::sync::{Condvar, Mutex as StdMutex};
 
 /// Manager for an active `MemTable` and an immutable `MemTable`

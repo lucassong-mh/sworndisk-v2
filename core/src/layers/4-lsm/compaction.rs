@@ -11,6 +11,9 @@ use crate::prelude::*;
 use core::marker::PhantomData;
 
 // TODO: Use `Thread` in os module
+#[cfg(feature = "occlum")]
+use sgx_tstd::thread::JoinHandle;
+#[cfg(feature = "std")]
 use std::thread::JoinHandle;
 
 /// A `Compactor` is currently used for asynchronous compaction

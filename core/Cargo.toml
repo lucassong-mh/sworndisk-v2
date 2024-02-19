@@ -25,6 +25,12 @@ serde = { version = "=1.0.188", default-features = false, features = ["alloc", "
 spin = { version = "0.9.8", optional = true }
 static_assertions = "1.1.0"
 
+sgx_tstd = { git = "https://github.com/apache/teaclave-sgx-sdk.git", features = ["backtrace", "thread"], optional = true }
+sgx_libc = { git = "https://github.com/apache/teaclave-sgx-sdk.git", optional = true }
+sgx_rand = { git = "https://github.com/apache/teaclave-sgx-sdk.git", optional = true }
+sgx_tcrypto = { git = "https://github.com/apache/teaclave-sgx-sdk.git", optional = true }
+sgx_types = { git = "https://github.com/apache/teaclave-sgx-sdk.git", optional = true }
+
 [lib]
 doctest = false
 
@@ -32,17 +38,9 @@ doctest = false
 default = ["std"]
 jinux = []
 linux = ["bindings"]
-occlum = []
+occlum = ["sgx_tstd", "sgx_libc", "sgx_rand", "sgx_tcrypto", "sgx_types", "spin"]
 std = ["log", "openssl", "spin"]
 
 [[bench]]
 name = "bench"
 harness = false
-
-# [target.'cfg(target_env = "sgx")'.dependencies]
-# sgx_alloc = {git = "https://github.com/occlum/incubator-teaclave-sgx-sdk", branch = "sgx_2.20_for_occlum"}
-# sgx_libc = {git = "https://github.com/occlum/incubator-teaclave-sgx-sdk", branch = "sgx_2.20_for_occlum"}
-# sgx_rand = {git = "https://github.com/occlum/incubator-teaclave-sgx-sdk", branch = "sgx_2.20_for_occlum"}
-# sgx_tcrypto = {git = "https://github.com/occlum/incubator-teaclave-sgx-sdk", branch = "sgx_2.20_for_occlum"}
-# sgx_tstd = {git = "https://github.com/occlum/incubator-teaclave-sgx-sdk", branch = "sgx_2.20_for_occlum", features = ["backtrace"]}
-# sgx_types = {git = "https://github.com/occlum/incubator-teaclave-sgx-sdk", branch = "sgx_2.20_for_occlum"}

@@ -196,7 +196,12 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     /// Spawn a task to continuously handle any queued block I/O requests.
     fn spawn_bio_req_handler(&self) {
         let inner = self.inner.clone();
+        #[cfg(feature = "std")]
         let _ = std::thread::spawn(move || {
+            inner.handle_bio_reqs_looped();
+        });
+        #[cfg(feature = "occlum")]
+        let _ = sgx_tstd::thread::spawn(move || {
             inner.handle_bio_reqs_looped();
         });
     }
