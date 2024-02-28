@@ -92,9 +92,11 @@ type BucketName = String;
 #[derive(Clone)]
 pub struct TxLogStore<D> {
     state: Arc<Mutex<State>>,
-    root_key: Key,
     raw_log_store: Arc<RawLogStore<D>>,
     journal: Arc<Mutex<Journal<D>>>,
+    superblock: Superblock,
+    root_key: Key,
+    raw_disk: D,
     tx_provider: Arc<TxProvider>,
 }
 
@@ -104,7 +106,9 @@ pub struct TxLogStore<D> {
 pub struct Superblock {
     journal_area_meta: EditJournalMeta,
     chunk_area_nblocks: usize,
+    magic: u64,
 }
+const MAGIC_NUMBER: u64 = 0x1130_0821;
 
 impl<D: BlockSet + 'static> TxLogStore<D> {
     /// Formats the disk to create a new instance of `TxLogStore`,
@@ -141,14 +145,16 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         let superblock = Superblock {
             journal_area_meta: journal.lock().meta(),
             chunk_area_nblocks: log_store_nblocks,
+            magic: MAGIC_NUMBER,
         };
-        superblock.persist(&disk, &root_key)?;
 
         Ok(Self::from_parts(
             tx_log_store_state,
-            root_key,
             raw_log_store,
             journal,
+            superblock,
+            root_key,
+            disk,
             tx_provider,
         ))
     }
@@ -194,9 +200,11 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
         );
         let tx_log_store = TxLogStore::from_parts(
             all_state.tx_log_store.clone(),
-            root_key,
             raw_log_store,
             Arc::new(Mutex::new(journal)),
+            superblock,
+            root_key,
+            disk,
             tx_provider,
         );
 
@@ -206,9 +214,11 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     /// Constructs a `TxLogStore` from its parts.
     fn from_parts(
         state: TxLogStoreState,
-        root_key: Key,
         raw_log_store: Arc<RawLogStore<D>>,
         journal: Arc<Mutex<Journal<D>>>,
+        superblock: Superblock,
+        root_key: Key,
+        raw_disk: D,
         tx_provider: Arc<TxProvider>,
     ) -> Self {
         let new_self = {
@@ -224,9 +234,11 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
 
             Self {
                 state: Arc::new(Mutex::new(State::new(state, lazy_deletes, log_caches))),
-                root_key,
                 raw_log_store,
                 journal: journal.clone(),
+                superblock,
+                root_key,
+                raw_disk,
                 tx_provider: tx_provider.clone(),
             }
         };
@@ -668,6 +680,10 @@ impl<D: BlockSet + 'static> TxLogStore<D> {
     pub fn sync(&self) -> Result<()> {
         self.raw_log_store.sync()?;
         self.journal.lock().flush()?;
+
+        self.superblock
+            .persist(&self.raw_disk.subset(0..1)?, &self.root_key)?;
+        self.raw_disk.flush()?;
         Ok(())
     }
 }
@@ -703,9 +719,13 @@ impl Superblock {
             &SkcipherIv::new_zeroed(),
             plain.as_mut_slice(),
         )?;
-        Ok(Superblock::from_bytes(
-            &plain.as_slice()[..Self::SUPERBLOCK_SIZE],
-        ))
+
+        let superblock = Superblock::from_bytes(&plain.as_slice()[..Self::SUPERBLOCK_SIZE]);
+        if superblock.magic != MAGIC_NUMBER {
+            Err(Error::with_msg(InvalidArgs, "open superblock failed"))
+        } else {
+            Ok(superblock)
+        }
     }
 
     /// Persists the `Superblock` on the disk with the given root key.
@@ -845,7 +865,6 @@ impl CryptoLogCache {
     }
 }
 
-// TODO: Test cache hitness
 impl NodeCache for CryptoLogCache {
     fn get(&self, pos: BlockId) -> Option<Arc<dyn Any + Send + Sync>> {
         let mut current = self.tx_provider.current();
@@ -882,7 +901,7 @@ impl NodeCache for CryptoLogCache {
 
 impl CacheInner {
     pub fn new() -> Self {
-        // TODO: Give the cache a bound
+        // TODO: Give the cache a bound then test cache hit rate
         Self {
             lru_cache: LruCache::unbounded(),
         }
@@ -1395,7 +1414,7 @@ mod tests {
         tx.commit()?;
 
         // Recover the tx log store
-        let _ = tx_log_store.journal.lock().flush();
+        tx_log_store.sync()?;
         drop(tx_log_store);
         let recovered_store = TxLogStore::recover(disk, root_key)?;
 

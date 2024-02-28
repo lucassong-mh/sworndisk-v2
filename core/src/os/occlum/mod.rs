@@ -11,6 +11,7 @@ use sgx_rand::{thread_rng, Rng as _};
 use sgx_tcrypto::{rsgx_aes_ctr_decrypt, rsgx_aes_ctr_encrypt};
 use sgx_tcrypto::{rsgx_rijndael128GCM_decrypt, rsgx_rijndael128GCM_encrypt};
 use sgx_tstd::alloc::{alloc, dealloc, Layout};
+use sgx_tstd::thread;
 use sgx_types::sgx_status_t;
 
 pub use hashbrown::{HashMap, HashSet};
@@ -29,7 +30,7 @@ pub use sgx_tstd::vec::Vec;
 /// Unique ID for the OS thread.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(transparent)]
-pub struct Tid(sgx_libc::pthread_t);
+pub struct Tid(thread::ThreadId);
 
 /// A struct to get the current thread id.
 pub struct CurrentThread;
@@ -37,7 +38,7 @@ pub struct CurrentThread;
 impl CurrentThread {
     pub fn id() -> Tid {
         // SAFETY: calling extern "C" to get the thread_id is safe here.
-        Tid(unsafe { sgx_libc::pthread_self() })
+        Tid(thread::current().id())
     }
 }
 

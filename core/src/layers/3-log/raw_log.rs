@@ -224,7 +224,8 @@ impl<D: BlockSet> RawLogStore<D> {
 
     /// Syncs all the data managed by `RawLogStore` for persistence.
     pub fn sync(&self) -> Result<()> {
-        self.disk.flush()
+        // Do nothing, leave the disk sync to `TxLogStore`
+        Ok(())
     }
 
     /// Creates a new raw log with a new log ID.

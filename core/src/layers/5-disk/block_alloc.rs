@@ -2,7 +2,7 @@
 use super::sworndisk::Hba;
 use crate::layers::bio::{BlockSet, Buf, BufRef, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogStore};
-use crate::os::{HashMap, Mutex};
+use crate::os::{BTreeMap, Mutex};
 use crate::prelude::*;
 use crate::util::BitMap;
 
@@ -27,7 +27,7 @@ pub(super) struct AllocTable {
 /// `TxLog`s of bucket `BAL` during TX for durability and recovery purpose.
 pub(super) struct BlockAlloc<D> {
     alloc_table: Arc<AllocTable>, // Point to the global allocator
-    diff_table: Mutex<HashMap<Hba, AllocDiff>>, // Per-TX diffs of block validity
+    diff_table: Mutex<BTreeMap<Hba, AllocDiff>>, // Per-TX diffs of block validity
     store: Arc<TxLogStore<D>>,    // Store for diff log from L3
     diff_log: Mutex<Option<Arc<TxLog<D>>>>, // Opened diff log (currently not in-use)
 }
@@ -175,7 +175,7 @@ impl AllocTable {
     pub fn do_compaction<D: BlockSet + 'static>(&self, store: &Arc<TxLogStore<D>>) -> Result<()> {
         // Serialize the block validity table
         let bitmap = self.bitmap.lock();
-        const BITMAP_MAX_SIZE: usize = 1024 * BLOCK_SIZE; // TBD
+        const BITMAP_MAX_SIZE: usize = 1280 * BLOCK_SIZE; // TBD
         let mut ser_buf = vec![0; BITMAP_MAX_SIZE];
         let ser_len = postcard::to_slice::<BitMap>(&bitmap, &mut ser_buf)
             .map_err(|_| Error::with_msg(InvalidArgs, "serialize block validity table failed"))?
@@ -221,7 +221,7 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
     pub fn new(alloc_table: Arc<AllocTable>, store: Arc<TxLogStore<D>>) -> Self {
         Self {
             alloc_table,
-            diff_table: Mutex::new(HashMap::new()),
+            diff_table: Mutex::new(BTreeMap::new()),
             store,
             diff_log: Mutex::new(None),
         }
@@ -270,16 +270,21 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
             return Ok(());
         }
 
-        let mut diff_buf = Vec::with_capacity(BLOCK_SIZE);
+        let diff_log = self.store.create_log(BUCKET_BLOCK_ALLOC_LOG)?;
+
+        const MAX_BUF_SIZE: usize = 1024 * BLOCK_SIZE;
+        let mut diff_buf = Vec::with_capacity(MAX_BUF_SIZE);
         for (block_id, block_diff) in diff_table.iter() {
             diff_buf.push(*block_diff as u8);
             diff_buf.extend_from_slice(block_id.as_bytes());
-        }
-        drop(diff_table);
-        diff_buf.resize(align_up(diff_buf.len(), BLOCK_SIZE), 0);
 
-        let diff_log = self.store.create_log(BUCKET_BLOCK_ALLOC_LOG)?;
-        diff_log.append(BufRef::try_from(&diff_buf[..]).unwrap())
+            if diff_buf.len() + 9 > MAX_BUF_SIZE {
+                diff_buf.resize(align_up(diff_buf.len(), BLOCK_SIZE), 0);
+                diff_log.append(BufRef::try_from(&diff_buf[..]).unwrap())?;
+                diff_buf.clear();
+            }
+        }
+        Ok(())
     }
 
     /// Update the metadata in diff table to the in-memory block validity table.

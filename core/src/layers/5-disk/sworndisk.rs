@@ -52,8 +52,8 @@ struct DiskInner<D: BlockSet> {
     root_key: Key,
     /// Whether `SwornDisk` is dropped.
     is_dropped: AtomicBool,
-    /// Scope lock.
-    lock: Mutex<()>,
+    /// Scope lock for exclusive sync operation.
+    sync_region: Mutex<()>,
 }
 
 impl<D: BlockSet + 'static> SwornDisk<D> {
@@ -83,7 +83,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
     /// Write a specified number of blocks at a logical block address on the device.
     /// The block contents reside in a single contiguous buffer.
-    pub fn write(&self, lba: Lba, buf: BufRef) -> Result<usize> {
+    pub fn write(&self, lba: Lba, buf: BufRef) -> Result<()> {
         self.inner.write(lba, buf)
     }
 
@@ -95,7 +95,11 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
     /// Sync all cached data in the device to the storage medium for durability.
     pub fn sync(&self) -> Result<()> {
-        self.inner.sync()
+        self.inner.sync()?;
+
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Sync completed");
+        Ok(())
     }
 
     /// Creates a new `SwornDisk` on the given disk, with the root encryption key.
@@ -133,12 +137,14 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 data_buf: DataBuf::new(DATA_BUF_CAP),
                 root_key,
                 is_dropped: AtomicBool::new(false),
-                lock: Mutex::new(()),
+                sync_region: Mutex::new(()),
             }),
         };
 
         // new_self.spawn_bio_req_handler();
 
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Created successfully!");
         // XXX: Would `disk::drop()` bring unexpected behavior?
         Ok(new_self)
     }
@@ -179,12 +185,14 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 tx_log_store,
                 root_key,
                 is_dropped: AtomicBool::new(false),
-                lock: Mutex::new(()),
+                sync_region: Mutex::new(()),
             }),
         };
 
         // opened_self.spawn_bio_req_handler();
 
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk] Opened successfully!");
         Ok(opened_self)
     }
 
@@ -407,9 +415,8 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
     /// Write a specified number of blocks at a logical block address on the device.
     /// The block contents reside in a single contiguous buffer.
-    pub fn write(&self, mut lba: Lba, buf: BufRef) -> Result<usize> {
-        let nblocks = buf.nblocks();
-        AmplificationMetrics::acc_data_amount(AmpType::Write, nblocks);
+    pub fn write(&self, mut lba: Lba, buf: BufRef) -> Result<()> {
+        AmplificationMetrics::acc_data_amount(AmpType::Write, buf.nblocks());
 
         // Write block contents to `DataBuf` directly
         for block_buf in buf.iter() {
@@ -421,8 +428,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             }
             lba += 1;
         }
-
-        Ok(nblocks)
+        Ok(())
     }
 
     /// Write multiple blocks at a logical block address on the device.
@@ -500,7 +506,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
     /// Sync all cached data in the device to the storage medium for durability.
     pub fn sync(&self) -> Result<()> {
-        let _lock = self.lock.lock();
+        let _guard = self.sync_region.lock();
         let timer = LatencyMetrics::start_timer(ReqType::Sync, "data", "");
 
         self.write_blocks_from_data_buf()?;

@@ -10,7 +10,7 @@ pub(crate) use crate::{return_errno, return_errno_with_msg};
 pub(crate) type Result<T> = core::result::Result<T, Error>;
 
 pub(crate) use core::fmt::{self, Debug};
-#[cfg(feature = "std")]
+#[cfg(not(feature = "linux"))]
 pub(crate) use log::{debug, error, info, trace, warn};
 
 #[cfg(feature = "linux")]

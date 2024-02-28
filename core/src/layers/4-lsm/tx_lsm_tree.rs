@@ -18,7 +18,7 @@ use crate::tx::Tx;
 
 use core::hash::Hash;
 use core::ops::{Add, RangeInclusive, Sub};
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use pod::Pod;
 
 // TODO: Use `Thread` in os module
@@ -279,8 +279,8 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
         recov_self.do_migration_tx()?;
 
-        #[cfg(feature = "std")]
-        debug!("[TxLsmTree Recovery] {recov_self:?}");
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk TxLsmTree] Recovery completed: {recov_self:?}");
         Ok(recov_self)
     }
 
@@ -534,8 +534,8 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         tx.commit()?;
         event_listener.on_tx_commit();
 
-        #[cfg(feature = "std")]
-        debug!("[TxLsmTree Minor Compaction] {self:?}");
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk TxLsmTree] Minor Compaction completed: {self:?}");
         Ok(())
     }
 
@@ -635,8 +635,8 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             self.do_major_compaction(to_level.lower_level())?;
         }
 
-        #[cfg(feature = "std")]
-        debug!("[TxLsmTree Major Compaction] {self:?}");
+        #[cfg(not(feature = "linux"))]
+        debug!("[SwornDisk TxLsmTree] Major Compaction completed: {self:?}");
         Ok(())
     }
 

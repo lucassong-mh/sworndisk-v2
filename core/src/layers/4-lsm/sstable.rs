@@ -58,8 +58,9 @@ struct IndexEntry<K> {
 struct RecordBlock {
     buf: Vec<u8>,
 }
+const RECORD_BLOCK_NBLOCKS: usize = 32;
 /// The size of a `RecordBlock`, which is a multiple of `BLOCK_SIZE`.
-const RECORD_BLOCK_SIZE: usize = 32 * BLOCK_SIZE;
+const RECORD_BLOCK_SIZE: usize = RECORD_BLOCK_NBLOCKS * BLOCK_SIZE;
 
 /// Accessor for a query.
 enum QueryAccessor<K> {
@@ -107,6 +108,7 @@ pub(super) struct SstIter<'a, K, V, D> {
 impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
     const K_SIZE: usize = size_of::<K>();
     const V_SIZE: usize = size_of::<V>();
+    const MIN_RECORD_SIZE: usize = BID_SIZE + 1 + Self::V_SIZE;
     const MAX_RECORD_SIZE: usize = BID_SIZE + 1 + 2 * Self::V_SIZE;
     const INDEX_ENTRY_SIZE: usize = BID_SIZE + 2 * Self::K_SIZE;
     const CACHE_CAP: usize = 1024;
@@ -416,7 +418,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
             build_one_record_block(&index_entry, &mut block_buf, tx_log, cache)?;
             index_vec.push(index_entry);
 
-            pos += 1;
+            pos += RECORD_BLOCK_NBLOCKS;
             inner_offset = 0;
             block_buf.clear();
         }
@@ -494,21 +496,29 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
     /// This method must be called within a TX. Otherwise, this method panics.
     pub fn from_log<D: BlockSet + 'static>(tx_log: &Arc<TxLog<D>>) -> Result<Self> {
         let nblocks = tx_log.nblocks();
+
         let mut rbuf = Buf::alloc(1)?;
         // Load footer block (last block)
         tx_log.read(nblocks - 1, rbuf.as_mut())?;
-
         let meta = FooterMeta::from_bytes(&rbuf.as_slice()[BLOCK_SIZE - FOOTER_META_SIZE..]);
+
         let mut rbuf = Buf::alloc(meta.index_nblocks as _)?;
         tx_log.read(nblocks - meta.index_nblocks as usize, rbuf.as_mut())?;
         let mut index = Vec::with_capacity(meta.num_index as _);
+        let mut cache = LruCache::new(NonZeroUsize::new(Self::CACHE_CAP).unwrap());
+        let mut record_block = vec![0; RECORD_BLOCK_SIZE];
         for i in 0..meta.num_index as _ {
             let buf =
                 &rbuf.as_slice()[i * Self::INDEX_ENTRY_SIZE..(i + 1) * Self::INDEX_ENTRY_SIZE];
+
             let pos = BlockId::from_le_bytes(buf[..BID_SIZE].try_into().unwrap());
             let first = K::from_bytes(&buf[BID_SIZE..BID_SIZE + Self::K_SIZE]);
             let last =
                 K::from_bytes(&buf[Self::INDEX_ENTRY_SIZE - Self::K_SIZE..Self::INDEX_ENTRY_SIZE]);
+
+            tx_log.read(pos, BufMut::try_from(&mut record_block[..]).unwrap())?;
+            let _ = cache.put(pos, Arc::new(RecordBlock::from_buf(record_block.clone())));
+
             index.push(IndexEntry { pos, first, last })
         }
 
@@ -516,7 +526,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         Ok(Self {
             id: tx_log.id(),
             footer,
-            cache: Mutex::new(LruCache::new(NonZeroUsize::new(Self::CACHE_CAP).unwrap())),
+            cache: Mutex::new(cache),
             phantom: PhantomData,
         })
     }
@@ -569,7 +579,7 @@ impl<K: RecordKey<K>, V: RecordValue> Iterator for BlockQueryIter<'_, K, V> {
         let buf_slice = &self.block.buf;
         let (k_size, v_size) = (SSTable::<K, V>::K_SIZE, SSTable::<K, V>::V_SIZE);
 
-        if offset + SSTable::<K, V>::MAX_RECORD_SIZE > RECORD_BLOCK_SIZE {
+        if offset + SSTable::<K, V>::MIN_RECORD_SIZE > RECORD_BLOCK_SIZE {
             return None;
         }
 
@@ -626,7 +636,7 @@ impl<K: RecordKey<K>, V: RecordValue> Iterator for BlockScanIter<'_, K, V> {
         );
 
         let (key, value_ex) = loop {
-            if offset + SSTable::<K, V>::MAX_RECORD_SIZE > RECORD_BLOCK_SIZE {
+            if offset + SSTable::<K, V>::MIN_RECORD_SIZE > RECORD_BLOCK_SIZE {
                 return None;
             }
 

@@ -18,22 +18,11 @@ pub(super) struct DataBuf {
     buf: Mutex<BTreeMap<RecordKey, Arc<DataBlock>>>,
     cap: usize,
     cvar: Condvar,
-    state: StdMutex<BufState>,
+    is_full: StdMutex<bool>,
 }
 
 /// User data block.
 pub(super) struct DataBlock([u8; BLOCK_SIZE]);
-
-/// State of the `DataBuf`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BufState {
-    /// `Vacant` indicates the buffer has available space,
-    /// the buffer is ready to read or write.
-    Vacant,
-    /// `Full` indicates the buffer capacity is run out,
-    /// the buffer cannot write, can read.
-    Full,
-}
 
 impl DataBuf {
     /// Create a new empty data buffer with a given capacity.
@@ -42,7 +31,7 @@ impl DataBuf {
             buf: Mutex::new(BTreeMap::new()),
             cap,
             cvar: Condvar::new(),
-            state: StdMutex::new(BufState::Vacant),
+            is_full: StdMutex::new(false),
         }
     }
 
@@ -78,20 +67,19 @@ impl DataBuf {
     pub fn put(&self, key: RecordKey, buf: BufRef) -> bool {
         debug_assert_eq!(buf.nblocks(), 1);
 
-        let mut state = self.state.lock().unwrap();
-        while *state != BufState::Vacant {
-            state = self.cvar.wait(state).unwrap();
+        let mut is_full = self.is_full.lock().unwrap();
+        while *is_full {
+            is_full = self.cvar.wait(is_full).unwrap();
         }
-        debug_assert_eq!(*state, BufState::Vacant);
+        debug_assert!(!*is_full);
 
         let mut data_buf = self.buf.lock();
         let _ = data_buf.insert(key, DataBlock::from_buf(buf));
 
-        let is_full = data_buf.len() >= self.cap;
-        if is_full {
-            *state = BufState::Full;
+        if data_buf.len() >= self.cap {
+            *is_full = true;
         }
-        is_full
+        *is_full
     }
 
     /// Return the number of data blocks of the buffer.
@@ -111,12 +99,12 @@ impl DataBuf {
 
     /// Empty the buffer.
     pub fn clear(&self) {
-        let mut state = self.state.lock().unwrap();
-        debug_assert_eq!(*state, BufState::Full);
+        let mut is_full = self.is_full.lock().unwrap();
+        debug_assert!(*is_full);
 
         self.buf.lock().clear();
 
-        *state = BufState::Vacant;
+        *is_full = false;
         self.cvar.notify_all();
     }
 

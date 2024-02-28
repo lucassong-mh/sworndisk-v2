@@ -9,13 +9,13 @@ use sgx_tstd::sync::{SgxCondvar as Condvar, SgxMutex as StdMutex};
 #[cfg(feature = "std")]
 use std::sync::{Condvar, Mutex as StdMutex};
 
-/// Manager for an active `MemTable` and an immutable `MemTable`
+/// Manager for an mutable `MemTable` and an immutable `MemTable`
 /// in a `TxLsmTree`.
 pub(super) struct MemTableManager<K: RecordKey<K>, V> {
-    active: Mutex<MemTable<K, V>>,
+    mutable: Mutex<MemTable<K, V>>,
     immutable: RwLock<MemTable<K, V>>, // Read-only most of the time
     cvar: Condvar,
-    state: StdMutex<TableState>,
+    is_full: StdMutex<bool>,
 }
 
 /// MemTable for LSM-Tree.
@@ -41,17 +41,6 @@ pub(super) enum ValueEx<V> {
     SyncedAndUnsynced(V, V),
 }
 
-/// State of the `MemTable`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TableState {
-    /// `Vacant` indicates the table has available space,
-    /// the table is ready to read or write.
-    Vacant,
-    /// `Full` indicates the table capacity is run out,
-    /// the table cannot write, can read.
-    Full,
-}
-
 impl<K: RecordKey<K>, V: RecordValue> MemTableManager<K, V> {
     /// Creates a new `MemTableManager` given the current master sync ID,
     /// the capacity and the callback when dropping records.
@@ -60,7 +49,7 @@ impl<K: RecordKey<K>, V: RecordValue> MemTableManager<K, V> {
         capacity: usize,
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
     ) -> Self {
-        let active = Mutex::new(MemTable::new(
+        let mutable = Mutex::new(MemTable::new(
             capacity,
             sync_id,
             on_drop_record_in_memtable.clone(),
@@ -68,16 +57,16 @@ impl<K: RecordKey<K>, V: RecordValue> MemTableManager<K, V> {
         let immutable = RwLock::new(MemTable::new(capacity, sync_id, on_drop_record_in_memtable));
 
         Self {
-            active,
+            mutable,
             immutable,
             cvar: Condvar::new(),
-            state: StdMutex::new(TableState::Vacant),
+            is_full: StdMutex::new(false),
         }
     }
 
     /// Gets the target value of the given key from the `MemTable`s.
     pub fn get(&self, key: &K) -> Option<V> {
-        if let Some(value) = self.active.lock().get(key) {
+        if let Some(value) = self.mutable.lock().get(key) {
             return Some(value.clone());
         }
 
@@ -90,7 +79,7 @@ impl<K: RecordKey<K>, V: RecordValue> MemTableManager<K, V> {
 
     /// Gets the range of values from the `MemTable`s.
     pub fn get_range(&self, range_query_ctx: &mut RangeQueryCtx<K, V>) -> bool {
-        let is_completed = self.active.lock().get_range(range_query_ctx);
+        let is_completed = self.mutable.lock().get_range(range_query_ctx);
         if is_completed {
             return is_completed;
         }
@@ -98,50 +87,49 @@ impl<K: RecordKey<K>, V: RecordValue> MemTableManager<K, V> {
         self.immutable.read().get_range(range_query_ctx)
     }
 
-    /// Puts a key-value pair into the active `MemTable`, and
-    /// return whether the active `MemTable` is full.
+    /// Puts a key-value pair into the mutable `MemTable`, and
+    /// return whether the mutable `MemTable` is full.
     pub fn put(&self, key: K, value: V) -> bool {
-        let mut state = self.state.lock().unwrap();
-        while *state != TableState::Vacant {
-            state = self.cvar.wait(state).unwrap();
+        let mut is_full = self.is_full.lock().unwrap();
+        while *is_full {
+            is_full = self.cvar.wait(is_full).unwrap();
         }
-        debug_assert_eq!(*state, TableState::Vacant);
+        debug_assert!(!*is_full);
 
-        let mut active = self.active.lock();
-        let _ = active.put(key, value);
+        let mut mutable = self.mutable.lock();
+        let _ = mutable.put(key, value);
 
-        let is_full = active.at_capacity();
-        if is_full {
-            *state = TableState::Full;
+        if mutable.at_capacity() {
+            *is_full = true;
         }
-        is_full
+        *is_full
     }
 
-    /// Sync the active `MemTable` with the given sync ID.
+    /// Sync the mutable `MemTable` with the given sync ID.
     pub fn sync(&self, sync_id: SyncID) -> Result<()> {
-        self.active.lock().sync(sync_id)
+        self.mutable.lock().sync(sync_id)
     }
 
     /// Switch two `MemTable`s. Should only be called in a situation that
-    /// the active `MemTable` becomes full and the immutable `MemTable` is
+    /// the mutable `MemTable` becomes full and the immutable `MemTable` is
     /// ready to be cleared.
     pub fn switch(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        debug_assert_eq!(*state, TableState::Full);
+        let mut is_full = self.is_full.lock().unwrap();
+        debug_assert!(*is_full);
 
-        let mut active = self.active.lock();
-        let sync_id = active.sync_id();
+        let mut mutable = self.mutable.lock();
+        let sync_id = mutable.sync_id();
 
         let mut immutable = self.immutable.write();
         immutable.clear();
 
-        core::mem::swap(&mut *active, &mut *immutable);
+        core::mem::swap(&mut *mutable, &mut *immutable);
 
-        debug_assert!(active.is_empty() && immutable.at_capacity());
-        // Update sync ID of the switched active `MemTable`
-        active.sync(sync_id)?;
+        debug_assert!(mutable.is_empty() && immutable.at_capacity());
+        // Update sync ID of the switched mutable `MemTable`
+        mutable.sync(sync_id)?;
 
-        *state = TableState::Vacant;
+        *is_full = false;
         self.cvar.notify_all();
         Ok(())
     }
@@ -207,6 +195,7 @@ impl<K: RecordKey<K>, V: RecordValue> MemTable<K, V> {
     }
 
     /// Sync the table, update the sync ID, drop the replaced one.
+    // TODO: Measure the cost upon frequent syncing
     pub fn sync(&mut self, sync_id: SyncID) -> Result<()> {
         debug_assert!(self.sync_id <= sync_id);
         if self.sync_id == sync_id {
@@ -331,7 +320,7 @@ impl<V: RecordValue> Default for ValueEx<V> {
 impl<K: RecordKey<K>, V: RecordValue> Debug for MemTableManager<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MemTableManager")
-            .field("active_memtable_size", &self.active.lock().size())
+            .field("mutable_memtable_size", &self.mutable.lock().size())
             .field("immutable_memtable_size", &self.immutable_memtable().size())
             .finish()
     }
