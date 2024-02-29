@@ -6,6 +6,8 @@ use crate::os::{BTreeMap, Mutex};
 use crate::prelude::*;
 use crate::util::BitMap;
 
+use core::mem::size_of;
+use core::num::NonZeroUsize;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use pod::Pod;
 use serde::{Deserialize, Serialize};
@@ -20,6 +22,7 @@ const BUCKET_BLOCK_ALLOC_LOG: &str = "BAL";
 pub(super) struct AllocTable {
     bitmap: Mutex<BitMap>,
     next_avail: AtomicUsize,
+    nblocks: NonZeroUsize,
 }
 
 /// Per-TX block allocator in `SwornDisk`, recording validities
@@ -34,18 +37,21 @@ pub(super) struct BlockAlloc<D> {
 
 /// Incremental diff of block validity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
 enum AllocDiff {
     Alloc = 3,
     Dealloc = 7,
     Invalid,
 }
+const DIFF_RECORD_SIZE: usize = size_of::<AllocDiff>() + size_of::<Hba>();
 
 impl AllocTable {
     /// Create a new `AllocTable` given the total number of blocks.
-    pub fn new(nblocks: usize) -> Self {
+    pub fn new(nblocks: NonZeroUsize) -> Self {
         Self {
-            bitmap: Mutex::new(BitMap::repeat(true, nblocks)),
+            bitmap: Mutex::new(BitMap::repeat(true, nblocks.get())),
             next_avail: AtomicUsize::new(0),
+            nblocks,
         }
     }
 
@@ -68,10 +74,15 @@ impl AllocTable {
 
     /// Allocate multiple free slots for a bunch of new blocks, returns `None`
     /// if there are no free slots for all.
-    pub fn alloc_batch(&self, count: usize) -> Option<Vec<Hba>> {
+    pub fn alloc_batch(&self, count: NonZeroUsize) -> Option<Vec<Hba>> {
+        let count = count.get();
         debug_assert!(count > 0);
         let mut bitmap = self.bitmap.lock();
         let mut next_avail = self.next_avail.load(Ordering::Acquire);
+
+        if next_avail + count > self.nblocks.get() {
+            next_avail = bitmap.first_one(0)?;
+        }
 
         let hbas = if let Some(hbas) = bitmap.first_ones(next_avail, count) {
             hbas
@@ -89,7 +100,7 @@ impl AllocTable {
     /// Recover the `AllocTable` from the latest `BVT` log and a bunch of `BAL` logs
     /// in the given store.
     pub fn recover<D: BlockSet + 'static>(
-        nblocks: usize,
+        nblocks: NonZeroUsize,
         store: &Arc<TxLogStore<D>>,
     ) -> Result<Self> {
         let mut tx = store.new_tx();
@@ -108,7 +119,7 @@ impl AllocTable {
                     if e.errno() != NotFound {
                         return Err(e);
                     }
-                    BitMap::repeat(true, nblocks)
+                    BitMap::repeat(true, nblocks.get())
                 }
             };
 
@@ -121,6 +132,7 @@ impl AllocTable {
                 return Ok(Self {
                     bitmap: Mutex::new(bitmap),
                     next_avail: AtomicUsize::new(next_avail),
+                    nblocks,
                 });
             }
             let mut bal_log_ids = bal_log_ids_res?;
@@ -140,7 +152,7 @@ impl AllocTable {
                 bal_log.read(0 as BlockId, buf.as_mut())?;
                 let buf_slice = buf.as_slice();
                 let mut offset = 0;
-                while offset <= log_nblocks * BLOCK_SIZE - 9 {
+                while offset <= log_nblocks * BLOCK_SIZE - DIFF_RECORD_SIZE {
                     let diff = AllocDiff::from(buf_slice[offset]);
                     offset += 1;
                     if diff == AllocDiff::Invalid {
@@ -160,6 +172,7 @@ impl AllocTable {
             Ok(Self {
                 bitmap: Mutex::new(bitmap),
                 next_avail: AtomicUsize::new(next_avail),
+                nblocks,
             })
         });
         let recov_self = res.map_err(|_| {
@@ -171,7 +184,7 @@ impl AllocTable {
         Ok(recov_self)
     }
 
-    /// Persist the block validity table to `BVT` log. GC all exsisted `BAL` logs.
+    /// Persist the block validity table to `BVT` log. GC all existed `BAL` logs.
     pub fn do_compaction<D: BlockSet + 'static>(&self, store: &Arc<TxLogStore<D>>) -> Result<()> {
         // Serialize the block validity table
         let bitmap = self.bitmap.lock();
@@ -278,7 +291,7 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
             diff_buf.push(*block_diff as u8);
             diff_buf.extend_from_slice(block_id.as_bytes());
 
-            if diff_buf.len() + 9 > MAX_BUF_SIZE {
+            if diff_buf.len() + DIFF_RECORD_SIZE > MAX_BUF_SIZE {
                 diff_buf.resize(align_up(diff_buf.len(), BLOCK_SIZE), 0);
                 diff_log.append(BufRef::try_from(&diff_buf[..]).unwrap())?;
                 diff_buf.clear();

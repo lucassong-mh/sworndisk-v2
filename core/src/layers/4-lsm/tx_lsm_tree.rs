@@ -6,7 +6,7 @@
 //! backed by a `TxLogStore`. All operations are executed based
 //! on internal transactions.
 use super::compaction::Compactor;
-use super::mem_table::{MemTable, MemTableManager, ValueEx};
+use super::mem_table::{MemTableManager, ValueEx};
 use super::range_query_ctx::RangeQueryCtx;
 use super::sstable::SSTable;
 use super::wal::{WalAppendTx, BUCKET_WAL};
@@ -979,7 +979,7 @@ mod tests {
         let cnt = 16;
         let mut range_query_ctx = RangeQueryCtx::new(500, cnt);
         tx_lsm_tree.get_range(&mut range_query_ctx).unwrap();
-        let res = range_query_ctx.as_results();
+        let res = range_query_ctx.into_results();
         assert_eq!(res[0].1.hba, 500);
         assert_eq!(res[cnt - 1].1.hba, 500 + cnt - 1);
         Ok(())

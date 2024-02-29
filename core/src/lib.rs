@@ -24,7 +24,7 @@ mod prelude;
 mod tx;
 mod util;
 
-#[cfg(feature = "std")]
+#[cfg(not(feature = "occlum"))]
 extern crate alloc;
 
 #[cfg(feature = "occlum")]
@@ -34,5 +34,5 @@ extern crate sgx_tstd;
 pub use self::error::{Errno, Error};
 pub use self::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef, BLOCK_SIZE};
 pub use self::layers::disk::SwornDisk;
-pub use self::os::{Aead, AeadKey, Rng};
+pub use self::os::{Aead, AeadIv, AeadKey, AeadMac, Rng};
 pub use self::util::{Aead as _, Metrics, RandomInit, Rng as _};

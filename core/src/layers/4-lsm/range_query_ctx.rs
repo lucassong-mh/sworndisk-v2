@@ -69,7 +69,7 @@ impl<K: RecordKey<K>, V: RecordValue> RangeQueryCtx<K, V> {
     }
 
     /// Turn the context into final results.
-    pub fn as_results(self) -> Vec<(K, V)> {
+    pub fn into_results(self) -> Vec<(K, V)> {
         debug_assert!(self.is_completed());
         self.res
     }

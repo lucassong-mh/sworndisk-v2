@@ -20,6 +20,7 @@ use crate::os::{Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, Mutex};
 use crate::prelude::*;
 use crate::tx::Tx;
 
+use core::num::NonZeroUsize;
 use core::ops::{Add, Sub};
 use core::sync::atomic::{AtomicBool, Ordering};
 use pod::Pod;
@@ -108,7 +109,9 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
         let tx_log_store = Arc::new(TxLogStore::format(lsm_tree_disk, root_key.clone())?);
-        let block_validity_table = Arc::new(AllocTable::new(data_disk.nblocks()));
+        let block_validity_table = Arc::new(AllocTable::new(
+            NonZeroUsize::new(data_disk.nblocks()).unwrap(),
+        ));
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
@@ -155,8 +158,10 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
 
         let tx_log_store = Arc::new(TxLogStore::recover(lsm_tree_disk, root_key)?);
-        let block_validity_table =
-            Arc::new(AllocTable::recover(data_disk.nblocks(), &tx_log_store)?);
+        let block_validity_table = Arc::new(AllocTable::recover(
+            NonZeroUsize::new(data_disk.nblocks()).unwrap(),
+            &tx_log_store,
+        )?);
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
@@ -380,7 +385,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         // TODO: `debug_assert!()`, allow empty read
         assert!(range_query_ctx.is_completed());
 
-        let mut res = range_query_ctx.as_results();
+        let mut res = range_query_ctx.into_results();
         let record_batches = {
             res.sort_by(|(_, v1), (_, v2)| v1.hba.cmp(&v2.hba));
             res.group_by(|(_, v1), (_, v2)| v2.hba - v1.hba == 1)
@@ -469,7 +474,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         // Allocate slots for data blocks
         let hbas = self
             .block_validity_table
-            .alloc_batch(num_write)
+            .alloc_batch(NonZeroUsize::new(num_write).unwrap())
             .ok_or(Error::with_msg(OutOfDisk, "block allocation failed"))?;
         debug_assert_eq!(hbas.len(), num_write);
         let hba_batches = hbas.group_by(|hba1, hba2| hba2 - hba1 == 1);
@@ -575,8 +580,6 @@ impl<'a> BufMutVec<'a> {
 }
 
 // SAFETY: `SwornDisk` is concurrency-safe.
-unsafe impl<D: BlockSet> Send for SwornDisk<D> {}
-unsafe impl<D: BlockSet> Sync for SwornDisk<D> {}
 unsafe impl<D: BlockSet> Send for DiskInner<D> {}
 unsafe impl<D: BlockSet> Sync for DiskInner<D> {}
 

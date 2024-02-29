@@ -8,9 +8,9 @@ use core::ops::RangeInclusive;
 
 // TODO: Put them into os module
 #[cfg(feature = "occlum")]
-use sgx_tstd::sync::{SgxCondvar as Condvar, SgxMutex as StdMutex};
+use sgx_tstd::sync::{SgxCondvar as Condvar, SgxMutex as CvarMutex};
 #[cfg(feature = "std")]
-use std::sync::{Condvar, Mutex as StdMutex};
+use std::sync::{Condvar, Mutex as CvarMutex};
 
 /// A buffer to cache data blocks before they are written to disk.
 #[derive(Debug)]
@@ -18,7 +18,7 @@ pub(super) struct DataBuf {
     buf: Mutex<BTreeMap<RecordKey, Arc<DataBlock>>>,
     cap: usize,
     cvar: Condvar,
-    is_full: StdMutex<bool>,
+    is_full: CvarMutex<bool>,
 }
 
 /// User data block.
@@ -31,7 +31,7 @@ impl DataBuf {
             buf: Mutex::new(BTreeMap::new()),
             cap,
             cvar: Condvar::new(),
-            is_full: StdMutex::new(false),
+            is_full: CvarMutex::new(false),
         }
     }
 
@@ -98,9 +98,13 @@ impl DataBuf {
     }
 
     /// Empty the buffer.
+    ///
+    /// # Panics
+    ///
+    /// Attempt to clear a non-full buffer will cause this method to panic.
     pub fn clear(&self) {
         let mut is_full = self.is_full.lock().unwrap();
-        debug_assert!(*is_full);
+        assert!(*is_full);
 
         self.buf.lock().clear();
 

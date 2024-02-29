@@ -54,7 +54,7 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
     pub fn append<K: Pod, V: Pod>(&self, record: &dyn AsKV<K, V>) -> Result<()> {
         let mut inner = self.inner.lock();
         if inner.wal_tx_and_log.is_none() {
-            inner.perpare()?;
+            inner.prepare()?;
         }
 
         {
@@ -98,7 +98,7 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
     pub fn sync(&self, sync_id: SyncID) -> Result<()> {
         let mut inner = self.inner.lock();
         if inner.wal_tx_and_log.is_none() {
-            inner.perpare()?;
+            inner.prepare()?;
         }
         inner.record_buf.push(WalAppendFlag::Sync as u8);
         inner.record_buf.extend_from_slice(&sync_id.to_le_bytes());
@@ -213,7 +213,7 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
 
 impl<D: BlockSet + 'static> WalTxInner<D> {
     /// Prepare phase for an Append TX, mainly to create new TX and WAL.
-    pub fn perpare(&mut self) -> Result<()> {
+    pub fn prepare(&mut self) -> Result<()> {
         debug_assert!(self.wal_tx_and_log.is_none());
         let wal_tx_and_log = {
             let store = &self.tx_log_store;
@@ -246,6 +246,7 @@ impl<D: BlockSet + 'static> WalTxInner<D> {
 
 /// Two content kinds in a WAL.
 #[derive(PartialEq, Eq, Debug)]
+#[repr(u8)]
 enum WalAppendFlag {
     Record = 13,
     Sync = 23,

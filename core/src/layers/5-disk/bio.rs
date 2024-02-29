@@ -35,9 +35,13 @@ impl BioReqQueue {
 
     /// Dequeue a block I/O request.
     pub fn dequeue(&self) -> Option<BioReq> {
-        let req_opt = self.queue.lock().pop();
-        self.num_reqs.fetch_sub(1, Ordering::Release);
-        req_opt
+        if let Some(req) = self.queue.lock().pop() {
+            self.num_reqs.fetch_sub(1, Ordering::Release);
+            Some(req)
+        } else {
+            debug_assert_eq!(self.num_reqs.load(Ordering::Acquire), 0);
+            None
+        }
     }
 
     /// Returns the number of pending requests in this queue.
@@ -295,7 +299,7 @@ impl BlockBuf {
     #[inline]
     pub unsafe fn from_raw_parts(ptr: NonNull<u8>, len: usize) -> Self {
         assert!(
-            len % BLOCK_SIZE == 0,
+            len > 0 && len % BLOCK_SIZE == 0,
             "attempt to create a buffer whose size is not a multiple of block size"
         );
         Self { ptr, len }

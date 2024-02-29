@@ -5,9 +5,9 @@ use crate::prelude::*;
 
 // TODO: Put them into os module
 #[cfg(feature = "occlum")]
-use sgx_tstd::sync::{SgxCondvar as Condvar, SgxMutex as StdMutex};
+use sgx_tstd::sync::{SgxCondvar as Condvar, SgxMutex as CvarMutex};
 #[cfg(feature = "std")]
-use std::sync::{Condvar, Mutex as StdMutex};
+use std::sync::{Condvar, Mutex as CvarMutex};
 
 /// Manager for an mutable `MemTable` and an immutable `MemTable`
 /// in a `TxLsmTree`.
@@ -15,7 +15,7 @@ pub(super) struct MemTableManager<K: RecordKey<K>, V> {
     mutable: Mutex<MemTable<K, V>>,
     immutable: RwLock<MemTable<K, V>>, // Read-only most of the time
     cvar: Condvar,
-    is_full: StdMutex<bool>,
+    is_full: CvarMutex<bool>,
 }
 
 /// MemTable for LSM-Tree.
@@ -60,7 +60,7 @@ impl<K: RecordKey<K>, V: RecordValue> MemTableManager<K, V> {
             mutable,
             immutable,
             cvar: Condvar::new(),
-            is_full: StdMutex::new(false),
+            is_full: CvarMutex::new(false),
         }
     }
 

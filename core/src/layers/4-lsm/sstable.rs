@@ -108,8 +108,9 @@ pub(super) struct SstIter<'a, K, V, D> {
 impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
     const K_SIZE: usize = size_of::<K>();
     const V_SIZE: usize = size_of::<V>();
-    const MIN_RECORD_SIZE: usize = BID_SIZE + 1 + Self::V_SIZE;
-    const MAX_RECORD_SIZE: usize = BID_SIZE + 1 + 2 * Self::V_SIZE;
+    const FLAG_SIZE: usize = size_of::<RecordFlag>();
+    const MIN_RECORD_SIZE: usize = BID_SIZE + Self::FLAG_SIZE + Self::V_SIZE;
+    const MAX_RECORD_SIZE: usize = BID_SIZE + Self::FLAG_SIZE + 2 * Self::V_SIZE;
     const INDEX_ENTRY_SIZE: usize = BID_SIZE + 2 * Self::K_SIZE;
     const CACHE_CAP: usize = 1024;
 
@@ -751,6 +752,7 @@ impl<K: Debug, V> Debug for SSTable<K, V> {
 
 /// Flag bit for records in SSTable.
 #[derive(PartialEq, Eq, Debug)]
+#[repr(u8)]
 enum RecordFlag {
     Synced = 7,
     Unsynced = 11,
