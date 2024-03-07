@@ -166,13 +166,11 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         let inner = &self.0;
         let record = (key, value);
 
-        let timer = LatencyMetrics::start_timer(ReqType::Write, "wal_and_memtable", "lsmtree");
         // Write the record to WAL
         inner.wal_append_tx.append(&record)?;
 
         // Put the record into `MemTable`
         let at_capacity = inner.memtable_manager.put(key, value);
-        LatencyMetrics::stop_timer(timer);
         if !at_capacity {
             return Ok(());
         }
@@ -182,13 +180,11 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         inner.wal_append_tx.commit()?;
 
         // Trigger compaction when `MemTable` is at capacity
-        let timer = LatencyMetrics::start_timer(ReqType::Write, "compaction", "lsmtree");
         inner.compactor.wait_compaction()?;
 
         inner.memtable_manager.switch()?;
 
         self.do_compaction_tx()?;
-        LatencyMetrics::stop_timer(timer);
 
         // Discard current WAL
         inner.wal_append_tx.discard()?; // WAL might be deleted before asynchronous minor compaction completed
@@ -211,21 +207,11 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
                 .read()
                 .require_major_compaction(LsmLevel::L0)
             {
-                let timer =
-                    LatencyMetrics::start_timer(ReqType::Write, "major_compaction", "compaction");
-
                 inner.do_compaction_tx(LsmLevel::L1)?;
-
-                LatencyMetrics::stop_timer(timer);
             }
-
-            let timer =
-                LatencyMetrics::start_timer(ReqType::Write, "minor_compaction", "compaction");
 
             // Do minor compaction
             inner.do_compaction_tx(LsmLevel::L0)?;
-
-            LatencyMetrics::stop_timer(timer);
 
             Ok(())
         });
@@ -358,12 +344,8 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             return Ok(value);
         }
 
-        let timer = LatencyMetrics::start_timer(ReqType::Read, "read_tx", "lsmtree");
-
         // 2. Search from SSTs (do Read TX)
         let value = self.do_read_tx(key)?;
-
-        LatencyMetrics::stop_timer(timer);
 
         Ok(value)
     }
@@ -374,11 +356,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             return Ok(());
         }
 
-        let timer = LatencyMetrics::start_timer(ReqType::Read, "read_range_tx", "lsmtree");
-
         self.do_read_range_tx(range_query_ctx)?;
-
-        LatencyMetrics::stop_timer(timer);
 
         Ok(())
     }
@@ -386,19 +364,12 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
     pub fn sync(&self) -> Result<()> {
         let master_sync_id = MASTER_SYNC_ID.load(Ordering::Acquire) + 1;
 
-        let timer = LatencyMetrics::start_timer(ReqType::Sync, "wal_and_memtable", "lsmtree");
-
         self.wal_append_tx.sync(master_sync_id)?;
 
         self.memtable_manager.sync(master_sync_id)?;
 
-        LatencyMetrics::stop_timer(timer);
-        let timer = LatencyMetrics::start_timer(ReqType::Sync, "tx_log_store", "lsmtree");
-
         self.compactor.wait_compaction()?;
         self.tx_log_store.sync()?;
-
-        LatencyMetrics::stop_timer(timer);
 
         // XXX: Master sync ID should be updated to trusted storage
         MASTER_SYNC_ID.fetch_add(1, Ordering::Release);
@@ -409,7 +380,6 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
     /// Read TX.
     fn do_read_tx(&self, key: &K) -> Result<V> {
-        let timer = LatencyMetrics::start_timer(ReqType::Read, "sst", "read_tx");
         let mut tx = self.tx_log_store.new_tx();
 
         let read_res: Result<_> = tx.context(|| {
@@ -430,15 +400,12 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
             return_errno_with_msg!(NotFound, "target sst not found");
         });
-        LatencyMetrics::stop_timer(timer);
-        let timer = LatencyMetrics::start_timer(ReqType::Read, "tx_commit", "read_tx");
         if read_res.as_ref().is_err_and(|e| e.errno() != NotFound) {
             tx.abort();
             return_errno_with_msg!(TxAborted, "read TX failed")
         }
 
         tx.commit()?;
-        LatencyMetrics::stop_timer(timer);
 
         read_res
     }
@@ -446,7 +413,6 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
     /// Read Range TX.
     fn do_read_range_tx(&self, range_query_ctx: &mut RangeQueryCtx<K, V>) -> Result<()> {
         debug_assert!(!range_query_ctx.is_completed());
-        let timer = LatencyMetrics::start_timer(ReqType::Read, "sst", "read_range_tx");
         let mut tx = self.tx_log_store.new_tx();
 
         let read_res: Result<_> = tx.context(|| {
@@ -468,15 +434,12 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
             return_errno_with_msg!(NotFound, "target sst not found");
         });
-        LatencyMetrics::stop_timer(timer);
-        let timer = LatencyMetrics::start_timer(ReqType::Read, "tx_commit", "read_range_tx");
         if read_res.as_ref().is_err_and(|e| e.errno() != NotFound) {
             tx.abort();
             return_errno_with_msg!(TxAborted, "read TX failed")
         }
 
         tx.commit()?;
-        LatencyMetrics::stop_timer(timer);
 
         read_res
     }

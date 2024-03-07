@@ -20,8 +20,13 @@
  * accidentally exposed.
  */
 
+#include <crypto/aead.h>
+#include <crypto/skcipher.h>
 #include <linux/atomic.h>
+#include <linux/bio.h>
 #include <linux/refcount.h>
+#include <linux/sched/task.h>
+#include <linux/scatterlist.h>
 
 refcount_t helper_REFCOUNT_INIT(int n)
 {
@@ -46,4 +51,57 @@ int helper_atomic_read_acquire(const atomic_t *v)
 int helper_atomic_fetch_add_release(int i, atomic_t *v)
 {
 	return atomic_fetch_add_release(i, v);
+}
+
+struct task_struct *helper_get_task_struct(struct task_struct *t)
+{
+	return get_task_struct(t);
+}
+
+void helper_put_task_struct(struct task_struct *t)
+{
+	put_task_struct(t);
+}
+
+void helper_bio_get(struct bio *bio)
+{
+	bio_get(bio);
+}
+
+void helper_bio_set_dev(struct bio *bio, struct block_device *bdev)
+{
+	bio_set_dev(bio, bdev);
+}
+
+bool helper_bio_has_data(struct bio *bio)
+{
+	return bio_has_data(bio);
+}
+
+struct page *helper_virt_to_page(void *addr)
+{
+	return virt_to_page(addr);
+}
+
+void *helper_page_to_virt(struct page *page)
+{
+	return page_to_virt(page);
+}
+
+void helper_sg_set_buf(struct scatterlist *sg, const void *buf,
+				unsigned int buflen)
+{
+	sg_set_buf(sg, buf, buflen);
+}
+
+struct aead_request *helper_aead_request_alloc(struct crypto_aead *tfm,
+				gfp_t gfp)
+{
+	return aead_request_alloc(tfm, gfp);
+}
+
+struct skcipher_request *helper_skcipher_request_alloc(
+				struct crypto_skcipher *tfm, gfp_t gfp)
+{
+	return skcipher_request_alloc(tfm, gfp);
 }

@@ -311,7 +311,6 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     /// The block contents will be read into a single contiguous buffer.
     pub fn read(&self, lba: Lba, buf: BufMut) -> Result<()> {
         let nblocks = buf.nblocks();
-        AmplificationMetrics::acc_data_amount(AmpType::Read, nblocks);
 
         if nblocks == 1 {
             self.read_one_block(lba, buf)?;
@@ -335,13 +334,8 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             return Ok(());
         }
 
-        let timer = LatencyMetrics::start_timer(ReqType::Read, "lsmtree", "");
-
         // Search in `TxLsmTree` then
         let value = self.logical_block_table.get(&RecordKey { lba })?;
-
-        LatencyMetrics::stop_timer(timer);
-        let timer = LatencyMetrics::start_timer(ReqType::Read, "data", "");
 
         // Perform disk read and decryption
         let mut cipher = Buf::alloc(1)?;
@@ -355,7 +349,6 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             buf.as_mut_slice(),
         )?;
 
-        LatencyMetrics::stop_timer(timer);
         Ok(())
     }
 
@@ -379,7 +372,6 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             return Ok(());
         }
 
-        let timer = LatencyMetrics::start_timer(ReqType::Read, "lsmtree", "");
         // Search in `TxLsmTree` then
         self.logical_block_table.get_range(&mut range_query_ctx)?;
         // TODO: `debug_assert!()`, allow empty read
@@ -390,8 +382,6 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             res.sort_by(|(_, v1), (_, v2)| v1.hba.cmp(&v2.hba));
             res.group_by(|(_, v1), (_, v2)| v2.hba - v1.hba == 1)
         };
-        LatencyMetrics::stop_timer(timer);
-        let timer = LatencyMetrics::start_timer(ReqType::Read, "data", "");
 
         // Perform disk read in batches and decryption
         let mut cipher_buf = Buf::alloc(nblocks)?;
@@ -413,7 +403,6 @@ impl<D: BlockSet + 'static> DiskInner<D> {
                 )?;
             }
         }
-        LatencyMetrics::stop_timer(timer);
 
         Ok(())
     }
@@ -421,8 +410,6 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     /// Write a specified number of blocks at a logical block address on the device.
     /// The block contents reside in a single contiguous buffer.
     pub fn write(&self, mut lba: Lba, buf: BufRef) -> Result<()> {
-        AmplificationMetrics::acc_data_amount(AmpType::Write, buf.nblocks());
-
         // Write block contents to `DataBuf` directly
         for block_buf in buf.iter() {
             let buf_at_capacity = self.data_buf.put(RecordKey { lba }, block_buf);
@@ -447,16 +434,11 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     }
 
     fn flush_data_buf(&self) -> Result<()> {
-        let timer = LatencyMetrics::start_timer(ReqType::Write, "data", "");
         let records = self.write_blocks_from_data_buf()?;
-        LatencyMetrics::stop_timer(timer);
-
-        let timer = LatencyMetrics::start_timer(ReqType::Write, "lsmtree", "");
         // Insert new records of data blocks to `TxLsmTree`
         for (key, value) in records {
             self.logical_block_table.put(key, value)?;
         }
-        LatencyMetrics::stop_timer(timer);
 
         self.data_buf.clear();
         Ok(())
@@ -512,29 +494,18 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     /// Sync all cached data in the device to the storage medium for durability.
     pub fn sync(&self) -> Result<()> {
         let _guard = self.sync_region.lock();
-        let timer = LatencyMetrics::start_timer(ReqType::Sync, "data", "");
 
         self.write_blocks_from_data_buf()?;
         debug_assert!(self.data_buf.is_empty());
 
-        LatencyMetrics::stop_timer(timer);
-        let timer = LatencyMetrics::start_timer(ReqType::Sync, "lsmtree", "");
-
         self.logical_block_table.sync()?;
 
-        LatencyMetrics::stop_timer(timer);
-        let timer = LatencyMetrics::start_timer(ReqType::Sync, "data", "");
-
         self.user_data_disk.flush()?;
-
-        LatencyMetrics::stop_timer(timer);
-        let timer = LatencyMetrics::start_timer(ReqType::Sync, "bvt_bal_compaction", "");
 
         // XXX: May impact performance when there comes frequent syncs
         self.block_validity_table
             .do_compaction(&self.tx_log_store)?;
 
-        LatencyMetrics::stop_timer(timer);
         Ok(())
     }
 }

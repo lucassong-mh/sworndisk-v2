@@ -4,7 +4,6 @@ pub(crate) use crate::os::{Arc, Box, String, ToString, Vec, Weak};
 pub(crate) use crate::util::{
     align_down, align_up, Aead as _, RandomInit, Rng as _, Skcipher as _,
 };
-pub(crate) use crate::util::{AmpType, AmplificationMetrics, LatencyMetrics, Metrics, ReqType};
 pub(crate) use crate::{return_errno, return_errno_with_msg};
 
 pub(crate) type Result<T> = core::result::Result<T, Error>;

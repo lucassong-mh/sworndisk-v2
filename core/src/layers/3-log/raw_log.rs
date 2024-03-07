@@ -385,8 +385,6 @@ impl<D: BlockSet> BlockLog for RawLog<D> {
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
     fn read(&self, pos: BlockId, buf: BufMut) -> Result<()> {
-        AmplificationMetrics::acc_index_amount(AmpType::Read, buf.nblocks());
-
         let log_ref = self.as_ref();
         log_ref.read(pos, buf)
     }
@@ -405,7 +403,6 @@ impl<D: BlockSet> BlockLog for RawLog<D> {
         let nblocks = buf.nblocks();
         let pos = self.append_pos.fetch_add(nblocks, Ordering::Release);
 
-        AmplificationMetrics::acc_index_amount(AmpType::Write, nblocks);
         Ok(pos)
     }
 

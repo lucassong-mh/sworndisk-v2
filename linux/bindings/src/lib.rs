@@ -26,11 +26,43 @@
 )]
 #![feature(allocator_api)]
 #![feature(coerce_unsized)]
+#![feature(core_intrinsics)]
 #![feature(dispatch_from_dyn)]
+#![feature(error_in_core)]
+#![feature(exclusive_range_pattern)]
+#![feature(extend_one)]
+#![feature(hasher_prefixfree_extras)]
+#![feature(inline_const)]
+#![feature(layout_for_ptr)]
+#![feature(maybe_uninit_slice)]
+#![feature(new_uninit)]
+#![feature(offset_of)]
 #![feature(receiver_trait)]
+#![feature(slice_ptr_get)]
+#![feature(specialization)]
 #![feature(unsize)]
 
-pub mod sync;
+mod bindings_raw {
+    // Use glob import here to expose all helpers.
+    // Symbols defined within the module will take precedence to the glob import.
+    pub use super::bindings_helper::*;
+    include!("./bindings_generated.rs");
+}
 
-include!("./bindings_generated.rs");
-include!("./bindings_helpers_generated.rs");
+// When both a directly exposed symbol and a helper exists for the same function,
+// the directly exposed symbol is preferred and the helper becomes dead code, so
+// ignore the warning here.
+#[allow(dead_code)]
+mod bindings_helper {
+    // Import the generated bindings for types.
+    use super::bindings_raw::*;
+    include!("./bindings_helpers_generated.rs");
+}
+
+// Vendor for `alloc::collections::btree`.
+pub mod btree;
+pub mod crypto;
+pub mod sync;
+pub mod thread;
+
+pub use bindings_raw::*;

@@ -1,7 +1,10 @@
 //! Linux specific implementations.
 
-use alloc::boxed::Box as KBox;
-use alloc::vec::Vec as KVec;
+use alloc::{
+    alloc::{alloc, dealloc, AllocError, Layout},
+    boxed::Box as KBox,
+    vec::Vec as KVec,
+};
 use bindings::{
     new_rwlock,
     sync::lock::rwlock::{Read, RwLockBackend, Write},
@@ -10,16 +13,20 @@ use bindings::{
 };
 use core::{
     any::Any,
+    borrow::Borrow,
+    cmp::Ordering,
     fmt,
-    hash::Hash,
+    hash::{Hash, Hasher},
     marker::{PhantomData, Tuple, Unsize},
+    mem::SizedTypeProperties,
     ops::{CoerceUnsized, Deref, DerefMut, DispatchFromDyn, Receiver},
     pin::Pin,
     ptr::NonNull,
     result, slice,
+    slice::sort::{merge_sort, TimSortRun},
 };
 use kernel::{
-    current,
+    c_str, current,
     init::{InPlaceInit, Init, PinInit},
     new_mutex,
     sync::lock::{mutex::MutexBackend, Guard},
@@ -31,6 +38,12 @@ use crate::{
     error::Errno,
     prelude::{Error, Result},
 };
+
+/// Reuse `BTreeMap` in `bindings` crate.
+pub use bindings::btree::map::BTreeMap;
+
+/// Reuse `spawn` and `JoinHandle` in `bindings::thread`.
+pub use bindings::thread::{spawn, JoinHandle, Thread};
 
 /// Wrap `alloc::boxed::Box` provided by kernel.
 #[repr(transparent)]
@@ -161,7 +174,7 @@ impl<T> InPlaceInit<T> for Box<T> {
     #[inline]
     fn try_pin_init<E>(init: impl PinInit<T, E>) -> result::Result<Pin<Self>, E>
     where
-        E: From<alloc::alloc::AllocError>,
+        E: From<AllocError>,
     {
         let mut inner = KBox::try_new_uninit()?;
         let slot = inner.as_mut_ptr();
@@ -178,7 +191,7 @@ impl<T> InPlaceInit<T> for Box<T> {
     #[inline]
     fn try_init<E>(init: impl Init<T, E>) -> result::Result<Self, E>
     where
-        E: From<alloc::alloc::AllocError>,
+        E: From<AllocError>,
     {
         let mut inner = KBox::try_new_uninit()?;
         let slot = inner.as_mut_ptr();
@@ -430,6 +443,79 @@ where
             marker: PhantomData,
         };
         deserializer.deserialize_seq(visitor)
+    }
+}
+
+/// Revised standard implementation from `alloc/slice.rs`.
+fn stable_sort<T, F>(v: &mut [T], mut is_less: F)
+where
+    F: FnMut(&T, &T) -> bool,
+{
+    if T::IS_ZST {
+        // Sorting has no meaningful behavior on zero-sized types. Do nothing.
+        return;
+    }
+
+    let elem_alloc_fn = |len: usize| -> *mut T {
+        // SAFETY: Creating the layout is safe as long as merge_sort never calls this with len >
+        // v.len(). Alloc in general will only be used as 'shadow-region' to store temporary swap
+        // elements.
+        unsafe { alloc(Layout::array::<T>(len).unwrap_unchecked()) as *mut T }
+    };
+
+    let elem_dealloc_fn = |buf_ptr: *mut T, len: usize| {
+        // SAFETY: Creating the layout is safe as long as merge_sort never calls this with len >
+        // v.len(). The caller must ensure that buf_ptr was created by elem_alloc_fn with the same
+        // len.
+        unsafe {
+            dealloc(
+                buf_ptr as *mut u8,
+                Layout::array::<T>(len).unwrap_unchecked(),
+            );
+        }
+    };
+
+    let run_alloc_fn = |len: usize| -> *mut TimSortRun {
+        // SAFETY: Creating the layout is safe as long as merge_sort never calls this with an
+        // obscene length or 0.
+        unsafe { alloc(Layout::array::<TimSortRun>(len).unwrap_unchecked()) as *mut TimSortRun }
+    };
+
+    let run_dealloc_fn = |buf_ptr: *mut TimSortRun, len: usize| {
+        // SAFETY: The caller must ensure that buf_ptr was created by elem_alloc_fn with the same
+        // len.
+        unsafe {
+            dealloc(
+                buf_ptr as *mut u8,
+                Layout::array::<TimSortRun>(len).unwrap_unchecked(),
+            );
+        }
+    };
+
+    merge_sort(
+        v,
+        &mut is_less,
+        elem_alloc_fn,
+        elem_dealloc_fn,
+        run_alloc_fn,
+        run_dealloc_fn,
+    );
+}
+
+impl<T: Ord> Vec<T> {
+    /// Sorts the slice.
+    pub fn sort(&mut self) {
+        stable_sort(self.as_mut_slice(), T::lt);
+    }
+}
+
+impl<T> Vec<T> {
+    /// Sorts the slice with a comparator function.
+    pub fn sort_by<F>(&mut self, mut compare: F)
+    where
+        F: FnMut(&T, &T) -> Ordering,
+    {
+        stable_sort(self.as_mut_slice(), |a, b| compare(a, b) == Ordering::Less);
     }
 }
 
@@ -791,7 +877,7 @@ where
 /// # Invariants
 ///
 /// The string is always `NUL`-terminated and contains no other `NUL` bytes.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CString {
     buf: Vec<u8>,
 }
@@ -880,6 +966,38 @@ impl From<&str> for CString {
 impl ToString for &str {
     fn to_string(&self) -> String {
         String::from(*self)
+    }
+}
+
+impl Borrow<str> for CString {
+    fn borrow(&self) -> &str {
+        self.to_str().unwrap()
+    }
+}
+
+impl Hash for String {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        (**self).hash(hasher)
+    }
+}
+
+impl<'a> PartialEq<&'a str> for CString {
+    fn eq(&self, other: &&'a str) -> bool {
+        PartialEq::eq(&self.to_str().unwrap(), other)
+    }
+
+    fn ne(&self, other: &&'a str) -> bool {
+        PartialEq::ne(&self.to_str().unwrap(), other)
+    }
+}
+
+impl<'a> PartialEq<CString> for &'a str {
+    fn eq(&self, other: &CString) -> bool {
+        PartialEq::eq(self, &other.to_str().unwrap())
+    }
+
+    fn ne(&self, other: &CString) -> bool {
+        PartialEq::ne(self, &other.to_str().unwrap())
     }
 }
 
@@ -1036,6 +1154,12 @@ impl<T> Mutex<T> {
     }
 }
 
+impl<T: fmt::Debug> fmt::Debug for Mutex<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("No data, since `Mutex` does't support `try_lock` now")
+    }
+}
+
 /// Wrap the `RwLock` provided by kernel.
 ///
 /// Instances of `kernel::sync::RwLock` need a lock class and to
@@ -1085,6 +1209,21 @@ impl<T> RwLock<T> {
     }
 }
 
+impl<T: fmt::Debug> fmt::Debug for RwLock<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut d = f.debug_struct("RwLock");
+        match self.try_read() {
+            Ok(guard) => {
+                d.field("data", &&*guard);
+            }
+            Err(_) => {
+                d.field("data", &format_args!("<locked>"));
+            }
+        }
+        d.finish_non_exhaustive()
+    }
+}
+
 /// Reuse `RwLockReadGuard` provided by kernel.
 pub type RwLockReadGuard<'a, T> = bindings::sync::lock::Guard<'a, T, RwLockBackend<Read>>;
 
@@ -1127,9 +1266,8 @@ impl PageAllocator {
         // SAFETY: the `count` is non-zero, then the `Layout` has
         // non-zero size, so it's safe.
         unsafe {
-            let layout =
-                alloc::alloc::Layout::from_size_align_unchecked(len * PAGE_SIZE, PAGE_SIZE);
-            let ptr = alloc::alloc::alloc(layout);
+            let layout = Layout::from_size_align_unchecked(len * PAGE_SIZE, PAGE_SIZE);
+            let ptr = alloc(layout);
             NonNull::new(ptr)
         }
     }
@@ -1147,9 +1285,8 @@ impl PageAllocator {
     unsafe fn dealloc(ptr: *mut u8, len: usize) {
         // SAFETY: the caller should pass valid `ptr` and `len`.
         unsafe {
-            let layout =
-                alloc::alloc::Layout::from_size_align_unchecked(len * PAGE_SIZE, PAGE_SIZE);
-            alloc::alloc::dealloc(ptr, layout)
+            let layout = Layout::from_size_align_unchecked(len * PAGE_SIZE, PAGE_SIZE);
+            dealloc(ptr, layout)
         }
     }
 }
@@ -1268,13 +1405,20 @@ new_byte_array_type!(AeadIv, AES_GCM_IV_SIZE);
 new_byte_array_type!(AeadMac, AES_GCM_MAC_SIZE);
 
 /// An `AEAD` cipher.
-pub struct Aead;
+pub struct Aead {
+    inner: Pin<Box<bindings::crypto::Aead>>,
+}
 
-// TODO: impl `Aead` with linux kernel Crypto API.
 impl Aead {
     /// Construct an `Aead` instance.
     pub fn new() -> Self {
-        todo!()
+        let inner = Box::pin_init(bindings::crypto::Aead::new(
+            kernel::c_str!("gcm(aes)"),
+            0,
+            0,
+        ))
+        .expect("alloc gcm(aes) cipher failed");
+        Self { inner }
     }
 }
 
@@ -1291,7 +1435,15 @@ impl crate::util::Aead for Aead {
         aad: &[u8],
         output: &mut [u8],
     ) -> Result<AeadMac> {
-        todo!()
+        self.inner.set_key(key);
+        let req = self
+            .inner
+            .alloc_request()
+            .map_err(|_| Error::with_msg(Errno::OutOfMemory, "alloc aead_request failed"))?;
+        let mut mac = AeadMac::default();
+        req.encrypt(aad, input, &iv, output, &mut mac)
+            .map_err(|_| Error::with_msg(Errno::EncryptFailed, "gcm(aes) encryption failed"))?;
+        Ok(mac)
     }
 
     fn decrypt(
@@ -1303,7 +1455,13 @@ impl crate::util::Aead for Aead {
         mac: &AeadMac,
         output: &mut [u8],
     ) -> Result<()> {
-        todo!()
+        self.inner.set_key(key);
+        let req = self
+            .inner
+            .alloc_request()
+            .map_err(|_| Error::with_msg(Errno::OutOfMemory, "alloc aead_request failed"))?;
+        req.decrypt(aad, input, &mac, &iv, output)
+            .map_err(|_| Error::with_msg(Errno::DecryptFailed, "gcm(aes) decryption failed"))
     }
 }
 
@@ -1314,13 +1472,21 @@ new_byte_array_type!(SkcipherKey, AES_CTR_KEY_SIZE);
 new_byte_array_type!(SkcipherIv, AES_CTR_IV_SIZE);
 
 /// A symmetric key cipher.
-pub struct Skcipher;
+pub struct Skcipher {
+    inner: Pin<Box<bindings::crypto::Skcipher>>,
+}
 
 // TODO: impl `Skcipher` with linux kernel Crypto API.
 impl Skcipher {
     /// Construct a `Skcipher` instance.
     pub fn new() -> Self {
-        todo!()
+        let inner = Box::pin_init(bindings::crypto::Skcipher::new(
+            kernel::c_str!("ctr(aes)"),
+            0,
+            0,
+        ))
+        .expect("alloc ctr(aes) cipher failed");
+        Self { inner }
     }
 }
 
@@ -1335,7 +1501,13 @@ impl crate::util::Skcipher for Skcipher {
         iv: &SkcipherIv,
         output: &mut [u8],
     ) -> Result<()> {
-        todo!()
+        self.inner.set_key(key);
+        let req = self
+            .inner
+            .alloc_request()
+            .map_err(|_| Error::with_msg(Errno::OutOfMemory, "alloc skcipher_request failed"))?;
+        req.encrypt(input, &iv, output)
+            .map_err(|_| Error::with_msg(Errno::EncryptFailed, "ctr(aes) encryption failed"))
     }
 
     fn decrypt(
@@ -1345,6 +1517,12 @@ impl crate::util::Skcipher for Skcipher {
         iv: &SkcipherIv,
         output: &mut [u8],
     ) -> Result<()> {
-        todo!()
+        self.inner.set_key(key);
+        let req = self
+            .inner
+            .alloc_request()
+            .map_err(|_| Error::with_msg(Errno::OutOfMemory, "alloc skcipher_request failed"))?;
+        req.decrypt(input, &iv, output)
+            .map_err(|_| Error::with_msg(Errno::DecryptFailed, "ctr(aes) decryption failed"))
     }
 }
